@@ -14,6 +14,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/blocks", get(get_blocks))
         .route("/api/payouts", get(get_payouts))
         .route("/api/zallet/status", get(get_zallet_status))
+        .route("/api/blocks/immature", get(get_immature_blocks))
         .route("/api/payout/trigger", post(trigger_payout))
         .route("/health", get(get_health));
 

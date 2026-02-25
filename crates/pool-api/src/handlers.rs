@@ -104,6 +104,16 @@ pub struct PayoutInfo {
 }
 
 #[derive(Serialize)]
+pub struct ImmatureBlock {
+    pub height: i64,
+    pub reward_zec: f64,
+    pub confirmations: i64,
+    pub required: u64,
+    pub progress_percent: f64,
+    pub found_at: String,
+}
+
+#[derive(Serialize)]
 pub struct MinerListInfo {
     pub address: String,
     pub pending_zec: f64,
@@ -649,6 +659,42 @@ pub async fn get_zallet_status(
     Ok(Json(status))
 }
 
+pub async fn get_immature_blocks(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ImmatureBlock>>, StatusCode> {
+    let current_height = state
+        .rpc
+        .get_block_count()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? as i64;
+
+    let pending = state
+        .db
+        .get_pending_blocks()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let required = state.maturity_confirmations;
+    let mut blocks: Vec<ImmatureBlock> = pending
+        .into_iter()
+        .map(|b| {
+            let confirmations = (current_height - b.height).max(0);
+            let progress = (confirmations as f64 / required as f64 * 100.0).min(100.0);
+            ImmatureBlock {
+                height: b.height,
+                reward_zec: b.reward as f64 / ZATOSHIS_PER_ZEC,
+                confirmations,
+                required,
+                progress_percent: progress,
+                found_at: b.created_at,
+            }
+        })
+        .collect();
+
+    blocks.sort_by(|a, b| b.height.cmp(&a.height));
+    Ok(Json(blocks))
+}
+
 pub async fn zallet_dashboard() -> Html<String> {
     Html(ZALLET_DASHBOARD_HTML.to_string())
 }
@@ -666,7 +712,7 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         .header h1 { color: #f4b728; font-size: 1.5rem; }
         .header a { color: #718096; text-decoration: none; font-size: 0.9rem; }
         .header a:hover { color: #f4b728; }
-        .container { max-width: 600px; margin: 0 auto; padding: 2rem; }
+        .container { max-width: 700px; margin: 0 auto; padding: 2rem; }
         .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }
         .card h2 { font-size: 1rem; color: #a0aec0; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #2d3748; }
         .badge { padding: 0.25rem 0.75rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
@@ -677,6 +723,12 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         .balance-item .value { font-size: 1.25rem; color: #f4b728; }
         .error { color: #fc8181; margin-top: 0.5rem; }
         .note { font-size: 0.75rem; color: #718096; margin-top: 1rem; }
+        .maturity-table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
+        .maturity-table th { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: #718096; padding: 0.4rem 0.5rem; text-align: left; border-bottom: 1px solid #2d3748; }
+        .maturity-table td { font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace; font-size: 0.8rem; padding: 0.4rem 0.5rem; border-bottom: 1px solid #1a2332; color: #a0aec0; }
+        .progress-bar { background: #2d3748; border-radius: 4px; height: 16px; overflow: hidden; min-width: 80px; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #d69e2e, #f4b728); border-radius: 4px; transition: width 0.5s ease; }
+        .empty-msg { color: #4a5568; font-size: 0.8rem; padding: 1rem 0; text-align: center; }
     </style>
 </head>
 <body>
@@ -698,6 +750,12 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 <div class="balance-item"><div class="label">Total</div><div class="value" id="bal-total">–</div></div>
             </div>
             <div class="note">Zallet must be run externally. Pool communicates with it via RPC only.</div>
+        </div>
+        <div class="card">
+            <h2>Block Maturity</h2>
+            <div id="maturity-content">
+                <div class="empty-msg">Loading...</div>
+            </div>
         </div>
     </div>
     <script>
@@ -724,8 +782,35 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 document.getElementById('error').textContent = 'Failed to fetch: ' + e;
             }
         }
+        async function fetchImmature() {
+            try {
+                const r = await fetch('/api/blocks/immature');
+                const blocks = await r.json();
+                const el = document.getElementById('maturity-content');
+                if (!blocks.length) {
+                    el.innerHTML = '<div class="empty-msg">No immature blocks</div>';
+                    return;
+                }
+                let html = '<table class="maturity-table"><thead><tr><th>Height</th><th>Reward</th><th>Confirmations</th><th>Progress</th></tr></thead><tbody>';
+                for (const b of blocks) {
+                    const pct = Math.min(b.progress_percent, 100).toFixed(0);
+                    html += '<tr>' +
+                        '<td style="color:#e2e8f0">' + b.height + '</td>' +
+                        '<td>' + b.reward_zec.toFixed(4) + ' TAZ</td>' +
+                        '<td>' + b.confirmations + ' / ' + b.required + '</td>' +
+                        '<td><div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div></td>' +
+                        '</tr>';
+                }
+                html += '</tbody></table>';
+                el.innerHTML = html;
+            } catch (e) {
+                document.getElementById('maturity-content').innerHTML = '<div class="empty-msg">Failed to load</div>';
+            }
+        }
         fetchStatus();
+        fetchImmature();
         setInterval(fetchStatus, 5000);
+        setInterval(fetchImmature, 5000);
     </script>
 </body>
 </html>
