@@ -269,42 +269,6 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         .status-pending { color: #ecc94b; }
         .status-orphaned { color: #fc8181; }
 
-        /* ── Pool Actions ── */
-        .actions-bar {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            padding: 0.5rem 0;
-            margin-bottom: 1rem;
-        }
-        .btn {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            padding: 0.4rem 1rem;
-            font-size: 0.7rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            border: 1px solid #333;
-            background: #1a1a1a;
-            color: #999;
-            cursor: pointer;
-            transition: all 0.15s;
-        }
-        .btn:hover { background: #252525; color: #f4b728; border-color: #f4b728; }
-        .btn-primary { background: #f4b728; color: #0b0b0b; border-color: #f4b728; }
-        .btn-primary:hover { background: #d69e2e; border-color: #d69e2e; }
-        #payout-result {
-            display: none;
-            background: #111;
-            border: 1px solid #222;
-            padding: 0.6rem 0.75rem;
-            margin-bottom: 1rem;
-            font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
-            font-size: 0.7rem;
-            color: #888;
-            white-space: pre-wrap;
-        }
-
         /* ── Miner Lookup ── */
         .lookup-row {
             display: flex;
@@ -500,14 +464,6 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <canvas id="chart-mining"></canvas>
         </div>
     </div>
-
-    <!-- ── Pool Actions ── -->
-    <div class="section-title">Actions</div>
-    <div class="actions-bar">
-        <button class="btn btn-primary" onclick="triggerPayout()">Run Payout</button>
-        <span id="payout-status" style="font-size:0.65rem;color:#555"></span>
-    </div>
-    <div id="payout-result"></div>
 
     <!-- ── Miner Lookup ── -->
     <div class="section-title">Miner Lookup</div>
@@ -929,46 +885,6 @@ async function lookupMiner() {
         tbody.innerHTML = data.workers.map(w => '<tr><td>' + w.name + '</td><td>' + w.last_seen + '</td></tr>').join('');
     } catch (e) {
         console.error('Lookup failed:', e);
-    }
-}
-
-async function triggerPayout() {
-    const statusEl = document.getElementById('payout-status');
-    const resultEl = document.getElementById('payout-result');
-    statusEl.textContent = 'Processing...';
-    statusEl.style.color = '#ecc94b';
-    resultEl.style.display = 'none';
-    try {
-        const resp = await fetch('/api/payout/trigger', { method: 'POST' });
-        const data = await resp.json();
-        resultEl.style.display = 'block';
-        if (data.status === 'ok') {
-            statusEl.textContent = 'Done';
-            statusEl.style.color = '#48bb78';
-            let lines = [];
-            if (data.blocks_confirmed > 0) lines.push('Blocks confirmed: ' + data.blocks_confirmed);
-            if (data.blocks_orphaned > 0) lines.push('Blocks orphaned: ' + data.blocks_orphaned);
-            if (data.shielding_triggered) lines.push('Shielding: triggered');
-            if (data.payouts > 0 || data.miners > 0) {
-                lines.push('Payouts: ' + (data.miners || data.payouts) + ' miners, ' + (data.total_zec ? data.total_zec.toFixed(4) + ' TAZ' : ''));
-                if (data.opid) lines.push('OpID: ' + data.opid);
-            } else {
-                lines.push(data.message);
-            }
-            resultEl.textContent = lines.join('\n');
-        } else {
-            statusEl.textContent = 'Failed';
-            statusEl.style.color = '#fc8181';
-            resultEl.textContent = data.message || JSON.stringify(data);
-        }
-        fetchStats();
-        fetchBlocks();
-        fetchPayouts();
-    } catch (e) {
-        statusEl.textContent = 'Error';
-        statusEl.style.color = '#fc8181';
-        resultEl.style.display = 'block';
-        resultEl.textContent = e.message;
     }
 }
 
