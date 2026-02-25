@@ -840,7 +840,7 @@ async function fetchBlocks() {
             return '<tr>' +
                 '<td style="color:#e0e0e0">' + b.height + '</td>' +
                 '<td title="' + b.hash + '">' + b.hash.substring(0, 16) + '...</td>' +
-                '<td>' + b.reward_zec.toFixed(4) + ' ZEC</td>' +
+                '<td>' + b.reward_zec.toFixed(4) + ' TAZ</td>' +
                 '<td style="color:' + luckColor + '">' + luckStr + '</td>' +
                 '<td class="status-' + b.status + '">' + b.status + '</td>' +
                 '<td>' + b.found_at + '</td>' +
@@ -867,7 +867,7 @@ async function fetchMiners() {
             '<td>' + formatHashrate(m.hashrate) + '</td>' +
             '<td>' + m.worker_count + '</td>' +
             '<td>' + m.share_count.toLocaleString() + '</td>' +
-            '<td>' + m.pending_zec.toFixed(8) + ' ZEC</td>' +
+            '<td>' + m.pending_zec.toFixed(8) + ' TAZ</td>' +
             '<td>' + m.joined + '</td>' +
             '</tr>'
         ).join('');
@@ -890,7 +890,7 @@ async function fetchPayouts() {
             const txTitle = p.txid || '';
             return '<tr>' +
                 '<td title="' + p.miner_address + '" style="color:#e0e0e0">' + p.miner_address + '</td>' +
-                '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' ZEC</td>' +
+                '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' TAZ</td>' +
                 '<td title="' + txTitle + '">' + txid + '</td>' +
                 '<td>' + p.created_at + '</td>' +
                 '</tr>';
@@ -909,8 +909,8 @@ async function lookupMiner() {
         const data = await resp.json();
         document.getElementById('miner-info').style.display = 'block';
         document.getElementById('miner-stats-grid').innerHTML =
-            '<div class="metric-cell"><div class="label">Pending Balance</div><div class="value" style="color:#f4b728">' + data.balance.pending_zec.toFixed(8) + ' ZEC</div></div>' +
-            '<div class="metric-cell"><div class="label">Total Paid</div><div class="value" style="color:#48bb78">' + data.balance.paid_zec.toFixed(8) + ' ZEC</div></div>' +
+            '<div class="metric-cell"><div class="label">Pending Balance</div><div class="value" style="color:#f4b728">' + data.balance.pending_zec.toFixed(8) + ' TAZ</div></div>' +
+            '<div class="metric-cell"><div class="label">Total Paid</div><div class="value" style="color:#48bb78">' + data.balance.paid_zec.toFixed(8) + ' TAZ</div></div>' +
             '<div class="metric-cell"><div class="label">Workers</div><div class="value">' + data.workers.length + '</div></div>';
         const tbody = document.querySelector('#workers-table tbody');
         tbody.innerHTML = data.workers.map(w => '<tr><td>' + w.name + '</td><td>' + w.last_seen + '</td></tr>').join('');
@@ -937,7 +937,7 @@ async function triggerPayout() {
             if (data.blocks_orphaned > 0) lines.push('Blocks orphaned: ' + data.blocks_orphaned);
             if (data.shielding_triggered) lines.push('Shielding: triggered');
             if (data.payouts > 0 || data.miners > 0) {
-                lines.push('Payouts: ' + (data.miners || data.payouts) + ' miners, ' + (data.total_zec ? data.total_zec.toFixed(4) + ' ZEC' : ''));
+                lines.push('Payouts: ' + (data.miners || data.payouts) + ' miners, ' + (data.total_zec ? data.total_zec.toFixed(4) + ' TAZ' : ''));
                 if (data.opid) lines.push('OpID: ' + data.opid);
             } else {
                 lines.push(data.message);

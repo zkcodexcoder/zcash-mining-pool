@@ -696,9 +696,9 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 rb.textContent = d.rpc_ok ? 'Online' : 'Offline';
                 rb.className = 'badge ' + (d.rpc_ok ? 'badge-ok' : 'badge-fail');
                 if (d.balance) {
-                    document.getElementById('bal-t').textContent = d.balance.transparent + ' ZEC';
-                    document.getElementById('bal-p').textContent = d.balance.private + ' ZEC';
-                    document.getElementById('bal-total').textContent = d.balance.total + ' ZEC';
+                    document.getElementById('bal-t').textContent = d.balance.transparent + ' TAZ';
+                    document.getElementById('bal-p').textContent = d.balance.private + ' TAZ';
+                    document.getElementById('bal-total').textContent = d.balance.total + ' TAZ';
                 } else {
                     document.getElementById('bal-t').textContent = '–';
                     document.getElementById('bal-p').textContent = '–';
