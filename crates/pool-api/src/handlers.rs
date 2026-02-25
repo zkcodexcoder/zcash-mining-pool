@@ -54,6 +54,8 @@ pub struct PoolStats {
     pub network_hashrate: f64,
     /// Pool luck over the last 24h as a percentage (100 = exactly as expected).
     pub luck_percent: Option<f64>,
+    /// Pool's share of network blocks in the last 24h (percentage).
+    pub pool_percent_24h: Option<f64>,
     pub node_ok: bool,
     pub last_template_at: Option<String>,
     pub wallet_ok: bool,
@@ -165,25 +167,35 @@ pub async fn get_pool_stats(
         .await
         .unwrap_or(0.0);
 
+    // Query 24h block count once for both luck and network share.
+    let since_24h = chrono::Utc::now()
+        .checked_sub_signed(chrono::Duration::hours(24))
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+    let actual_blocks_24h = state
+        .db
+        .get_blocks_count_since(&since_24h)
+        .await
+        .unwrap_or(0) as f64;
+
     // Luck (effort) over the last 24h: expected_blocks / actual_blocks * 100.
     // <100% = lucky (found blocks faster than expected), >100% = unlucky.
     let luck_percent = if network_hashrate > 0.0 && hashrate > 0.0 {
         let window_secs = 24.0 * 3600.0;
-        let since_24h = chrono::Utc::now()
-            .checked_sub_signed(chrono::Duration::hours(24))
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_default();
-        let actual_blocks = state
-            .db
-            .get_blocks_count_since(&since_24h)
-            .await
-            .unwrap_or(0) as f64;
         let expected_blocks = (hashrate / network_hashrate) * (window_secs / BLOCK_TIME_SECS);
-        if actual_blocks > 0.0 {
-            Some((expected_blocks / actual_blocks) * 100.0)
+        if actual_blocks_24h > 0.0 {
+            Some((expected_blocks / actual_blocks_24h) * 100.0)
         } else {
             None
         }
+    } else {
+        None
+    };
+
+    // Network share: pool_blocks_24h / expected_network_blocks_24h * 100.
+    // Expected = 86400 / 75 = 1152 blocks per day.
+    let pool_percent_24h = if actual_blocks_24h > 0.0 {
+        Some((actual_blocks_24h / 1152.0) * 100.0)
     } else {
         None
     };
@@ -200,6 +212,7 @@ pub async fn get_pool_stats(
         hashrate_estimate: hashrate,
         network_hashrate,
         luck_percent,
+        pool_percent_24h,
         node_ok,
         last_template_at,
         wallet_ok: check_wallet_rpc(&state).await,

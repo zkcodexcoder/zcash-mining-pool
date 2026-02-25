@@ -155,7 +155,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         /* ── Secondary Metrics ── */
         .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(6, 1fr);
+            grid-template-columns: repeat(7, 1fr);
             gap: 1px;
             background: #222;
             border: 1px solid #222;
@@ -454,6 +454,10 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="metric-cell">
             <div class="label">Luck (24h)</div>
             <div class="value" id="stat-luck">--</div>
+        </div>
+        <div class="metric-cell">
+            <div class="label">Network Share (24h)</div>
+            <div class="value" id="stat-pool-pct">--</div>
         </div>
         <div class="metric-cell">
             <div class="label">Immature Blocks</div>
@@ -778,6 +782,15 @@ async function fetchStats() {
         } else {
             luckEl.textContent = '--';
             luckEl.style.color = '#555';
+        }
+
+        const pctEl = document.getElementById('stat-pool-pct');
+        if (d.pool_percent_24h != null) {
+            pctEl.textContent = d.pool_percent_24h.toFixed(2) + '%';
+            pctEl.style.color = '#f4b728';
+        } else {
+            pctEl.textContent = '--';
+            pctEl.style.color = '#555';
         }
 
         const headerDot = document.getElementById('header-status-dot');
