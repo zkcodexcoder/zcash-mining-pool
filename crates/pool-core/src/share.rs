@@ -226,7 +226,7 @@ impl ShareValidator {
 
     async fn validate_share(
         &self,
-        _session_id: &str,
+        session_id: &str,
         worker_name: &str,
         job_id: &str,
         time: &str,
@@ -302,8 +302,15 @@ impl ShareValidator {
             .map_err(|e| StratumError::other(&format!("Bad network target: {e}")))?;
         let is_block = meets_target(&hash_bytes, &network_target);
 
-        // Each valid Equihash solution = 1 Sol of work.
-        let difficulty = 1.0;
+        // Use the session's current vardiff difficulty so that hashrate
+        // calculations correctly weight higher-difficulty shares.
+        let difficulty = {
+            let sessions = self.session_difficulty.read().await;
+            sessions
+                .get(session_id)
+                .map(|sd| sd.vardiff.current_difficulty())
+                .unwrap_or(1.0)
+        };
 
         // Parse worker name (format: "address.worker")
         let miner_address = worker_name.split('.').next().unwrap_or(worker_name);
