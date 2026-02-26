@@ -266,7 +266,9 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             color: #999;
         }
         tr:hover td { background: #151515; }
-        .addr-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
+        .addr-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .addr-link { color: #e0e0e0; cursor: pointer; text-decoration: none; }
+        .addr-link:hover { color: #f4b728; text-decoration: underline; }
         .status-confirmed { color: #48bb78; }
         .status-pending { color: #ecc94b; }
         .status-orphaned { color: #fc8181; }
@@ -470,7 +472,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <!-- ── Miner Lookup ── -->
     <div class="section-title">Miner Lookup</div>
     <div class="lookup-row">
-        <input type="text" id="miner-address" placeholder="Enter Zcash address...">
+        <input type="text" id="miner-address" placeholder="Enter Zcash address..." onkeydown="if(event.key==='Enter')lookupMiner()">
         <button onclick="lookupMiner()">Lookup</button>
     </div>
     <div id="miner-info">
@@ -833,7 +835,7 @@ async function fetchMiners() {
         }
         tbody.innerHTML = miners.map(m =>
             '<tr>' +
-            '<td class="addr-cell" title="' + m.address + '" style="color:#e0e0e0">' + m.address + '</td>' +
+            '<td class="addr-cell" title="' + m.address + '"><span class="addr-link" onclick="doLookup(\'' + m.address.replace(/'/g, "\\'") + '\')">' + m.address + '</span></td>' +
             '<td>' + formatHashrate(m.hashrate_1m) + '</td>' +
             '<td>' + formatHashrate(m.hashrate) + '</td>' +
             '<td>' + m.worker_count + '</td>' +
@@ -869,6 +871,11 @@ async function fetchPayouts() {
     } catch (e) {
         console.error('Failed to fetch payouts:', e);
     }
+}
+
+function doLookup(addr) {
+    document.getElementById('miner-address').value = addr;
+    lookupMiner();
 }
 
 async function lookupMiner() {
