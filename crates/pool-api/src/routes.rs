@@ -266,6 +266,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             color: #999;
         }
         tr:hover td { background: #151515; }
+        .addr-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
         .status-confirmed { color: #48bb78; }
         .status-pending { color: #ecc94b; }
         .status-orphaned { color: #fc8181; }
@@ -832,7 +833,7 @@ async function fetchMiners() {
         }
         tbody.innerHTML = miners.map(m =>
             '<tr>' +
-            '<td title="' + m.address + '" style="color:#e0e0e0">' + m.address + '</td>' +
+            '<td class="addr-cell" title="' + m.address + '" style="color:#e0e0e0">' + m.address + '</td>' +
             '<td>' + formatHashrate(m.hashrate_1m) + '</td>' +
             '<td>' + formatHashrate(m.hashrate) + '</td>' +
             '<td>' + m.worker_count + '</td>' +
@@ -859,7 +860,7 @@ async function fetchPayouts() {
             const txid = p.txid ? p.txid.substring(0, 16) + '...' : '--';
             const txTitle = p.txid || '';
             return '<tr>' +
-                '<td title="' + p.miner_address + '" style="color:#e0e0e0">' + p.miner_address + '</td>' +
+                '<td class="addr-cell" title="' + p.miner_address + '" style="color:#e0e0e0">' + p.miner_address + '</td>' +
                 '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' TAZ</td>' +
                 '<td title="' + txTitle + '">' + txid + '</td>' +
                 '<td>' + p.created_at + '</td>' +
