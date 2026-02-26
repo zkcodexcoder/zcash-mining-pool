@@ -372,7 +372,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <div class="header-right">
         <span class="status-dot pulsing" id="header-status-dot"></span>
         <span style="font-size:0.6rem;color:#555" id="header-status-text">Connected</span>
-        <a href="http://pool.tazminer.com:3000" class="header-link" style="color:#f4b728;font-weight:600">Mine in Browser</a>
+        <a href="http://pool.tazminer.com:3000" target="_blank" rel="noopener" class="header-link" style="color:#f4b728;font-weight:600">Mine in Browser</a>
         <a href="/zallet" class="header-link">Wallet</a>
     </div>
 </div>
