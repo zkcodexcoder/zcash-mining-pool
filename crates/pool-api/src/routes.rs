@@ -28,6 +28,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/preview3", get(previews::preview3))
         .route("/preview4", get(previews::preview4))
         .route("/preview5", get(previews::preview5))
+        .route("/preview6", get(previews::preview6))
+        .route("/preview7", get(previews::preview7))
+        .route("/preview8", get(previews::preview8))
+        .route("/preview9", get(previews::preview9))
+        .route("/preview10", get(previews::preview10))
+        .route("/preview11", get(previews::preview11))
+        .route("/preview12", get(previews::preview12))
+        .route("/preview13", get(previews::preview13))
+        .route("/preview14", get(previews::preview14))
+        .route("/preview15", get(previews::preview15))
+        .route("/previews", get(previews::gallery))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -380,6 +391,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <span style="font-size:0.6rem;color:#555" id="header-status-text">Connected</span>
         <a href="http://pool.tazminer.com:3000" target="_blank" rel="noopener" class="header-link" style="color:#f4b728;font-weight:600">Mine in Browser</a>
         <a href="/zallet" class="header-link">Wallet</a>
+        <a href="/previews" class="header-link">Themes</a>
     </div>
 </div>
 
