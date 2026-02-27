@@ -1,11 +1,50 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{Html, Json};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::task::JoinSet;
 
 use crate::handlers::AppState;
 
-const CACHE_TTL_MS: i64 = 60_000;
-const BLOCKS_TO_SCAN: u64 = 100;
+/// Number of blocks to fetch concurrently per batch.
+const CONCURRENCY: usize = 25;
+
+#[derive(Deserialize)]
+pub struct NetworkQuery {
+    #[serde(default = "default_range")]
+    pub range: String,
+}
+
+fn default_range() -> String {
+    "1h".to_string()
+}
+
+/// Validate and normalize the range parameter.
+fn normalize_range(raw: &str) -> &'static str {
+    match raw {
+        "24h" => "24h",
+        "1w" => "1w",
+        _ => "1h",
+    }
+}
+
+/// (range_seconds, max_blocks_to_scan)
+fn range_params(range: &str) -> (i64, u64) {
+    match range {
+        "24h" => (24 * 3600, 1500),
+        "1w" => (7 * 24 * 3600, 3000),
+        _ => (3600, 100),
+    }
+}
+
+/// Per-range cache TTL in milliseconds.
+fn cache_ttl_ms(range: &str) -> i64 {
+    match range {
+        "24h" => 120_000,
+        "1w" => 300_000,
+        _ => 60_000,
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub struct NetworkBlock {
@@ -54,96 +93,8 @@ fn truncate_address(addr: &str) -> String {
     }
 }
 
-async fn fetch_network_blocks(state: &AppState) -> Result<NetworkMiningStats, String> {
-    let tip = state.rpc.get_block_count().await.map_err(|e| format!("getblockcount: {e}"))?;
-    let start_height = if tip > BLOCKS_TO_SCAN { tip - BLOCKS_TO_SCAN + 1 } else { 1 };
-
-    let our_mining_address = state.mining_address.clone().unwrap_or_default();
-
-    let mut blocks = Vec::with_capacity(BLOCKS_TO_SCAN as usize);
-
-    for height in (start_height..=tip).rev() {
-        let hash = match state.rpc.get_block_hash(height).await {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-
-        // Try verbosity=2 first (full tx objects inline)
-        let block_data = match state.rpc.get_block(&hash, 2).await {
-            Ok(d) => d,
-            Err(_) => {
-                // Fallback to verbosity=1 (txids only)
-                match state.rpc.get_block(&hash, 1).await {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                }
-            }
-        };
-
-        let time = block_data.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
-
-        // Extract coinbase transaction
-        let (miner_address, reward_zec, coinbase_text) = extract_coinbase_info(state, &block_data).await;
-
-        let is_our_pool = !our_mining_address.is_empty() && miner_address == our_mining_address;
-        let miner_label = if is_our_pool {
-            "Our Pool".to_string()
-        } else {
-            truncate_address(&miner_address)
-        };
-
-        blocks.push(NetworkBlock {
-            height,
-            hash: hash.clone(),
-            time,
-            miner_address: miner_address.clone(),
-            miner_label,
-            reward_zec,
-            is_our_pool,
-            coinbase_text,
-        });
-    }
-
-    // Build distribution
-    let mut addr_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    for b in &blocks {
-        *addr_counts.entry(b.miner_address.clone()).or_insert(0) += 1;
-    }
-
-    let total = blocks.len() as f64;
-    let mut distribution: Vec<MinerDistribution> = addr_counts
-        .into_iter()
-        .map(|(addr, count)| {
-            let is_our_pool = !our_mining_address.is_empty() && addr == our_mining_address;
-            MinerDistribution {
-                label: if is_our_pool {
-                    "Our Pool".to_string()
-                } else {
-                    truncate_address(&addr)
-                },
-                address: addr,
-                block_count: count,
-                percent: if total > 0.0 { (count as f64 / total) * 100.0 } else { 0.0 },
-                is_our_pool,
-            }
-        })
-        .collect();
-    distribution.sort_by(|a, b| b.block_count.cmp(&a.block_count));
-
-    let our_pool_blocks = blocks.iter().filter(|b| b.is_our_pool).count() as u64;
-    let our_pool_percent = if total > 0.0 { (our_pool_blocks as f64 / total) * 100.0 } else { 0.0 };
-
-    Ok(NetworkMiningStats {
-        total_blocks: blocks.len() as u64,
-        our_pool_blocks,
-        our_pool_percent,
-        unique_miners: distribution.len() as u64,
-        blocks,
-        distribution,
-    })
-}
-
-async fn extract_coinbase_info(state: &AppState, block_data: &serde_json::Value) -> (String, f64, String) {
+/// Extract coinbase info from a block JSON (verbosity=2, full tx objects inline).
+fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, String) {
     let unknown = ("unknown".to_string(), 0.0, String::new());
 
     let tx_array = match block_data.get("tx").and_then(|v| v.as_array()) {
@@ -153,19 +104,14 @@ async fn extract_coinbase_info(state: &AppState, block_data: &serde_json::Value)
 
     let coinbase_tx = &tx_array[0];
 
-    // If verbosity=2, tx is a full object; if verbosity=1, it's a txid string
-    let tx_obj = if coinbase_tx.is_string() {
-        let txid = coinbase_tx.as_str().unwrap_or("");
-        match state.rpc.get_raw_transaction(txid, 1).await {
-            Ok(tx) => tx,
-            Err(_) => return unknown,
-        }
-    } else {
-        coinbase_tx.clone()
-    };
+    // With verbosity=2, tx should be a full object. If it's a txid string, we
+    // can't extract info without another RPC call — just mark as unknown.
+    if coinbase_tx.is_string() {
+        return unknown;
+    }
 
     // Extract coinbase text from vin[0].coinbase
-    let coinbase_text = tx_obj
+    let coinbase_text = coinbase_tx
         .get("vin")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
@@ -175,14 +121,13 @@ async fn extract_coinbase_info(state: &AppState, block_data: &serde_json::Value)
         .unwrap_or_default();
 
     // Extract miner address and reward from vout[0]
-    let vout = match tx_obj.get("vout").and_then(|v| v.as_array()) {
+    let vout = match coinbase_tx.get("vout").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
         _ => return ("unknown".to_string(), 0.0, coinbase_text),
     };
 
     let first_vout = &vout[0];
 
-    // Get reward: try valueZat first, then value
     let reward_zec = first_vout
         .get("valueZat")
         .and_then(|v| v.as_i64())
@@ -190,7 +135,6 @@ async fn extract_coinbase_info(state: &AppState, block_data: &serde_json::Value)
         .or_else(|| first_vout.get("value").and_then(|v| v.as_f64()))
         .unwrap_or(0.0);
 
-    // Get miner address from scriptPubKey.addresses[0]
     let miner_address = first_vout
         .get("scriptPubKey")
         .and_then(|spk| {
@@ -210,41 +154,180 @@ async fn extract_coinbase_info(state: &AppState, block_data: &serde_json::Value)
     (miner_address, reward_zec, coinbase_text)
 }
 
+async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMiningStats, String> {
+    let tip = state.rpc.get_block_count().await.map_err(|e| format!("getblockcount: {e}"))?;
+
+    let (range_secs, max_blocks) = range_params(range);
+    let cutoff_time = chrono::Utc::now().timestamp() - range_secs;
+
+    // Estimate how many blocks to scan with 20% buffer for block time variance.
+    let estimated_blocks = ((range_secs as f64 / 75.0) * 1.2) as u64;
+    let scan_count = estimated_blocks.min(max_blocks);
+    let start_height = (tip).saturating_sub(scan_count).max(1);
+
+    let our_mining_address = state.mining_address.clone().unwrap_or_default();
+
+    // Collect heights to fetch (newest first).
+    let heights: Vec<u64> = (start_height..=tip).rev().collect();
+
+    // Fetch blocks in parallel batches.
+    let mut raw_blocks: Vec<(u64, serde_json::Value)> = Vec::with_capacity(heights.len());
+
+    for chunk in heights.chunks(CONCURRENCY) {
+        let mut set = JoinSet::new();
+        for &h in chunk {
+            let rpc = Arc::clone(&state.rpc);
+            set.spawn(async move {
+                // get_block_hash then get_block(hash, 2) for full tx objects
+                let hash = match rpc.get_block_hash(h).await {
+                    Ok(hash) => hash,
+                    Err(_) => return None,
+                };
+                match rpc.get_block(&hash, 2).await {
+                    Ok(data) => Some((h, data)),
+                    Err(_) => {
+                        // Fallback to verbosity=1
+                        match rpc.get_block(&hash, 1).await {
+                            Ok(data) => Some((h, data)),
+                            Err(_) => None,
+                        }
+                    }
+                }
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some(pair)) = res {
+                raw_blocks.push(pair);
+            }
+        }
+    }
+
+    // Sort by height descending.
+    raw_blocks.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Extract block info, filtering by cutoff time.
+    let mut blocks = Vec::with_capacity(raw_blocks.len());
+    for (height, block_data) in &raw_blocks {
+        let time = block_data.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
+        if time < cutoff_time {
+            continue;
+        }
+
+        let hash = block_data
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (miner_address, reward_zec, coinbase_text) = extract_coinbase_from_block(block_data);
+
+        let is_our_pool = !our_mining_address.is_empty() && miner_address == our_mining_address;
+        let miner_label = if is_our_pool {
+            "Our Pool".to_string()
+        } else {
+            truncate_address(&miner_address)
+        };
+
+        blocks.push(NetworkBlock {
+            height: *height,
+            hash,
+            time,
+            miner_address,
+            miner_label,
+            reward_zec,
+            is_our_pool,
+            coinbase_text,
+        });
+    }
+
+    // Build distribution.
+    let mut addr_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for b in &blocks {
+        *addr_counts.entry(b.miner_address.clone()).or_insert(0) += 1;
+    }
+
+    let total = blocks.len() as f64;
+    let mut distribution: Vec<MinerDistribution> = addr_counts
+        .into_iter()
+        .map(|(addr, count)| {
+            let is_our_pool = !our_mining_address.is_empty() && addr == our_mining_address;
+            MinerDistribution {
+                label: if is_our_pool {
+                    "Our Pool".to_string()
+                } else {
+                    truncate_address(&addr)
+                },
+                address: addr,
+                block_count: count,
+                percent: if total > 0.0 {
+                    (count as f64 / total) * 100.0
+                } else {
+                    0.0
+                },
+                is_our_pool,
+            }
+        })
+        .collect();
+    distribution.sort_by(|a, b| b.block_count.cmp(&a.block_count));
+
+    let our_pool_blocks = blocks.iter().filter(|b| b.is_our_pool).count() as u64;
+    let our_pool_percent = if total > 0.0 {
+        (our_pool_blocks as f64 / total) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(NetworkMiningStats {
+        total_blocks: blocks.len() as u64,
+        our_pool_blocks,
+        our_pool_percent,
+        unique_miners: distribution.len() as u64,
+        blocks,
+        distribution,
+    })
+}
+
+fn empty_stats() -> NetworkMiningStats {
+    NetworkMiningStats {
+        blocks: vec![],
+        distribution: vec![],
+        total_blocks: 0,
+        our_pool_blocks: 0,
+        our_pool_percent: 0.0,
+        unique_miners: 0,
+    }
+}
+
 pub async fn get_network_blocks(
     State(state): State<AppState>,
+    Query(query): Query<NetworkQuery>,
 ) -> Json<NetworkMiningStats> {
-    // Check cache
+    let range = normalize_range(&query.range);
+    let ttl = cache_ttl_ms(range);
+
+    // Check per-range cache.
     {
         let cache = state.network_blocks_cache.read().await;
-        if let Some((ref data, ts)) = *cache {
+        if let Some((ref data, ts)) = cache.get(range) {
             let now = chrono::Utc::now().timestamp_millis();
-            if now - ts < CACHE_TTL_MS {
+            if now - ts < ttl {
                 return Json(data.clone());
             }
         }
     }
 
-    // Cache miss — fetch fresh data
-    let stats = match fetch_network_blocks(&state).await {
+    // Cache miss — fetch fresh data.
+    let stats = match fetch_network_blocks(&state, range).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to fetch network blocks");
-            // Return empty stats on error
-            NetworkMiningStats {
-                blocks: vec![],
-                distribution: vec![],
-                total_blocks: 0,
-                our_pool_blocks: 0,
-                our_pool_percent: 0.0,
-                unique_miners: 0,
-            }
+            tracing::error!(error = %e, range = range, "Failed to fetch network blocks");
+            empty_stats()
         }
     };
 
-    // Update cache
+    // Update cache.
     {
         let mut cache = state.network_blocks_cache.write().await;
-        *cache = Some((stats.clone(), chrono::Utc::now().timestamp_millis()));
+        cache.insert(range.to_string(), (stats.clone(), chrono::Utc::now().timestamp_millis()));
     }
 
     Json(stats)
@@ -311,6 +394,41 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
         .header-link.active { color: #f4b728; }
 
         .container { max-width: 1400px; margin: 0 auto; padding: 1rem 1.5rem; }
+
+        /* ── Range Selector ── */
+        .range-bar {
+            display: flex;
+            align-items: center;
+            gap: 0;
+            margin-bottom: 1rem;
+            border: 1px solid #222;
+            background: #222;
+        }
+        .range-btn {
+            padding: 0.5rem 1.25rem;
+            background: #111;
+            border: none;
+            color: #555;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            cursor: pointer;
+            transition: color 0.15s, background 0.15s;
+        }
+        .range-btn:hover { color: #999; background: #151515; }
+        .range-btn.active { color: #f4b728; background: #1a1a1a; }
+        .range-status {
+            margin-left: auto;
+            padding: 0 1rem;
+            font-size: 0.6rem;
+            color: #444;
+            background: #111;
+            height: 100%;
+            display: flex;
+            align-items: center;
+        }
 
         .summary-grid {
             display: grid;
@@ -412,6 +530,16 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             padding: 0.25rem 0;
         }
 
+        @keyframes pulse-load {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .loading-indicator {
+            color: #f4b728;
+            font-size: 0.6rem;
+            animation: pulse-load 1.5s ease-in-out infinite;
+        }
+
         @media (max-width: 900px) {
             .summary-grid { grid-template-columns: repeat(2, 1fr); }
             .content-row { grid-template-columns: 1fr; }
@@ -434,6 +562,14 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
 </div>
 
 <div class="container">
+
+    <!-- Range Selector -->
+    <div class="range-bar">
+        <button class="range-btn active" data-range="1h" onclick="setRange('1h')">1 Hour</button>
+        <button class="range-btn" data-range="24h" onclick="setRange('24h')">24 Hours</button>
+        <button class="range-btn" data-range="1w" onclick="setRange('1w')">1 Week</button>
+        <div class="range-status" id="range-status"></div>
+    </div>
 
     <div class="summary-grid">
         <div class="summary-cell">
@@ -500,19 +636,41 @@ const CHART_COLORS = [
     '#76e4f7', '#fca5a5', '#86efac', '#c4b5fd', '#fdba74'
 ];
 
+const REFRESH_MS = { '1h': 60000, '24h': 120000, '1w': 300000 };
+
 let distChart = null;
+let currentRange = '1h';
+let refreshTimer = null;
+let fetching = false;
 
 function formatTime(ts) {
     const d = new Date(ts * 1000);
     return d.toLocaleString();
 }
 
+function setRange(range) {
+    if (fetching) return;
+    currentRange = range;
+    document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+    document.querySelector('[data-range="' + range + '"]').classList.add('active');
+
+    // Reset auto-refresh interval for this range
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(fetchData, REFRESH_MS[range] || 60000);
+
+    fetchData();
+}
+
 async function fetchData() {
+    if (fetching) return;
+    fetching = true;
+    const status = document.getElementById('range-status');
+    status.innerHTML = '<span class="loading-indicator">Loading...</span>';
+
     try {
-        const resp = await fetch('/api/network/blocks');
+        const resp = await fetch('/api/network/blocks?range=' + currentRange);
         const data = await resp.json();
 
-        // Summary stats
         document.getElementById('stat-total').textContent = data.total_blocks;
         document.getElementById('stat-ours').textContent = data.our_pool_blocks;
         document.getElementById('stat-share').textContent = data.our_pool_percent.toFixed(1) + '%';
@@ -562,9 +720,7 @@ async function fetchData() {
                     responsive: true,
                     maintainAspectRatio: true,
                     plugins: {
-                        legend: {
-                            display: false
-                        },
+                        legend: { display: false },
                         tooltip: {
                             backgroundColor: '#1a1a1a',
                             titleColor: '#888',
@@ -604,15 +760,18 @@ async function fetchData() {
             }).join('');
         }
 
-        document.getElementById('last-updated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+        status.textContent = data.total_blocks + ' blocks \u00b7 Updated ' + new Date().toLocaleTimeString();
     } catch (e) {
         console.error('Failed to fetch network data:', e);
+        status.textContent = 'Error loading data';
+    } finally {
+        fetching = false;
     }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
     fetchData();
-    setInterval(fetchData, 60000);
+    refreshTimer = setInterval(fetchData, REFRESH_MS[currentRange]);
 });
 </script>
 </body>

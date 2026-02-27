@@ -38,8 +38,8 @@ pub struct ApiState {
     /// Difficulty multiplier: converts shares/sec to Sol/s.
     /// Equal to 2^256 / share_target. For target 0800...0000 this is 32.
     pub difficulty_multiplier: f64,
-    /// Cache for network block mining stats (data, fetch_timestamp_ms). TTL = 60s.
-    pub network_blocks_cache: tokio::sync::RwLock<Option<(crate::network::NetworkMiningStats, i64)>>,
+    /// Per-range cache for network block mining stats. Key = range ("1h","24h","1w").
+    pub network_blocks_cache: tokio::sync::RwLock<std::collections::HashMap<String, (crate::network::NetworkMiningStats, i64)>>,
 }
 
 #[derive(Serialize)]
