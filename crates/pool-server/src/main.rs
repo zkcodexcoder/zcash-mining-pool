@@ -685,9 +685,19 @@ async fn process_payouts(
         available_zec / total_payout_zec
     };
 
-    // Build scaled payout list in zatoshis, skipping miners below minimum.
+    // Build scaled payout list in zatoshis, skipping miners below minimum
+    // or with invalid addresses.
     let mut payout_list: Vec<(usize, i64)> = Vec::new(); // (index into pending, scaled_zatoshis)
     for (i, p) in pending.iter().enumerate() {
+        // Skip invalid addresses: must start with a known Zcash prefix
+        if !is_valid_zcash_address(&p.address) {
+            warn!(
+                miner_id = p.miner_id,
+                address = %p.address,
+                "Skipping payout: invalid address format"
+            );
+            continue;
+        }
         let scaled_zatoshis = (p.amount as f64 * scale).floor() as i64;
         if scaled_zatoshis >= min_payout_zatoshis {
             payout_list.push((i, scaled_zatoshis));
@@ -809,4 +819,19 @@ fn parse_have_balance(msg: &str) -> Option<i64> {
     let rest = &msg[start..];
     let end = rest.find(|c: char| !c.is_ascii_digit())?;
     rest[..end].parse::<i64>().ok()
+}
+
+/// Check if an address looks like a valid Zcash address (t-addr, z-addr, or unified).
+fn is_valid_zcash_address(addr: &str) -> bool {
+    // Transparent: t1/t3 (mainnet) or tm/t2 (testnet)
+    // Sapling: zs (mainnet) or ztestsapling (testnet)
+    // Unified: u1 (mainnet) or utest (testnet)
+    addr.starts_with("t1")
+        || addr.starts_with("t3")
+        || addr.starts_with("tm")
+        || addr.starts_with("t2")
+        || addr.starts_with("zs")
+        || addr.starts_with("ztestsapling")
+        || addr.starts_with("u1")
+        || addr.starts_with("utest")
 }
