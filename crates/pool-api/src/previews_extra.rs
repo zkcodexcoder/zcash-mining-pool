@@ -351,6 +351,7 @@ h1{font-size:24px;font-weight:600;color:#f0f8ff;text-align:center;margin-bottom:
   <a href="/preview18" class="thumb"><div class="iframe-wrap"><iframe src="/preview18" loading="lazy"></iframe></div><div class="thumb-info"><div><div class="thumb-name">Blueprint</div><div class="thumb-desc">Technical drawing, CAD-style blue lines on dark</div></div><div class="thumb-num">#18</div></div></a>
   <a href="/preview19" class="thumb"><div class="iframe-wrap"><iframe src="/preview19" loading="lazy"></iframe></div><div class="thumb-info"><div><div class="thumb-name">Solarpunk</div><div class="thumb-desc">Warm olive/green, organic nature tech</div></div><div class="thumb-num">#19</div></div></a>
   <a href="/preview20" class="thumb"><div class="iframe-wrap"><iframe src="/preview20" loading="lazy"></iframe></div><div class="thumb-info"><div><div class="thumb-name">Crimson</div><div class="thumb-desc">Deep red/black, luxurious dark premium feel</div></div><div class="thumb-num">#20</div></div></a>
+  <a href="/preview21" class="thumb" style="border-color:rgba(0,229,255,0.6);box-shadow:0 0 20px rgba(0,229,255,0.3)"><div class="iframe-wrap"><iframe src="/preview21" loading="lazy"></iframe></div><div class="thumb-info"><div><div class="thumb-name">Tempest</div><div class="thumb-desc">Premium: Canvas gauges, sparklines, VFD glow, LEDs</div></div><div class="thumb-num">#21</div></div></a>
 </div>
 </main></body></html>
 "##;

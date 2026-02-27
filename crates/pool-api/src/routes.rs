@@ -43,6 +43,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/preview18", get(previews::preview18))
         .route("/preview19", get(previews::preview19))
         .route("/preview20", get(previews::preview20))
+        .route("/preview21", get(previews::preview21))
         .route("/previews", get(previews::gallery))
         .layer(CorsLayer::permissive())
         .with_state(state)
