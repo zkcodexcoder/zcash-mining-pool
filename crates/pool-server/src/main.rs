@@ -279,11 +279,12 @@ async fn main() -> Result<()> {
     });
 
     // Spawn background network cache warmer so /network page loads instantly.
-    // Refreshes the 1h cache every 55s (just before 60s TTL expires).
+    // Warms all three ranges (1h, 24h, 1w) every 55s; warm_cache skips ranges
+    // whose TTL hasn't expired yet, so heavier ranges refresh less often.
     let net_cache_state = Arc::clone(&api_state);
     let net_cache_handle = tokio::spawn(async move {
         loop {
-            pool_api::warm_network_cache(&net_cache_state, &["1h"]).await;
+            pool_api::warm_network_cache(&net_cache_state, &["1h", "24h", "1w"]).await;
             tokio::time::sleep(Duration::from_secs(55)).await;
         }
     });
