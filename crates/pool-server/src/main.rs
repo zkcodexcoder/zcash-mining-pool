@@ -821,17 +821,15 @@ fn parse_have_balance(msg: &str) -> Option<i64> {
     rest[..end].parse::<i64>().ok()
 }
 
-/// Check if an address looks like a valid Zcash address (t-addr, z-addr, or unified).
+/// Check if an address looks like a valid Zcash testnet address.
+/// Rejects mainnet addresses, garbage strings, and anything else that would
+/// cause z_sendmany to fail and block the entire payout batch.
 fn is_valid_zcash_address(addr: &str) -> bool {
-    // Transparent: t1/t3 (mainnet) or tm/t2 (testnet)
-    // Sapling: zs (mainnet) or ztestsapling (testnet)
-    // Unified: u1 (mainnet) or utest (testnet)
-    addr.starts_with("t1")
-        || addr.starts_with("t3")
-        || addr.starts_with("tm")
+    // Testnet transparent: tm/t2
+    // Testnet sapling: ztestsapling
+    // Testnet unified: utest
+    addr.starts_with("tm")
         || addr.starts_with("t2")
-        || addr.starts_with("zs")
         || addr.starts_with("ztestsapling")
-        || addr.starts_with("u1")
         || addr.starts_with("utest")
 }
