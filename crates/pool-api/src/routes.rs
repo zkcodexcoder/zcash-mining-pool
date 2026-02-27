@@ -4,6 +4,7 @@ use axum::Router;
 use tower_http::cors::CorsLayer;
 
 use crate::handlers::*;
+use crate::previews;
 
 /// Build the full API router.
 pub fn build_router(state: AppState) -> Router {
@@ -22,6 +23,11 @@ pub fn build_router(state: AppState) -> Router {
         .merge(api)
         .route("/", get(dashboard))
         .route("/zallet", get(zallet_dashboard))
+        .route("/preview1", get(previews::preview1))
+        .route("/preview2", get(previews::preview2))
+        .route("/preview3", get(previews::preview3))
+        .route("/preview4", get(previews::preview4))
+        .route("/preview5", get(previews::preview5))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
