@@ -15,6 +15,11 @@ pub async fn preview12() -> Html<String> { Html(PREVIEW12.to_string()) }
 pub async fn preview13() -> Html<String> { Html(PREVIEW13.to_string()) }
 pub async fn preview14() -> Html<String> { Html(PREVIEW14.to_string()) }
 pub async fn preview15() -> Html<String> { Html(PREVIEW15.to_string()) }
+pub async fn preview16() -> Html<String> { Html(PREVIEW16.to_string()) }
+pub async fn preview17() -> Html<String> { Html(PREVIEW17.to_string()) }
+pub async fn preview18() -> Html<String> { Html(PREVIEW18.to_string()) }
+pub async fn preview19() -> Html<String> { Html(PREVIEW19.to_string()) }
+pub async fn preview20() -> Html<String> { Html(PREVIEW20.to_string()) }
 pub async fn gallery() -> Html<String> { Html(GALLERY.to_string()) }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -921,3 +926,4 @@ setInterval(tick,10000);setInterval(miners,10000);setInterval(blocks,30000);setI
 // Previews 6-10 and Gallery are in previews_extra.rs
 include!("previews_extra.rs");
 include!("previews_extra2.rs");
+include!("previews_extra3.rs");
