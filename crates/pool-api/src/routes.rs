@@ -417,6 +417,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="label">Pool Hashrate</div>
             <div class="value-row">
                 <div class="value" id="stat-hashrate">--</div>
+                <div class="sub" id="stat-hashrate-avg"></div>
             </div>
             <div class="sparkline-wrap"><canvas id="spark-hashrate"></canvas></div>
         </div>
@@ -752,7 +753,8 @@ async function fetchStats() {
             if (el && el.textContent !== String(val)) { el.textContent = val; flashEl(id); }
         };
 
-        setVal('stat-hashrate', formatHashrate(d.hashrate_estimate));
+        setVal('stat-hashrate', formatHashrate(d.hashrate_current));
+        document.getElementById('stat-hashrate-avg').textContent = '10m: ' + formatHashrate(d.hashrate_estimate);
         setVal('stat-net-hashrate', formatHashrate(d.network_hashrate));
         setVal('stat-blocks', d.total_blocks);
         setVal('stat-miners', d.connected_miners);

@@ -53,6 +53,8 @@ pub struct PoolStats {
     pub pending_payout_blocks: i64,
     pub total_shares: i64,
     pub hashrate_estimate: f64,
+    /// Short-term (1 min) pool hashrate for responsive display.
+    pub hashrate_current: f64,
     pub network_hashrate: f64,
     /// Pool luck over the last 24h as a percentage (100 = exactly as expected).
     pub luck_percent: Option<f64>,
@@ -144,6 +146,7 @@ pub async fn get_pool_stats(
 
     // Pool hashrate: difficulty_sum / time × difficulty_multiplier = Sol/s.
     // Uses SUM(difficulty) instead of COUNT(*) to account for vardiff.
+    // 10-minute average (smooth, used for luck/sparklines).
     let since_10m = chrono::Utc::now()
         .checked_sub_signed(chrono::Duration::minutes(10))
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -154,6 +157,18 @@ pub async fn get_pool_stats(
         .await
         .unwrap_or(0.0);
     let hashrate = (diff_sum_10m / 600.0) * state.difficulty_multiplier;
+
+    // 1-minute current hashrate (responsive display).
+    let since_1m = chrono::Utc::now()
+        .checked_sub_signed(chrono::Duration::minutes(1))
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+    let diff_sum_1m = state
+        .db
+        .get_difficulty_sum_since(&since_1m)
+        .await
+        .unwrap_or(0.0);
+    let hashrate_current = (diff_sum_1m / 60.0) * state.difficulty_multiplier;
 
     let (node_ok, last_template_at) = match &state.last_template_at_ms {
         None => (true, None),
@@ -222,6 +237,7 @@ pub async fn get_pool_stats(
         pending_payout_blocks: pending_payout,
         total_shares: shares,
         hashrate_estimate: hashrate,
+        hashrate_current,
         network_hashrate,
         luck_percent,
         pool_percent_24h,
