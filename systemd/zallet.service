@@ -7,9 +7,10 @@ Wants=network-online.target
 Type=simple
 User=zec
 Group=zec
+ExecStartPre=/bin/rm -f /home/zec/.zallet/.lock
 ExecStart=/home/zec/zallet/target/release/zallet --datadir /home/zec/.zallet start
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 StandardOutput=append:/home/zec/zallet.log
 StandardError=append:/home/zec/zallet.log
 
