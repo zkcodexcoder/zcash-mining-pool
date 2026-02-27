@@ -3,6 +3,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
+use crate::diagnostics;
 use crate::handlers::*;
 use crate::network;
 use crate::previews;
@@ -19,11 +20,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/blocks/immature", get(get_immature_blocks))
         .route("/api/payout/trigger", post(trigger_payout))
         .route("/api/network/blocks", get(network::get_network_blocks))
-        .route("/health", get(get_health));
+        .route("/health", get(get_health))
+        .route("/api/miner/{address}/diagnostics", get(diagnostics::get_miner_diagnostics));
 
     Router::new()
         .merge(api)
         .route("/", get(dashboard))
+        .route("/miner/{address}", get(diagnostics::miner_page))
         .route("/network", get(network::network_page))
         .route("/zallet", get(zallet_dashboard))
         .route("/preview1", get(previews::preview1))
@@ -869,7 +872,7 @@ async function fetchMiners() {
         }
         tbody.innerHTML = miners.map(m =>
             '<tr>' +
-            '<td class="addr-cell" title="' + m.address + '"><span class="addr-link" onclick="doLookup(\'' + m.address.replace(/'/g, "\\'") + '\')">' + m.address + '</span></td>' +
+            '<td class="addr-cell" title="' + m.address + '"><a class="addr-link" href="/miner/' + encodeURIComponent(m.address) + '">' + m.address + '</a></td>' +
             '<td>' + formatHashrate(m.hashrate_1m) + '</td>' +
             '<td>' + formatHashrate(m.hashrate) + '</td>' +
             '<td>' + m.worker_count + '</td>' +

@@ -1,6 +1,27 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerDiagnostics {
+    pub id: i64,
+    pub name: String,
+    pub last_seen: String,
+    pub current_difficulty: Option<f64>,
+    pub diff_sum_1m: f64,
+    pub diff_sum_10m: f64,
+    pub shares_10m: i64,
+    pub total_shares: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareDetail {
+    pub id: i64,
+    pub difficulty: f64,
+    pub is_block: bool,
+    pub created_at: String,
+    pub worker_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Miner {
     pub id: i64,

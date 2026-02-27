@@ -471,6 +471,109 @@ impl PoolDb {
         Ok(entries)
     }
 
+    // -- Diagnostics --
+
+    /// Get per-worker stats for a miner, including current difficulty and hashrate data.
+    pub async fn get_worker_stats_for_miner(
+        &self,
+        miner_id: i64,
+        since_1m: &str,
+        since_10m: &str,
+    ) -> Result<Vec<WorkerDiagnostics>, DbError> {
+        let rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT w.id, w.name, w.last_seen, \
+                    (SELECT s.difficulty FROM shares s WHERE s.worker_id = w.id ORDER BY s.id DESC LIMIT 1) as current_difficulty, \
+                    COALESCE((SELECT SUM(s.difficulty) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?1), 0) as diff_sum_1m, \
+                    COALESCE((SELECT SUM(s.difficulty) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?2), 0) as diff_sum_10m, \
+                    COALESCE((SELECT COUNT(*) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?2), 0) as shares_10m, \
+                    (SELECT COUNT(*) FROM shares s WHERE s.worker_id = w.id) as total_shares \
+             FROM workers w WHERE w.miner_id = ?3",
+        )
+        .bind(since_1m)
+        .bind(since_10m)
+        .bind(miner_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| WorkerDiagnostics {
+                id: row.get("id"),
+                name: row.get("name"),
+                last_seen: row.get("last_seen"),
+                current_difficulty: row.get("current_difficulty"),
+                diff_sum_1m: row.get("diff_sum_1m"),
+                diff_sum_10m: row.get("diff_sum_10m"),
+                shares_10m: row.get("shares_10m"),
+                total_shares: row.get("total_shares"),
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
+    /// Get recent shares for a miner with worker name, for the diagnostics page.
+    pub async fn get_recent_shares_for_miner(
+        &self,
+        miner_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ShareDetail>, DbError> {
+        let rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT s.id, s.difficulty, s.is_block, s.created_at, w.name as worker_name \
+             FROM shares s \
+             JOIN workers w ON s.worker_id = w.id \
+             WHERE w.miner_id = ?1 \
+             ORDER BY s.id DESC \
+             LIMIT ?2",
+        )
+        .bind(miner_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| ShareDetail {
+                id: row.get("id"),
+                difficulty: row.get("difficulty"),
+                is_block: row.get("is_block"),
+                created_at: row.get("created_at"),
+                worker_name: row.get("worker_name"),
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
+    /// Get all blocks found by a specific miner's workers.
+    pub async fn get_miner_blocks(&self, miner_id: i64) -> Result<Vec<Block>, DbError> {
+        let blocks: Vec<Block> = sqlx::query_as(
+            "SELECT b.id, b.height, b.hash, b.reward, b.status, b.found_by, b.created_at \
+             FROM blocks b \
+             JOIN workers w ON b.found_by = w.id \
+             WHERE w.miner_id = ?1 \
+             ORDER BY b.height DESC",
+        )
+        .bind(miner_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(blocks)
+    }
+
+    /// Get recent payouts for a specific miner.
+    pub async fn get_miner_payouts(&self, miner_id: i64, limit: i64) -> Result<Vec<Payout>, DbError> {
+        let payouts: Vec<Payout> = sqlx::query_as(
+            "SELECT id, miner_id, txid, amount, created_at FROM payouts WHERE miner_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )
+        .bind(miner_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(payouts)
+    }
+
     /// Get shares grouped by miner for the last N shares (for PPLNS).
     pub async fn get_pplns_shares(
         &self,
