@@ -23,6 +23,8 @@ pub async fn preview20() -> Html<String> { Html(PREVIEW20.to_string()) }
 pub async fn preview21() -> Html<String> { Html(PREVIEW21.to_string()) }
 pub async fn preview22() -> Html<String> { Html(PREVIEW22.to_string()) }
 pub async fn preview23() -> Html<String> { Html(PREVIEW23.to_string()) }
+pub async fn preview24() -> Html<String> { Html(PREVIEW24.to_string()) }
+pub async fn preview25() -> Html<String> { Html(PREVIEW25.to_string()) }
 pub async fn gallery() -> Html<String> { Html(GALLERY.to_string()) }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -932,3 +934,4 @@ include!("previews_extra2.rs");
 include!("previews_extra3.rs");
 include!("previews_extra4.rs");
 include!("previews_extra5.rs");
+include!("previews_extra6.rs");
