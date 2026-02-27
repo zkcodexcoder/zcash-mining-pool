@@ -333,6 +333,37 @@ pub async fn get_network_blocks(
     Json(stats)
 }
 
+/// Pre-fetch and cache network block data for the given ranges.
+/// Called from a background task to keep the cache warm so the /network page
+/// loads instantly instead of waiting for RPC calls.
+pub async fn warm_cache(state: &AppState, ranges: &[&str]) {
+    for &range in ranges {
+        let range = normalize_range(range);
+        let ttl = cache_ttl_ms(range);
+
+        // Skip if cache is still fresh.
+        {
+            let cache = state.network_blocks_cache.read().await;
+            if let Some((_, ts)) = cache.get(range) {
+                let now = chrono::Utc::now().timestamp_millis();
+                if now - *ts < ttl {
+                    continue;
+                }
+            }
+        }
+
+        match fetch_network_blocks(state, range).await {
+            Ok(stats) => {
+                let mut cache = state.network_blocks_cache.write().await;
+                cache.insert(range.to_string(), (stats, chrono::Utc::now().timestamp_millis()));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, range = range, "Network cache warm failed");
+            }
+        }
+    }
+}
+
 pub async fn network_page() -> Html<String> {
     Html(NETWORK_HTML.to_string())
 }

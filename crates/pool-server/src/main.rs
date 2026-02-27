@@ -278,6 +278,16 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Spawn background network cache warmer so /network page loads instantly.
+    // Refreshes the 1h cache every 55s (just before 60s TTL expires).
+    let net_cache_state = Arc::clone(&api_state);
+    let net_cache_handle = tokio::spawn(async move {
+        loop {
+            pool_api::warm_network_cache(&net_cache_state, &["1h"]).await;
+            tokio::time::sleep(Duration::from_secs(55)).await;
+        }
+    });
+
     let router = pool_api::build_router(api_state);
 
     // Spawn all services
@@ -371,6 +381,7 @@ async fn main() -> Result<()> {
     share_handle.abort();
     api_handle.abort();
     history_handle.abort();
+    net_cache_handle.abort();
     if let Some(h) = payout_handle { h.abort(); }
 
     info!("Pool shut down gracefully");
