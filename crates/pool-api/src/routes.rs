@@ -396,6 +396,18 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             .metrics-grid { grid-template-columns: repeat(2, 1fr); }
         }
         .loading { color: #333; font-style: italic; font-family: inherit; }
+        .toggle-row td {
+            text-align: center;
+            color: #555;
+            cursor: pointer;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            padding: 0.5rem;
+        }
+        .toggle-row:hover td { color: #f4b728; background: #151515; }
+        .hidden-rows { display: none; }
     </style>
 </head>
 <body>
@@ -744,6 +756,35 @@ function updateCharts() {
     chartMining.update('none');
 }
 
+/* ── Collapsible Table Helper ── */
+const COLLAPSE_LIMIT = 10;
+function renderCollapsible(rows, colspan, id) {
+    if (rows.length <= COLLAPSE_LIMIT) return rows.join('');
+    const visible = rows.slice(0, COLLAPSE_LIMIT).join('');
+    const hidden = rows.slice(COLLAPSE_LIMIT).join('');
+    const remaining = rows.length - COLLAPSE_LIMIT;
+    return visible +
+        '<tr class="hidden-rows" id="' + id + '-hidden">' +
+            '<td colspan="' + colspan + '" style="padding:0;border:0">' +
+                '<table style="width:100%">' + hidden + '</table>' +
+            '</td>' +
+        '</tr>' +
+        '<tr class="toggle-row" onclick="toggleTable(\'' + id + '\')">' +
+            '<td colspan="' + colspan + '" id="' + id + '-toggle">Show all ' + rows.length + ' ' + id + ' ▾</td>' +
+        '</tr>';
+}
+function toggleTable(id) {
+    const hidden = document.getElementById(id + '-hidden');
+    const toggle = document.getElementById(id + '-toggle');
+    if (!hidden || !toggle) return;
+    const expanded = hidden.style.display === 'table-row';
+    hidden.style.display = expanded ? 'none' : 'table-row';
+    const total = hidden.querySelector('table').rows.length + COLLAPSE_LIMIT;
+    toggle.textContent = expanded
+        ? 'Show all ' + total + ' ' + id + ' ▾'
+        : 'Show less ▴';
+}
+
 /* ── Data Fetching ── */
 async function fetchStats() {
     try {
@@ -842,7 +883,7 @@ async function fetchBlocks() {
             tbody.innerHTML = '<tr><td colspan="6" class="loading">No blocks found yet</td></tr>';
             return;
         }
-        tbody.innerHTML = blocks.map(b => {
+        const rows = blocks.map(b => {
             let luckStr = '--';
             let luckColor = '#555';
             if (b.luck_percent != null) {
@@ -857,7 +898,8 @@ async function fetchBlocks() {
                 '<td class="status-' + b.status + '">' + b.status + '</td>' +
                 '<td>' + b.found_at + '</td>' +
                 '</tr>';
-        }).join('');
+        });
+        tbody.innerHTML = renderCollapsible(rows, 6, 'blocks');
     } catch (e) {
         console.error('Failed to fetch blocks:', e);
     }
@@ -872,7 +914,7 @@ async function fetchMiners() {
             tbody.innerHTML = '<tr><td colspan="7" class="loading">No miners yet</td></tr>';
             return;
         }
-        tbody.innerHTML = miners.map(m =>
+        const rows = miners.map(m =>
             '<tr>' +
             '<td class="addr-cell" title="' + m.address + '"><a class="addr-link" href="/miner/' + encodeURIComponent(m.address) + '">' + m.address + '</a></td>' +
             '<td>' + formatHashrate(m.hashrate_1m) + '</td>' +
@@ -882,7 +924,8 @@ async function fetchMiners() {
             '<td>' + m.pending_zec.toFixed(8) + ' TAZ</td>' +
             '<td>' + m.joined + '</td>' +
             '</tr>'
-        ).join('');
+        );
+        tbody.innerHTML = renderCollapsible(rows, 7, 'miners');
     } catch (e) {
         console.error('Failed to fetch miners:', e);
     }
@@ -897,7 +940,7 @@ async function fetchPayouts() {
             tbody.innerHTML = '<tr><td colspan="4" class="loading">No payouts yet</td></tr>';
             return;
         }
-        tbody.innerHTML = payouts.map(p => {
+        const rows = payouts.map(p => {
             const txid = p.txid ? p.txid.substring(0, 16) + '...' : '--';
             const txTitle = p.txid || '';
             return '<tr>' +
@@ -906,7 +949,8 @@ async function fetchPayouts() {
                 '<td title="' + txTitle + '">' + txid + '</td>' +
                 '<td>' + p.created_at + '</td>' +
                 '</tr>';
-        }).join('');
+        });
+        tbody.innerHTML = renderCollapsible(rows, 4, 'payouts');
     } catch (e) {
         console.error('Failed to fetch payouts:', e);
     }
