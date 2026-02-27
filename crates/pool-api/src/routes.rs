@@ -4,6 +4,7 @@ use axum::Router;
 use tower_http::cors::CorsLayer;
 
 use crate::handlers::*;
+use crate::network;
 use crate::previews;
 
 /// Build the full API router.
@@ -17,11 +18,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/zallet/status", get(get_zallet_status))
         .route("/api/blocks/immature", get(get_immature_blocks))
         .route("/api/payout/trigger", post(trigger_payout))
+        .route("/api/network/blocks", get(network::get_network_blocks))
         .route("/health", get(get_health));
 
     Router::new()
         .merge(api)
         .route("/", get(dashboard))
+        .route("/network", get(network::network_page))
         .route("/zallet", get(zallet_dashboard))
         .route("/preview1", get(previews::preview1))
         .route("/preview2", get(previews::preview2))
@@ -400,6 +403,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <span class="status-dot pulsing" id="header-status-dot"></span>
         <span style="font-size:0.6rem;color:#555" id="header-status-text">Connected</span>
         <a href="http://pool.tazminer.com:3000" target="_blank" rel="noopener" class="header-link" style="color:#f4b728;font-weight:600">Mine in Browser</a>
+        <a href="/network" class="header-link">Network</a>
         <a href="/zallet" class="header-link">Wallet</a>
         <a href="/previews" class="header-link">Themes</a>
     </div>

@@ -169,6 +169,18 @@ impl ZcashRpcClient {
         self.call("getblockhash", serde_json::json!([height])).await
     }
 
+    /// Get a block by hash or height with the specified verbosity level.
+    /// verbosity=0: hex-encoded data, 1: JSON object, 2: JSON with full tx objects.
+    pub async fn get_block(&self, hash_or_height: &str, verbosity: u8) -> Result<serde_json::Value, RpcError> {
+        self.call("getblock", serde_json::json!([hash_or_height, verbosity])).await
+    }
+
+    /// Get a raw transaction by txid.
+    /// verbose=0: hex string, verbose=1: JSON object.
+    pub async fn get_raw_transaction(&self, txid: &str, verbose: u8) -> Result<serde_json::Value, RpcError> {
+        self.call("getrawtransaction", serde_json::json!([txid, verbose])).await
+    }
+
     /// Get estimated network solutions per second.
     /// `blocks`: number of recent blocks to average over (default 120).
     pub async fn get_network_sol_ps(&self, blocks: Option<u32>) -> Result<f64, RpcError> {

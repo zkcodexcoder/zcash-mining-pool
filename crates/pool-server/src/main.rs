@@ -257,6 +257,7 @@ async fn main() -> Result<()> {
         mining_address: config.payout.mining_address.clone(),
         min_payout_zatoshis: (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64,
         maturity_confirmations: config.payout.maturity_confirmations,
+        network_blocks_cache: tokio::sync::RwLock::new(None),
         difficulty_multiplier: {
             // Convert shares/sec → Sol/s.  Each share means a hash below pool_target,
             // so on average each share takes 2^256 / target hashes to find.
