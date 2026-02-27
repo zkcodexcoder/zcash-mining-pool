@@ -17,8 +17,6 @@ StandardError=append:/home/zec/zcash-mining-pool/pool.log
 
 # Hardening
 NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/home/zec/zcash-mining-pool
 
 [Install]
 WantedBy=multi-user.target
