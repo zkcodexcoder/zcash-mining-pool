@@ -1,0 +1,24 @@
+[Unit]
+Description=Zcash Mining Pool
+After=network-online.target zallet.service
+Wants=network-online.target
+Requires=zallet.service
+
+[Service]
+Type=simple
+User=zec
+Group=zec
+WorkingDirectory=/home/zec/zcash-mining-pool
+ExecStart=/home/zec/zcash-mining-pool/target/release/zcash-pool config/pool.toml
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/zec/zcash-mining-pool/pool.log
+StandardError=append:/home/zec/zcash-mining-pool/pool.log
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/zec/zcash-mining-pool
+
+[Install]
+WantedBy=multi-user.target

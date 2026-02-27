@@ -1,0 +1,22 @@
+[Unit]
+Description=Zallet (Zcash Wallet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zec
+Group=zec
+ExecStart=/home/zec/zallet/target/release/zallet --datadir /home/zec/.zallet start
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/zec/zallet.log
+StandardError=append:/home/zec/zallet.log
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/zec/.zallet /home/zec/zallet.log
+
+[Install]
+WantedBy=multi-user.target
