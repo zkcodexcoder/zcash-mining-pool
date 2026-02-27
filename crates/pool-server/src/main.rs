@@ -258,6 +258,7 @@ async fn main() -> Result<()> {
         min_payout_zatoshis: (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64,
         maturity_confirmations: config.payout.maturity_confirmations,
         network_blocks_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        stats_history: pool_api::StatsHistory::new(),
         difficulty_multiplier: {
             // Convert shares/sec → Sol/s.  Each share means a hash below pool_target,
             // so on average each share takes 2^256 / target hashes to find.
@@ -267,6 +268,16 @@ async fn main() -> Result<()> {
             if target_f64 > 0.0 { 2.0f64.powi(256) / target_f64 } else { 1.0 }
         },
     });
+    // Spawn background stats history recorder (10s snapshots, 1hr ring buffer).
+    let history_state = Arc::clone(&api_state);
+    let history_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let snapshot = pool_api::compute_stats_snapshot(&history_state).await;
+            history_state.stats_history.push(snapshot).await;
+        }
+    });
+
     let router = pool_api::build_router(api_state);
 
     // Spawn all services
@@ -359,6 +370,7 @@ async fn main() -> Result<()> {
     job_handle.abort();
     share_handle.abort();
     api_handle.abort();
+    history_handle.abort();
     if let Some(h) = payout_handle { h.abort(); }
 
     info!("Pool shut down gracefully");

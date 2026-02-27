@@ -4,6 +4,7 @@ use axum::response::{Html, Json};
 use chrono::TimeZone;
 use node_rpc::ZcashRpcClient;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -40,6 +41,8 @@ pub struct ApiState {
     pub difficulty_multiplier: f64,
     /// Per-range cache for network block mining stats. Key = range ("1h","24h","1w").
     pub network_blocks_cache: tokio::sync::RwLock<std::collections::HashMap<String, (crate::network::NetworkMiningStats, i64)>>,
+    /// In-memory ring buffer of stats snapshots (1 hour @ 10s = 360 entries).
+    pub stats_history: StatsHistory,
 }
 
 #[derive(Serialize)]
@@ -133,20 +136,53 @@ pub struct ApiError {
     pub error: String,
 }
 
-const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
+/// A point-in-time snapshot of pool stats for the history ring buffer.
+#[derive(Clone, Serialize)]
+pub struct StatsSnapshot {
+    pub timestamp_ms: i64,
+    pub pool_hashrate: f64,
+    pub pool_hashrate_1m: f64,
+    pub network_hashrate: f64,
+    pub connected_miners: i64,
+    pub total_blocks: i64,
+    pub total_shares: i64,
+}
 
-pub async fn get_pool_stats(
-    State(state): State<AppState>,
-) -> Result<Json<PoolStats>, StatusCode> {
+/// Fixed-capacity ring buffer that holds up to 360 snapshots (1 hour @ 10s).
+pub struct StatsHistory {
+    buffer: tokio::sync::RwLock<VecDeque<StatsSnapshot>>,
+}
+
+const STATS_HISTORY_CAPACITY: usize = 360;
+
+impl StatsHistory {
+    pub fn new() -> Self {
+        Self {
+            buffer: tokio::sync::RwLock::new(VecDeque::with_capacity(STATS_HISTORY_CAPACITY)),
+        }
+    }
+
+    pub async fn push(&self, snapshot: StatsSnapshot) {
+        let mut buf = self.buffer.write().await;
+        if buf.len() >= STATS_HISTORY_CAPACITY {
+            buf.pop_front();
+        }
+        buf.push_back(snapshot);
+    }
+
+    pub async fn get_all(&self) -> Vec<StatsSnapshot> {
+        self.buffer.read().await.iter().cloned().collect()
+    }
+}
+
+/// Compute a stats snapshot from the DB + RPC. Used by both the polling handler
+/// and the background history-recording task.
+pub async fn compute_stats_snapshot(state: &ApiState) -> StatsSnapshot {
     let connected = state.db.get_connected_miners_count().await.unwrap_or(0);
     let blocks = state.db.get_blocks_count().await.unwrap_or(0);
-    let immature = state.db.get_immature_blocks_count().await.unwrap_or(0);
-    let pending_payout = state.db.get_pending_payout_blocks_count().await.unwrap_or(0);
     let shares = state.db.get_total_shares_count().await.unwrap_or(0);
 
-    // Pool hashrate: difficulty_sum / time × difficulty_multiplier = Sol/s.
-    // Uses SUM(difficulty) instead of COUNT(*) to account for vardiff.
-    // 10-minute average (smooth, used for luck/sparklines).
+    // 10-minute average hashrate
     let since_10m = chrono::Utc::now()
         .checked_sub_signed(chrono::Duration::minutes(10))
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -158,7 +194,7 @@ pub async fn get_pool_stats(
         .unwrap_or(0.0);
     let hashrate = (diff_sum_10m / 600.0) * state.difficulty_multiplier;
 
-    // 1-minute current hashrate (responsive display).
+    // 1-minute current hashrate
     let since_1m = chrono::Utc::now()
         .checked_sub_signed(chrono::Duration::minutes(1))
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -169,6 +205,33 @@ pub async fn get_pool_stats(
         .await
         .unwrap_or(0.0);
     let hashrate_current = (diff_sum_1m / 60.0) * state.difficulty_multiplier;
+
+    let network_hashrate = state
+        .rpc
+        .get_network_sol_ps(Some(120))
+        .await
+        .unwrap_or(0.0);
+
+    StatsSnapshot {
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        pool_hashrate: hashrate,
+        pool_hashrate_1m: hashrate_current,
+        network_hashrate,
+        connected_miners: connected,
+        total_blocks: blocks,
+        total_shares: shares,
+    }
+}
+
+const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
+
+pub async fn get_pool_stats(
+    State(state): State<AppState>,
+) -> Result<Json<PoolStats>, StatusCode> {
+    let snap = compute_stats_snapshot(&state).await;
+
+    let immature = state.db.get_immature_blocks_count().await.unwrap_or(0);
+    let pending_payout = state.db.get_pending_payout_blocks_count().await.unwrap_or(0);
 
     let (node_ok, last_template_at) = match &state.last_template_at_ms {
         None => (true, None),
@@ -188,12 +251,6 @@ pub async fn get_pool_stats(
         }
     };
 
-    let network_hashrate = state
-        .rpc
-        .get_network_sol_ps(Some(120))
-        .await
-        .unwrap_or(0.0);
-
     // Query 24h block count once for both luck and network share.
     let since_24h = chrono::Utc::now()
         .checked_sub_signed(chrono::Duration::hours(24))
@@ -206,10 +263,9 @@ pub async fn get_pool_stats(
         .unwrap_or(0) as f64;
 
     // Luck (effort) over the last 24h: expected_blocks / actual_blocks * 100.
-    // <100% = lucky (found blocks faster than expected), >100% = unlucky.
-    let luck_percent = if network_hashrate > 0.0 && hashrate > 0.0 {
+    let luck_percent = if snap.network_hashrate > 0.0 && snap.pool_hashrate > 0.0 {
         let window_secs = 24.0 * 3600.0;
-        let expected_blocks = (hashrate / network_hashrate) * (window_secs / BLOCK_TIME_SECS);
+        let expected_blocks = (snap.pool_hashrate / snap.network_hashrate) * (window_secs / BLOCK_TIME_SECS);
         if actual_blocks_24h > 0.0 {
             Some((expected_blocks / actual_blocks_24h) * 100.0)
         } else {
@@ -220,7 +276,6 @@ pub async fn get_pool_stats(
     };
 
     // Network share: pool_blocks_24h / expected_network_blocks_24h * 100.
-    // Expected = 86400 / 75 = 1152 blocks per day.
     let pool_percent_24h = if actual_blocks_24h > 0.0 {
         Some((actual_blocks_24h / 1152.0) * 100.0)
     } else {
@@ -231,20 +286,26 @@ pub async fn get_pool_stats(
         name: state.pool_name.clone(),
         fee_percent: state.pool_fee,
         stratum_port: state.stratum_port,
-        connected_miners: connected,
-        total_blocks: blocks,
+        connected_miners: snap.connected_miners,
+        total_blocks: snap.total_blocks,
         immature_blocks: immature,
         pending_payout_blocks: pending_payout,
-        total_shares: shares,
-        hashrate_estimate: hashrate,
-        hashrate_current,
-        network_hashrate,
+        total_shares: snap.total_shares,
+        hashrate_estimate: snap.pool_hashrate,
+        hashrate_current: snap.pool_hashrate_1m,
+        network_hashrate: snap.network_hashrate,
         luck_percent,
         pool_percent_24h,
         node_ok,
         last_template_at,
         wallet_ok: check_wallet_rpc(&state).await,
     }))
+}
+
+pub async fn get_stats_history(
+    State(state): State<AppState>,
+) -> Json<Vec<StatsSnapshot>> {
+    Json(state.stats_history.get_all().await)
 }
 
 async fn check_wallet_rpc(state: &ApiState) -> bool {

@@ -19,6 +19,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/zallet/status", get(get_zallet_status))
         .route("/api/blocks/immature", get(get_immature_blocks))
         .route("/api/payout/trigger", post(trigger_payout))
+        .route("/api/pool/stats/history", get(get_stats_history))
         .route("/api/network/blocks", get(network::get_network_blocks))
         .route("/health", get(get_health))
         .route("/api/miner/{address}/diagnostics", get(diagnostics::get_miner_diagnostics));
@@ -600,7 +601,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 </div>
 
 <script>
-const MAX_HISTORY = 60;
+const MAX_HISTORY = 360;
 const REFRESH_STATS = 10000;
 const REFRESH_MINERS = 10000;
 const REFRESH_BLOCKS = 30000;
@@ -934,10 +935,60 @@ async function lookupMiner() {
     }
 }
 
+/* ── History Pre-fill ── */
+async function fetchHistory() {
+    try {
+        const resp = await fetch('/api/pool/stats/history');
+        const snapshots = await resp.json();
+        if (!snapshots || snapshots.length === 0) return;
+
+        // Pre-fill core history arrays from server snapshots
+        for (const s of snapshots) {
+            history.hashrate.push(s.pool_hashrate || 0);
+            history.netHashrate.push(s.network_hashrate || 0);
+            history.miners.push(s.connected_miners || 0);
+            history.blocks.push(s.total_blocks || 0);
+            history.labels.push(s.timestamp_ms);
+        }
+
+        // Compute shares/min deltas between consecutive snapshots
+        for (let i = 0; i < snapshots.length; i++) {
+            if (i === 0) {
+                history.shares.push(0);
+            } else {
+                const dt = (snapshots[i].timestamp_ms - snapshots[i-1].timestamp_ms) / 1000;
+                const ds = snapshots[i].total_shares - snapshots[i-1].total_shares;
+                const sharesPerMin = dt > 0 ? Math.max(0, (ds / dt) * 60) : 0;
+                history.shares.push(Math.round(sharesPerMin));
+            }
+        }
+
+        // Set prevShares so the first live poll computes a correct delta
+        prevShares = snapshots[snapshots.length - 1].total_shares;
+
+        // Track peak miners from history
+        for (const s of snapshots) {
+            if (s.connected_miners > peakMiners) peakMiners = s.connected_miners;
+        }
+        document.getElementById('stat-miners-peak').textContent = 'Peak: ' + peakMiners;
+
+        // Update all charts with pre-filled data
+        const idxLabels = history.labels.map(() => '');
+        updateSparkline(sparkHashrate, history.hashrate, idxLabels);
+        updateSparkline(sparkNetHashrate, history.netHashrate, idxLabels);
+        updateSparkline(sparkBlocks, history.blocks, idxLabels);
+        updateSparkline(sparkMiners, history.miners, idxLabels);
+        updateCharts();
+    } catch (e) {
+        console.error('Failed to fetch stats history:', e);
+    }
+}
+
 /* ── Init ── */
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     initSparklines();
     initCharts();
+    await fetchHistory();
     fetchStats();
     fetchMiners();
     fetchBlocks();
