@@ -483,8 +483,8 @@ impl PoolDb {
         let rows: Vec<SqliteRow> = sqlx::query(
             "SELECT w.id, w.name, w.last_seen, \
                     (SELECT s.difficulty FROM shares s WHERE s.worker_id = w.id ORDER BY s.id DESC LIMIT 1) as current_difficulty, \
-                    COALESCE((SELECT SUM(s.difficulty) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?1), 0) as diff_sum_1m, \
-                    COALESCE((SELECT SUM(s.difficulty) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?2), 0) as diff_sum_10m, \
+                    COALESCE((SELECT SUM(s.difficulty) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?1), 0.0) as diff_sum_1m, \
+                    COALESCE((SELECT SUM(s.difficulty) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?2), 0.0) as diff_sum_10m, \
                     COALESCE((SELECT COUNT(*) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?2), 0) as shares_10m, \
                     (SELECT COUNT(*) FROM shares s WHERE s.worker_id = w.id) as total_shares \
              FROM workers w WHERE w.miner_id = ?3",
