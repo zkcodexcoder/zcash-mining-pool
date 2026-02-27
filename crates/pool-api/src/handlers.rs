@@ -606,18 +606,22 @@ pub async fn get_blocks(
 
     let mut result = Vec::with_capacity(blocks.len());
     for (i, b) in blocks.iter().enumerate() {
+        // For the last (oldest) block we don't have the previous block's time,
+        // so we can't compute a meaningful luck value — show "--" instead of
+        // summing all shares from the beginning of time.
         let luck_percent = if expected_work > 0.0 {
-            let prev_time = blocks.get(i + 1)
-                .map(|prev| prev.created_at.as_str())
-                .unwrap_or("2000-01-01 00:00:00");
-            let diff_sum = state
-                .db
-                .get_difficulty_sum_between(prev_time, &b.created_at)
-                .await
-                .unwrap_or(0.0);
-            let actual_work = diff_sum * state.difficulty_multiplier;
-            if actual_work > 0.0 {
-                Some((actual_work / expected_work) * 100.0)
+            if let Some(prev) = blocks.get(i + 1) {
+                let diff_sum = state
+                    .db
+                    .get_difficulty_sum_between(&prev.created_at, &b.created_at)
+                    .await
+                    .unwrap_or(0.0);
+                let actual_work = diff_sum * state.difficulty_multiplier;
+                if actual_work > 0.0 {
+                    Some((actual_work / expected_work) * 100.0)
+                } else {
+                    None
+                }
             } else {
                 None
             }
