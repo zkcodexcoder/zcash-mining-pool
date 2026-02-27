@@ -430,6 +430,16 @@ impl PoolDb {
         Ok(row.0)
     }
 
+    pub async fn get_connected_workers_count(&self) -> Result<i64, DbError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workers \
+             WHERE last_seen >= datetime('now', '-5 minutes')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
     /// Get all miners with their share counts, worker counts, and recent hashrate.
     pub async fn get_all_miners_with_stats(&self) -> Result<Vec<MinerListEntry>, DbError> {
         let rows: Vec<SqliteRow> = sqlx::query(

@@ -308,6 +308,72 @@ pub async fn get_stats_history(
     Json(state.stats_history.get_all().await)
 }
 
+/// NOMP-compatible `/api/stats` endpoint for miningpoolstats.stream scraping.
+pub async fn get_pool_stats_nomp(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let snap = compute_stats_snapshot(&state).await;
+
+    // Network difficulty: try getmininginfo, fall back to estimation from hashrate.
+    let network_difficulty = match state.rpc.get_mining_info().await {
+        Ok(info) => info
+            .get("difficulty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        Err(_) => {
+            // Equihash approximation: difficulty ≈ hashrate * block_time / 2^13
+            snap.network_hashrate * BLOCK_TIME_SECS / 8192.0
+        }
+    };
+
+    // Network height
+    let network_height = state.rpc.get_block_count().await.unwrap_or(0) as i64;
+
+    // Workers (individual worker processes, not unique miners)
+    let workers = state.db.get_connected_workers_count().await.unwrap_or(0);
+
+    // Last block found timestamp (epoch ms as string, NOMP convention)
+    let last_block_found = match state.db.get_recent_blocks(1).await {
+        Ok(blocks) => blocks.first().and_then(|b| {
+            chrono::NaiveDateTime::parse_from_str(&b.created_at, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|dt| {
+                    dt.and_utc().timestamp_millis().to_string()
+                })
+        }),
+        Err(_) => None,
+    };
+    let last_block_str = last_block_found.unwrap_or_default();
+
+    Json(serde_json::json!({
+        "config": {
+            "ports": [{
+                "port": state.stratum_port,
+                "difficulty": 1,
+                "tls": false
+            }],
+            "fee": state.pool_fee,
+            "minPaymentThreshold": state.min_payout_zatoshis,
+            "paymentScheme": "PPLNS"
+        },
+        "network": {
+            "height": network_height,
+            "difficulty": network_difficulty,
+            "hashrate": snap.network_hashrate
+        },
+        "pool": {
+            "hashrate": snap.pool_hashrate,
+            "miners": snap.connected_miners,
+            "workers": workers,
+            "totalBlocks": snap.total_blocks,
+            "lastBlockFound": last_block_str,
+            "stats": {
+                "lastBlockFound": last_block_str
+            }
+        }
+    }))
+}
+
 async fn check_wallet_rpc(state: &ApiState) -> bool {
     match &state.wallet_rpc {
         Some(rpc) => {

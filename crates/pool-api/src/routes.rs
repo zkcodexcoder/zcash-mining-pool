@@ -11,6 +11,7 @@ use crate::previews;
 /// Build the full API router.
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
+        .route("/api/stats", get(get_pool_stats_nomp))
         .route("/api/pool/stats", get(get_pool_stats))
         .route("/api/miners", get(get_miners))
         .route("/api/miner/{address}", get(get_miner_stats))

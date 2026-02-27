@@ -181,6 +181,11 @@ impl ZcashRpcClient {
         self.call("getrawtransaction", serde_json::json!([txid, verbose])).await
     }
 
+    /// Get mining info (includes network difficulty, hashrate, chain height, etc.).
+    pub async fn get_mining_info(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getmininginfo", serde_json::json!([])).await
+    }
+
     /// Get estimated network solutions per second.
     /// `blocks`: number of recent blocks to average over (default 120).
     pub async fn get_network_sol_ps(&self, blocks: Option<u32>) -> Result<f64, RpcError> {
