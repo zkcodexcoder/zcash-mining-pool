@@ -909,6 +909,7 @@ async function fetchMiners() {
     try {
         const resp = await fetch('/api/miners');
         const miners = await resp.json();
+        miners.sort((a, b) => (b.hashrate || 0) - (a.hashrate || 0));
         const tbody = document.querySelector('#miners-table tbody');
         if (miners.length === 0) {
             tbody.innerHTML = '<tr><td colspan="7" class="loading">No miners yet</td></tr>';
