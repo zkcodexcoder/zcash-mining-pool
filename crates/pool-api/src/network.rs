@@ -584,7 +584,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
 
 <div class="header">
     <h1>NETWORK MINERS</h1>
-    <span class="badge">Testnet</span>
+    <span class="badge" id="network-badge">Testnet</span>
     <div class="header-right">
         <a href="/" class="header-link">Dashboard</a>
         <a href="/network" class="header-link active">Network</a>
@@ -661,6 +661,16 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
 </div>
 
 <script>
+let COIN = 'TAZ';
+(async function() {
+    try {
+        const r = await fetch('/api/pool/stats');
+        const d = await r.json();
+        COIN = d.network === 'mainnet' ? 'ZEC' : 'TAZ';
+        const badge = document.getElementById('network-badge');
+        if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
+    } catch(e) {}
+})();
 const CHART_COLORS = [
     '#f4b728', '#4a9eff', '#48bb78', '#fc8181', '#a78bfa',
     '#f687b3', '#68d391', '#63b3ed', '#fbd38d', '#b794f4',
@@ -784,7 +794,7 @@ async function fetchData() {
                     '<td style="color:#e0e0e0">' + b.height + '</td>' +
                     '<td title="' + b.hash + '">' + hashShort + '</td>' +
                     '<td title="' + b.miner_address + '">' + b.miner_label + '</td>' +
-                    '<td>' + b.reward_zec.toFixed(4) + ' TAZ</td>' +
+                    '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                     '<td title="' + b.coinbase_text.replace(/"/g, '&quot;') + '">' + cbShort + '</td>' +
                     '<td>' + formatTime(b.time) + '</td>' +
                     '</tr>';

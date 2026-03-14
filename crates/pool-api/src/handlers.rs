@@ -23,6 +23,7 @@ pub struct ApiState {
     pub rpc: Arc<ZcashRpcClient>,
     pub pool_name: String,
     pub pool_fee: f64,
+    pub network: String,
     pub stratum_port: u16,
     /// Unix timestamp (ms) of last successful getblocktemplate. Used for stall detection.
     pub last_template_at_ms: Option<Arc<std::sync::atomic::AtomicI64>>,
@@ -66,6 +67,7 @@ pub struct PoolStats {
     pub node_ok: bool,
     pub last_template_at: Option<String>,
     pub wallet_ok: bool,
+    pub network: String,
 }
 
 #[derive(Serialize)]
@@ -299,6 +301,7 @@ pub async fn get_pool_stats(
         node_ok,
         last_template_at,
         wallet_ok: check_wallet_rpc(&state).await,
+        network: state.network.clone(),
     }))
 }
 
@@ -908,6 +911,14 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         </div>
     </div>
     <script>
+        let COIN = 'TAZ';
+        async function fetchCoin() {
+            try {
+                const r = await fetch('/api/pool/stats');
+                const d = await r.json();
+                COIN = d.network === 'mainnet' ? 'ZEC' : 'TAZ';
+            } catch(e) {}
+        }
         async function fetchStatus() {
             try {
                 const r = await fetch('/api/zallet/status');
@@ -916,9 +927,9 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 rb.textContent = d.rpc_ok ? 'Online' : 'Offline';
                 rb.className = 'badge ' + (d.rpc_ok ? 'badge-ok' : 'badge-fail');
                 if (d.balance) {
-                    document.getElementById('bal-t').textContent = d.balance.transparent + ' TAZ';
-                    document.getElementById('bal-p').textContent = d.balance.private + ' TAZ';
-                    document.getElementById('bal-total').textContent = d.balance.total + ' TAZ';
+                    document.getElementById('bal-t').textContent = d.balance.transparent + ' ' + COIN;
+                    document.getElementById('bal-p').textContent = d.balance.private + ' ' + COIN;
+                    document.getElementById('bal-total').textContent = d.balance.total + ' ' + COIN;
                 } else {
                     document.getElementById('bal-t').textContent = '–';
                     document.getElementById('bal-p').textContent = '–';
@@ -945,7 +956,7 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                     const pct = Math.min(b.progress_percent, 100).toFixed(0);
                     html += '<tr>' +
                         '<td style="color:#e2e8f0">' + b.height + '</td>' +
-                        '<td>' + b.reward_zec.toFixed(4) + ' TAZ</td>' +
+                        '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                         '<td>' + b.confirmations + ' / ' + b.required + '</td>' +
                         '<td><div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div></td>' +
                         '</tr>';
@@ -956,6 +967,7 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 document.getElementById('maturity-content').innerHTML = '<div class="empty-msg">Failed to load</div>';
             }
         }
+        fetchCoin();
         fetchStatus();
         fetchImmature();
         setInterval(fetchStatus, 5000);

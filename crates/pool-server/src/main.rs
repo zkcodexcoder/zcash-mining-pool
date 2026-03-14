@@ -35,7 +35,11 @@ struct Config {
 struct PoolConfig {
     name: String,
     fee_percent: f64,
+    #[serde(default = "default_network")]
+    network: String,
 }
+
+fn default_network() -> String { "testnet".to_string() }
 
 #[derive(Debug, Deserialize)]
 struct StratumConfig {
@@ -244,6 +248,7 @@ async fn main() -> Result<()> {
         rpc: Arc::clone(&rpc),
         pool_name: config.pool.name.clone(),
         pool_fee: config.pool.fee_percent,
+        network: config.pool.network.clone(),
         stratum_port: config
             .stratum
             .listen_addr
@@ -339,6 +344,7 @@ async fn main() -> Result<()> {
         let maturity = config.payout.maturity_confirmations;
         let payout_db = db.clone();
         let node_rpc = Arc::clone(&rpc);
+        let payout_network = config.pool.network.clone();
         info!(
             pool_address = %pool_address,
             mining_address = %mining_address,
@@ -353,6 +359,7 @@ async fn main() -> Result<()> {
                 payout_db, node_rpc, wallet_rpc,
                 &pool_address, &mining_address,
                 min_payout_zatoshis, maturity, interval,
+                &payout_network,
             ).await;
         }))
     } else {
@@ -405,6 +412,7 @@ async fn run_payout_loop(
     min_payout_zatoshis: i64,
     maturity_confirmations: u64,
     interval: Duration,
+    network: &str,
 ) {
     info!("Payout loop started");
     loop {
@@ -422,7 +430,7 @@ async fn run_payout_loop(
         }
 
         // Phase 3: Pay miners from shielded pool (only if balance is sufficient)
-        match process_payouts(&db, &wallet_rpc, pool_address, min_payout_zatoshis).await {
+        match process_payouts(&db, &wallet_rpc, pool_address, min_payout_zatoshis, network).await {
             Ok(count) => {
                 if count > 0 {
                     info!(payouts = count, "Payout round completed");
@@ -662,6 +670,7 @@ async fn process_payouts(
     rpc: &ZcashRpcClient,
     pool_address: &str,
     min_payout_zatoshis: i64,
+    network: &str,
 ) -> anyhow::Result<usize> {
     let pending = db.get_pending_payouts(min_payout_zatoshis).await?;
     if pending.is_empty() {
@@ -714,7 +723,7 @@ async fn process_payouts(
     let mut payout_list: Vec<(usize, i64)> = Vec::new(); // (index into pending, scaled_zatoshis)
     for (i, p) in pending.iter().enumerate() {
         // Skip invalid addresses: must start with a known Zcash prefix
-        if !is_valid_zcash_address(&p.address) {
+        if !is_valid_zcash_address(&p.address, network) {
             warn!(
                 miner_id = p.miner_id,
                 address = %p.address,
@@ -845,15 +854,25 @@ fn parse_have_balance(msg: &str) -> Option<i64> {
     rest[..end].parse::<i64>().ok()
 }
 
-/// Check if an address looks like a valid Zcash testnet address.
-/// Rejects mainnet addresses, garbage strings, and anything else that would
+/// Check if an address looks like a valid Zcash address for the given network.
+/// Rejects wrong-network addresses, garbage strings, and anything else that would
 /// cause z_sendmany to fail and block the entire payout batch.
-fn is_valid_zcash_address(addr: &str) -> bool {
-    // Testnet transparent: tm/t2
-    // Testnet sapling: ztestsapling
-    // Testnet unified: utest
-    addr.starts_with("tm")
-        || addr.starts_with("t2")
-        || addr.starts_with("ztestsapling")
-        || addr.starts_with("utest")
+fn is_valid_zcash_address(addr: &str, network: &str) -> bool {
+    if network == "mainnet" {
+        // Mainnet transparent: t1/t3
+        // Mainnet sapling: zs
+        // Mainnet unified: u (but not utest)
+        addr.starts_with("t1")
+            || addr.starts_with("t3")
+            || addr.starts_with("zs")
+            || (addr.starts_with('u') && !addr.starts_with("utest"))
+    } else {
+        // Testnet transparent: tm/t2
+        // Testnet sapling: ztestsapling
+        // Testnet unified: utest
+        addr.starts_with("tm")
+            || addr.starts_with("t2")
+            || addr.starts_with("ztestsapling")
+            || addr.starts_with("utest")
+    }
 }

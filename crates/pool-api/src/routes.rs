@@ -415,7 +415,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <!-- ── Header ── -->
 <div class="header">
     <h1 id="pool-name">ZCASH MINING POOL</h1>
-    <span class="badge">Testnet</span>
+    <span class="badge" id="network-badge">Testnet</span>
     <div class="header-right">
         <span class="status-dot pulsing" id="header-status-dot"></span>
         <span style="font-size:0.6rem;color:#555" id="header-status-text">Connected</span>
@@ -618,6 +618,7 @@ const MAX_HISTORY = 360;
 const REFRESH_STATS = 10000;
 const REFRESH_MINERS = 10000;
 const REFRESH_BLOCKS = 30000;
+let COIN = 'TAZ'; // updated from API response
 
 const history = {
     hashrate: [],
@@ -793,6 +794,9 @@ async function fetchStats() {
         const now = Date.now();
 
         document.getElementById('pool-name').textContent = d.name.toUpperCase();
+        COIN = d.network === 'mainnet' ? 'ZEC' : 'TAZ';
+        const badge = document.getElementById('network-badge');
+        if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
 
         const setVal = (id, val) => {
             const el = document.getElementById(id);
@@ -893,7 +897,7 @@ async function fetchBlocks() {
             return '<tr>' +
                 '<td style="color:#e0e0e0">' + b.height + '</td>' +
                 '<td title="' + b.hash + '">' + b.hash.substring(0, 16) + '...</td>' +
-                '<td>' + b.reward_zec.toFixed(4) + ' TAZ</td>' +
+                '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                 '<td style="color:' + luckColor + '">' + luckStr + '</td>' +
                 '<td class="status-' + b.status + '">' + b.status + '</td>' +
                 '<td>' + b.found_at + '</td>' +
@@ -922,7 +926,7 @@ async function fetchMiners() {
             '<td>' + formatHashrate(m.hashrate) + '</td>' +
             '<td>' + m.worker_count + '</td>' +
             '<td>' + m.share_count.toLocaleString() + '</td>' +
-            '<td>' + m.pending_zec.toFixed(8) + ' TAZ</td>' +
+            '<td>' + m.pending_zec.toFixed(8) + ' ' + COIN + '</td>' +
             '<td>' + m.joined + '</td>' +
             '</tr>'
         );
@@ -946,7 +950,7 @@ async function fetchPayouts() {
             const txTitle = p.txid || '';
             return '<tr>' +
                 '<td class="addr-cell" title="' + p.miner_address + '" style="color:#e0e0e0">' + p.miner_address + '</td>' +
-                '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' TAZ</td>' +
+                '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' ' + COIN + '</td>' +
                 '<td title="' + txTitle + '">' + txid + '</td>' +
                 '<td>' + p.created_at + '</td>' +
                 '</tr>';
@@ -971,8 +975,8 @@ async function lookupMiner() {
         const data = await resp.json();
         document.getElementById('miner-info').style.display = 'block';
         document.getElementById('miner-stats-grid').innerHTML =
-            '<div class="metric-cell"><div class="label">Pending Balance</div><div class="value" style="color:#f4b728">' + data.balance.pending_zec.toFixed(8) + ' TAZ</div></div>' +
-            '<div class="metric-cell"><div class="label">Total Paid</div><div class="value" style="color:#48bb78">' + data.balance.paid_zec.toFixed(8) + ' TAZ</div></div>' +
+            '<div class="metric-cell"><div class="label">Pending Balance</div><div class="value" style="color:#f4b728">' + data.balance.pending_zec.toFixed(8) + ' ' + COIN + '</div></div>' +
+            '<div class="metric-cell"><div class="label">Total Paid</div><div class="value" style="color:#48bb78">' + data.balance.paid_zec.toFixed(8) + ' ' + COIN + '</div></div>' +
             '<div class="metric-cell"><div class="label">Workers</div><div class="value">' + data.workers.length + '</div></div>';
         const tbody = document.querySelector('#workers-table tbody');
         tbody.innerHTML = data.workers.map(w => '<tr><td>' + w.name + '</td><td>' + w.last_seen + '</td></tr>').join('');

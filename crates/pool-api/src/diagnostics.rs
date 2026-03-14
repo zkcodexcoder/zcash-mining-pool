@@ -421,7 +421,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
 
 <div class="header">
     <h1>MINER DIAGNOSTICS</h1>
-    <span class="badge">Testnet</span>
+    <span class="badge" id="network-badge">Testnet</span>
     <div class="header-right">
         <a href="/" class="header-link">Dashboard</a>
         <a href="/network" class="header-link">Network</a>
@@ -541,6 +541,16 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
 const WORKER_COLORS = ['#f4b728','#4a9eff','#48bb78','#fc8181','#a78bfa','#f687b3','#68d391','#ed8936'];
 let diffChart = null;
 let refreshTimer = null;
+let COIN = 'TAZ';
+(async function() {
+    try {
+        const r = await fetch('/api/pool/stats');
+        const d = await r.json();
+        COIN = d.network === 'mainnet' ? 'ZEC' : 'TAZ';
+        const badge = document.getElementById('network-badge');
+        if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
+    } catch(e) {}
+})();
 
 function formatHashrate(h) {
     if (h == null || isNaN(h)) return '--';
@@ -658,8 +668,8 @@ async function fetchDiagnostics() {
         // Summary cards
         document.getElementById('hr-1m').textContent = formatHashrate(d.total_hashrate_1m);
         document.getElementById('hr-10m').textContent = formatHashrate(d.total_hashrate_10m);
-        document.getElementById('bal-pending').textContent = d.pending_zec.toFixed(8) + ' TAZ';
-        document.getElementById('bal-paid').textContent = d.paid_zec.toFixed(8) + ' TAZ';
+        document.getElementById('bal-pending').textContent = d.pending_zec.toFixed(8) + ' ' + COIN;
+        document.getElementById('bal-paid').textContent = d.paid_zec.toFixed(8) + ' ' + COIN;
         document.getElementById('total-workers').textContent = d.workers.length;
         document.getElementById('blocks-found').textContent = d.blocks_found.length;
 
@@ -713,7 +723,7 @@ async function fetchDiagnostics() {
                 '<tr>' +
                 '<td style="color:#e0e0e0">' + b.height + '</td>' +
                 '<td title="' + b.hash + '">' + b.hash.substring(0, 16) + '...</td>' +
-                '<td>' + b.reward_zec.toFixed(4) + ' TAZ</td>' +
+                '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                 '<td class="status-' + b.status + '">' + b.status + '</td>' +
                 '<td>' + b.found_at + '</td>' +
                 '</tr>'
@@ -729,7 +739,7 @@ async function fetchDiagnostics() {
                 const txid = p.txid ? p.txid.substring(0, 20) + '...' : '--';
                 const txTitle = p.txid || '';
                 return '<tr>' +
-                    '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' TAZ</td>' +
+                    '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' ' + COIN + '</td>' +
                     '<td title="' + txTitle + '">' + txid + '</td>' +
                     '<td>' + p.created_at + '</td>' +
                     '</tr>';

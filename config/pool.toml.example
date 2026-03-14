@@ -1,6 +1,8 @@
 [pool]
 name = "ZcashTestPool"
 fee_percent = 1.0
+# "testnet" or "mainnet" — controls address validation, currency symbol (TAZ/ZEC), and badge
+network = "testnet"
 
 [stratum]
 listen_addr = "0.0.0.0:3333"
