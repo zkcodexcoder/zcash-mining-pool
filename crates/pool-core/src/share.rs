@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use pool_db::PoolDb;
 use sha2::{Digest, Sha256};
@@ -24,10 +25,17 @@ pub struct VardiffConfig {
     pub retarget_interval_secs: f64,
 }
 
-/// Per-session state: vardiff tracker + current target.
+/// Maximum shares per second before the session is rate-limited.
+/// Even at 100 MH/s, shares should never exceed this with proper difficulty.
+const MAX_SHARES_PER_SEC: f64 = 20.0;
+
+/// Per-session state: vardiff tracker + current target + rate limiter.
 struct SessionDifficulty {
     vardiff: VardiffTracker,
     target: [u8; 32],
+    /// Tracks share submissions for rate limiting.
+    rate_window_start: Instant,
+    rate_window_shares: u32,
 }
 
 pub struct ShareValidator {
@@ -103,6 +111,20 @@ impl ShareValidator {
                     nonce_2,
                     equihash_solution,
                 } => {
+                    // Rate-limit check before expensive validation
+                    if self.check_rate_limit(&session_id).await {
+                        warn!(worker = %worker_name, "Share rate limit exceeded, rejecting");
+                        self.stratum
+                            .send_to_session(&session_id, ServerMessage::SubmitResult {
+                                id: request_id, accepted: false,
+                                error: Some(StratumError::other("Share rate limit exceeded")),
+                            })
+                            .await;
+                        // Still trigger retarget so difficulty ramps up
+                        self.maybe_retarget(&session_id).await;
+                        continue;
+                    }
+
                     let result = self
                         .validate_share(
                             &session_id, &worker_name, &job_id, &time,
@@ -163,6 +185,8 @@ impl ShareValidator {
                         sessions.insert(session_id.clone(), SessionDifficulty {
                             vardiff: tracker,
                             target,
+                            rate_window_start: Instant::now(),
+                            rate_window_shares: 0,
                         });
                     }
                     info!(%session_id, target = %target_hex, "Sending initial target");
@@ -187,6 +211,27 @@ impl ShareValidator {
                     debug!(%session_id, %target, "Target suggestion received (ignored, using vardiff)");
                 }
             }
+        }
+    }
+
+    /// Returns true if the session is submitting shares too fast.
+    /// Resets the counter every second.
+    async fn check_rate_limit(&self, session_id: &str) -> bool {
+        let mut sessions = self.session_difficulty.write().await;
+        if let Some(sd) = sessions.get_mut(session_id) {
+            let elapsed = sd.rate_window_start.elapsed().as_secs_f64();
+            if elapsed >= 1.0 {
+                // Reset window
+                sd.rate_window_start = Instant::now();
+                sd.rate_window_shares = 1;
+                false
+            } else {
+                sd.rate_window_shares += 1;
+                let rate = sd.rate_window_shares as f64 / elapsed.max(0.01);
+                rate > MAX_SHARES_PER_SEC
+            }
+        } else {
+            false
         }
     }
 
@@ -297,20 +342,26 @@ impl ShareValidator {
         // Compute SHA-256d of the header (Zcash/Bitcoin block hash)
         let hash_bytes = sha256d(&full_header);
 
+        // Read the session's pool difficulty target and current difficulty.
+        let (pool_target, difficulty) = {
+            let sessions = self.session_difficulty.read().await;
+            match sessions.get(session_id) {
+                Some(sd) => (sd.target, sd.vardiff.current_difficulty()),
+                None => (self.default_target, 1.0),
+            }
+        };
+
+        // Check against the session's POOL target — reject shares that don't
+        // meet the assigned difficulty. Without this check, high-hashrate
+        // miners flood the pool with low-difficulty shares.
+        if !meets_target(&hash_bytes, &pool_target) {
+            return Err(StratumError::low_difficulty());
+        }
+
         // Check against the NETWORK target from the block template
         let network_target = parse_target(&job.template.target)
             .map_err(|e| StratumError::other(&format!("Bad network target: {e}")))?;
         let is_block = meets_target(&hash_bytes, &network_target);
-
-        // Use the session's current vardiff difficulty so that hashrate
-        // calculations correctly weight higher-difficulty shares.
-        let difficulty = {
-            let sessions = self.session_difficulty.read().await;
-            sessions
-                .get(session_id)
-                .map(|sd| sd.vardiff.current_difficulty())
-                .unwrap_or(1.0)
-        };
 
         // Parse worker name (format: "address.worker")
         let miner_address = worker_name.split('.').next().unwrap_or(worker_name);

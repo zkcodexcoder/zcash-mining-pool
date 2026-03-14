@@ -25,7 +25,8 @@ impl VardiffTracker {
             retarget_interval_secs,
             current_difficulty: initial_difficulty,
             min_difficulty: initial_difficulty.min(1.0),
-            max_difficulty: 1_000_000.0,
+            // 10 billion — enough for miners up to ~1 TH/s
+            max_difficulty: 10_000_000_000.0,
         }
     }
 
@@ -34,14 +35,24 @@ impl VardiffTracker {
         self.shares_in_window += 1;
 
         let elapsed = self.window_start.elapsed().as_secs_f64();
-        if elapsed < self.retarget_interval_secs {
+
+        // Early retarget: if we've already received 4x the expected shares
+        // before the retarget interval, retarget immediately to avoid flooding.
+        let expected_in_elapsed =
+            self.target_shares_per_minute * elapsed / 60.0;
+        let early_trigger = self.shares_in_window as f64 > expected_in_elapsed * 4.0
+            && elapsed >= 5.0;
+
+        if !early_trigger && elapsed < self.retarget_interval_secs {
             return None;
         }
 
         let shares_per_minute = (self.shares_in_window as f64 / elapsed) * 60.0;
         let ratio = shares_per_minute / self.target_shares_per_minute;
 
-        let adjustment = ratio.clamp(0.25, 4.0);
+        // Allow up to 16x adjustment per retarget so high-hashrate miners
+        // converge quickly instead of taking many 30s intervals.
+        let adjustment = ratio.clamp(0.25, 16.0);
         let new_difficulty = (self.current_difficulty * adjustment)
             .clamp(self.min_difficulty, self.max_difficulty);
 
