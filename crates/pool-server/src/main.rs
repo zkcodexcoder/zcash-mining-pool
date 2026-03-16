@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,8 +44,26 @@ fn default_network() -> String { "testnet".to_string() }
 
 #[derive(Debug, Deserialize)]
 struct StratumConfig {
-    listen_addr: String,
+    #[serde(default)]
+    listen_addr: Option<String>,
+    #[serde(default)]
+    listen_addrs: Option<Vec<String>>,
     nonce1_size: usize,
+    /// Per-port initial difficulty overrides (port number as string -> difficulty).
+    #[serde(default)]
+    port_difficulty: HashMap<String, f64>,
+}
+
+impl StratumConfig {
+    fn addrs(&self) -> Vec<String> {
+        if let Some(ref addrs) = self.listen_addrs {
+            addrs.clone()
+        } else if let Some(ref addr) = self.listen_addr {
+            vec![addr.clone()]
+        } else {
+            vec!["0.0.0.0:3333".to_string()]
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,10 +159,11 @@ async fn main() -> Result<()> {
     let config: Config = toml::from_str(&config_str)
         .with_context(|| "Failed to parse config file")?;
 
+    let stratum_addrs = config.stratum.addrs();
     info!(
         name = %config.pool.name,
         fee = %config.pool.fee_percent,
-        stratum = %config.stratum.listen_addr,
+        stratum = ?stratum_addrs,
         api = %config.api.listen_addr,
         node = %config.node.rpc_url,
         "Configuration loaded"
@@ -161,6 +181,57 @@ async fn main() -> Result<()> {
         .with_context(|| "Failed to run migrations")?;
     info!("Database initialized");
 
+    // Backfill luck_percent for any blocks that don't have it yet.
+    // This runs once at startup using the current network hashrate as an approximation.
+    {
+        let all_blocks = db.get_all_blocks_by_height().await.unwrap_or_default();
+        let needs_backfill: Vec<_> = all_blocks.iter().filter(|b| b.luck_percent.is_none()).collect();
+        if !needs_backfill.is_empty() {
+            info!(count = needs_backfill.len(), "Backfilling block luck values");
+            // We need RPC for network hashrate — initialize a temporary client
+            let temp_rpc = match (&config.node.rpc_user, &config.node.rpc_password) {
+                (Some(user), Some(pass)) => ZcashRpcClient::with_auth(&config.node.rpc_url, user, pass),
+                _ => ZcashRpcClient::new(&config.node.rpc_url),
+            };
+            let network_hashrate = temp_rpc.get_network_sol_ps(Some(120)).await.unwrap_or(0.0);
+            if network_hashrate > 0.0 {
+                let expected_work = network_hashrate * 75.0; // BLOCK_TIME_SECS
+                // Compute difficulty_multiplier inline (pool_target not yet available here,
+                // but we can parse it from config).
+                let temp_pool_target = pool_core::parse_target(&config.difficulty.initial_target).ok();
+                let temp_diff_mult = temp_pool_target.map(|t| {
+                    let target_f64 = t.iter().enumerate().fold(0.0f64, |acc, (i, &b)| {
+                        acc + (b as f64) * 256.0f64.powi(31 - i as i32)
+                    });
+                    if target_f64 > 0.0 { 2.0f64.powi(256) / target_f64 } else { 1.0 }
+                }).unwrap_or(1.0);
+
+                for (idx, block) in all_blocks.iter().enumerate() {
+                    if block.luck_percent.is_some() {
+                        continue;
+                    }
+                    // Sum share difficulties between previous block and this block
+                    let since = if idx > 0 {
+                        all_blocks[idx - 1].created_at.clone()
+                    } else {
+                        "1970-01-01 00:00:00".to_string()
+                    };
+                    let diff_sum = db.get_difficulty_sum_between(&since, &block.created_at).await.unwrap_or(0.0);
+                    let actual_work = diff_sum * temp_diff_mult;
+                    if actual_work > 0.0 {
+                        let luck = (actual_work / expected_work) * 100.0;
+                        if let Err(e) = db.update_block_luck(block.id, luck).await {
+                            warn!(block_id = block.id, error = %e, "Failed to backfill block luck");
+                        }
+                    }
+                }
+                info!("Block luck backfill complete");
+            } else {
+                warn!("Skipping luck backfill: network hashrate unavailable");
+            }
+        }
+    }
+
     // Initialize Zcash RPC client
     let rpc = match (&config.node.rpc_user, &config.node.rpc_password) {
         (Some(user), Some(pass)) => {
@@ -170,22 +241,31 @@ async fn main() -> Result<()> {
         _ => Arc::new(ZcashRpcClient::new(&config.node.rpc_url)),
     };
 
+    // Shared latest notify message — used by both stratum (send on subscribe)
+    // and job manager (updates on each new template).
+    let latest_notify: Arc<tokio::sync::RwLock<Option<stratum::ServerMessage>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
     // Initialize Stratum server
     let (event_tx, event_rx) = mpsc::channel(1024);
-    let (stratum, _notify_rx) = StratumServer::new(config.stratum.nonce1_size, event_tx);
+    let (stratum, _notify_rx) = StratumServer::new_with_latest_notify(
+        config.stratum.nonce1_size,
+        event_tx,
+        Arc::clone(&latest_notify),
+    );
     let stratum = Arc::new(stratum);
 
     // Stall detection: last time we got a block template (unix ms)
     let last_template_at_ms = Arc::new(AtomicI64::new(0));
 
     // Initialize Job Manager (updates last_template_at_ms on each successful poll)
-    let job_manager = JobManager::new_with_stall_tracking(
+    let job_manager = JobManager::new_with_stall_tracking_and_notify(
         Arc::clone(&rpc),
         Arc::clone(&stratum),
         Some(Arc::clone(&last_template_at_ms)),
+        Arc::clone(&latest_notify),
     );
     let jobs = job_manager.jobs();
-    let latest_notify = job_manager.latest_notify();
 
     // Initialize Block Assembler
     let block_assembler = Arc::new(BlockAssembler::new(Arc::clone(&rpc)));
@@ -218,6 +298,20 @@ async fn main() -> Result<()> {
     ));
 
     // Initialize Share Validator
+    let port_difficulty: HashMap<u16, f64> = config.stratum.port_difficulty.iter()
+        .filter_map(|(k, &v)| k.parse::<u16>().ok().map(|port| (port, v)))
+        .collect();
+    if !port_difficulty.is_empty() {
+        info!(?port_difficulty, "Per-port difficulty overrides loaded");
+    }
+    // Compute difficulty_multiplier for share→Sol/s conversion
+    let difficulty_multiplier = {
+        let target_f64 = pool_target.iter().enumerate().fold(0.0f64, |acc, (i, &b)| {
+            acc + (b as f64) * 256.0f64.powi(31 - i as i32)
+        });
+        if target_f64 > 0.0 { 2.0f64.powi(256) / target_f64 } else { 1.0 }
+    };
+
     let share_validator = ShareValidator::new(
         db.clone(),
         Arc::clone(&stratum),
@@ -226,7 +320,10 @@ async fn main() -> Result<()> {
         Arc::clone(&pplns),
         pool_target,
         vardiff_config,
+        port_difficulty.clone(),
         latest_notify,
+        Arc::clone(&rpc),
+        difficulty_multiplier,
     );
 
     // Wallet RPC for Zallet monitoring (and payouts)
@@ -242,6 +339,18 @@ async fn main() -> Result<()> {
             Arc::new(rpc)
         });
 
+    // Build stratum port info for the dashboard.
+    let stratum_ports: Vec<pool_api::StratumPortInfo> = stratum_addrs.iter().map(|addr| {
+        let port: u16 = addr.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let description = match port {
+            3334 => "300 KSol/s - 3 MSol/s".to_string(),
+            3335 => "3-50 MSol/s".to_string(),
+            3336 => "50+ MSol/s".to_string(),
+            _ => "Default".to_string(),
+        };
+        pool_api::StratumPortInfo { port, description }
+    }).collect();
+
     // Initialize API (shares last_template_at_ms for /health and pool stats)
     let api_state: AppState = Arc::new(ApiState {
         db: db.clone(),
@@ -249,13 +358,11 @@ async fn main() -> Result<()> {
         pool_name: config.pool.name.clone(),
         pool_fee: config.pool.fee_percent,
         network: config.pool.network.clone(),
-        stratum_port: config
-            .stratum
-            .listen_addr
-            .split(':')
-            .last()
+        stratum_port: stratum_addrs.first()
+            .and_then(|a| a.split(':').last())
             .and_then(|p| p.parse().ok())
             .unwrap_or(3333),
+        stratum_ports,
         last_template_at_ms: Some(last_template_at_ms),
         wallet_rpc,
         pool_address: config.payout.pool_address.clone(),
@@ -296,16 +403,17 @@ async fn main() -> Result<()> {
 
     let router = pool_api::build_router(api_state);
 
-    // Spawn all services
-    let stratum_addr = config.stratum.listen_addr.clone();
-    let stratum_handle = {
+    // Spawn all services — one stratum listener per address
+    let mut stratum_handles = Vec::new();
+    for addr in &stratum_addrs {
         let stratum = Arc::clone(&stratum);
-        tokio::spawn(async move {
-            if let Err(e) = stratum.listen(&stratum_addr).await {
-                error!(error = %e, "Stratum server failed");
+        let addr = addr.clone();
+        stratum_handles.push(tokio::spawn(async move {
+            if let Err(e) = stratum.listen(&addr).await {
+                error!(error = %e, addr = %addr, "Stratum server failed");
             }
-        })
-    };
+        }));
+    }
 
     let job_handle = tokio::spawn(async move {
         job_manager.run(Duration::from_millis(500)).await;
@@ -370,10 +478,10 @@ async fn main() -> Result<()> {
     info!(
         "Pool is running!\n\
          \n\
-         Stratum: stratum+tcp://{}\n\
+         Stratum: {:?}\n\
          Dashboard: http://{}\n\
          API: http://{}/api/pool/stats\n",
-        config.stratum.listen_addr,
+        stratum_addrs,
         config.api.listen_addr,
         config.api.listen_addr,
     );
@@ -384,7 +492,7 @@ async fn main() -> Result<()> {
         .expect("Failed to listen for ctrl+c");
     info!("Shutdown signal received, stopping services...");
 
-    stratum_handle.abort();
+    for h in &stratum_handles { h.abort(); }
     job_handle.abort();
     share_handle.abort();
     api_handle.abort();

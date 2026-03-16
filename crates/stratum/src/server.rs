@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use futures::SinkExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::codec::Framed;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::codec::StratumCodec;
 use crate::messages::*;
@@ -32,6 +33,7 @@ pub enum StratumEvent {
         worker_name: String,
         password: String,
         addr: SocketAddr,
+        local_port: u16,
     },
     /// A session disconnected.
     SessionDisconnected {
@@ -54,6 +56,9 @@ pub struct ShareResponse {
 }
 
 /// Holds the state for all connected miners + broadcast channel for jobs.
+/// Maximum connections allowed per IP address.
+const MAX_CONNECTIONS_PER_IP: u32 = 5;
+
 pub struct StratumServer {
     nonce_allocator: Arc<NonceAllocator>,
     /// Sender for pool events (share submissions, connections, etc.)
@@ -62,6 +67,10 @@ pub struct StratumServer {
     notify_tx: broadcast::Sender<ServerMessage>,
     /// Per-session channels for targeted responses (share accept/reject).
     session_senders: Arc<RwLock<HashMap<String, mpsc::Sender<ServerMessage>>>>,
+    /// Most recent notify message, sent to new miners on subscribe.
+    latest_notify: Arc<RwLock<Option<ServerMessage>>>,
+    /// Connection count per IP for rate limiting.
+    ip_connections: Arc<std::sync::Mutex<HashMap<IpAddr, u32>>>,
 }
 
 impl StratumServer {
@@ -69,12 +78,22 @@ impl StratumServer {
         nonce1_size: usize,
         event_tx: mpsc::Sender<StratumEvent>,
     ) -> (Self, broadcast::Receiver<ServerMessage>) {
+        Self::new_with_latest_notify(nonce1_size, event_tx, Arc::new(RwLock::new(None)))
+    }
+
+    pub fn new_with_latest_notify(
+        nonce1_size: usize,
+        event_tx: mpsc::Sender<StratumEvent>,
+        latest_notify: Arc<RwLock<Option<ServerMessage>>>,
+    ) -> (Self, broadcast::Receiver<ServerMessage>) {
         let (notify_tx, notify_rx) = broadcast::channel(256);
         let server = Self {
             nonce_allocator: Arc::new(NonceAllocator::new(nonce1_size)),
             event_tx,
             notify_tx,
             session_senders: Arc::new(RwLock::new(HashMap::new())),
+            latest_notify,
+            ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         (server, notify_rx)
     }
@@ -92,6 +111,12 @@ impl StratumServer {
         }
     }
 
+    /// Disconnect a session by closing its channel (causes the session loop to exit).
+    pub async fn disconnect_session(&self, session_id: &str) {
+        let mut senders = self.session_senders.write().await;
+        senders.remove(session_id);
+    }
+
     /// Start listening for miner connections.
     pub async fn listen(self: Arc<Self>, addr: &str) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
@@ -100,11 +125,32 @@ impl StratumServer {
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
+                    // Per-IP connection limiting
+                    let ip = peer_addr.ip();
+                    let allowed = {
+                        let mut conns = self.ip_connections.lock().unwrap();
+                        let count = conns.entry(ip).or_insert(0);
+                        if *count >= MAX_CONNECTIONS_PER_IP {
+                            false
+                        } else {
+                            *count += 1;
+                            true
+                        }
+                    };
+                    if !allowed {
+                        drop(stream);
+                        continue;
+                    }
                     info!(%peer_addr, "New miner connection");
                     let server = Arc::clone(&self);
+                    let ip_conns = Arc::clone(&self.ip_connections);
                     tokio::spawn(async move {
                         if let Err(e) = server.handle_connection(stream, peer_addr).await {
                             warn!(%peer_addr, error = %e, "Session error");
+                        }
+                        let mut conns = ip_conns.lock().unwrap();
+                        if let Some(count) = conns.get_mut(&ip) {
+                            *count = count.saturating_sub(1);
                         }
                     });
                 }
@@ -120,6 +166,7 @@ impl StratumServer {
         stream: TcpStream,
         peer_addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
         let mut framed = Framed::new(stream, StratumCodec);
         let session_id = generate_session_id();
         let nonce_1 = self.nonce_allocator.allocate();
@@ -139,12 +186,17 @@ impl StratumServer {
                 frame = futures::StreamExt::next(&mut framed) => {
                     match frame {
                         Some(Ok(raw)) => {
+                            debug!(%peer_addr, raw = ?raw, "Received from miner");
                             if let Some(request) = ClientRequest::parse(&raw) {
                                 let responses = self.handle_request(
                                     &mut session,
                                     request,
                                     peer_addr,
+                                    local_port,
                                 ).await;
+                                for msg in &responses {
+                                    debug!(%peer_addr, json = %msg.to_json(), "Sending to miner");
+                                }
                                 for msg in responses {
                                     framed.send(msg.to_json()).await?;
                                 }
@@ -164,16 +216,25 @@ impl StratumServer {
                 // Broadcast notifications (new jobs, target changes)
                 msg = notify_rx.recv() => {
                     if let Ok(msg) = msg {
+                        debug!(%peer_addr, json = %msg.to_json(), "Broadcasting to miner");
                         if framed.send(msg.to_json()).await.is_err() {
                             break;
                         }
                     }
                 }
 
-                // Targeted messages for this session (share responses)
+                // Targeted messages for this session (share responses, set_target)
+                // Returns None when channel is closed (disconnect_session was called)
                 msg = session_rx.recv() => {
-                    if let Some(msg) = msg {
-                        if framed.send(msg.to_json()).await.is_err() {
+                    match msg {
+                        Some(msg) => {
+                            debug!(%peer_addr, json = %msg.to_json(), "Session msg to miner");
+                            if framed.send(msg.to_json()).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            info!(%peer_addr, session_id = %session.session_id, "Session disconnected by pool");
                             break;
                         }
                     }
@@ -198,6 +259,7 @@ impl StratumServer {
         session: &mut MinerSession,
         request: ClientRequest,
         peer_addr: SocketAddr,
+        local_port: u16,
     ) -> Vec<ServerMessage> {
         let mut responses = Vec::new();
 
@@ -209,7 +271,20 @@ impl StratumServer {
                     id,
                     session_id: session.session_id.clone(),
                     nonce_1: session.nonce_1.clone(),
+                    nonce2_size: self.nonce_allocator.nonce2_size(),
                 });
+                // Send difficulty in both formats so all miners understand it.
+                // Pool-core will send the actual target after authorize.
+                responses.push(ServerMessage::SetDifficulty {
+                    difficulty: 8192.0,
+                });
+                responses.push(ServerMessage::SetTarget {
+                    target: "000042e340f98608c00000000000000000000000000000000000000000000000".to_string(),
+                });
+                let latest = self.latest_notify.read().await;
+                if let Some(ref notify) = *latest {
+                    responses.push(notify.clone());
+                }
             }
 
             ClientRequest::Authorize { id, worker_name, worker_password } => {
@@ -230,6 +305,7 @@ impl StratumServer {
                     worker_name: worker_name.clone(),
                     password: worker_password,
                     addr: peer_addr,
+                    local_port,
                 }).await;
 
                 responses.push(ServerMessage::AuthorizeResult {
@@ -272,6 +348,15 @@ impl StratumServer {
                     target,
                 }).await;
                 // Server responds via mining.set_target asynchronously
+            }
+
+            ClientRequest::ExtranonceSubscribe { id } => {
+                debug!(%peer_addr, "Extranonce subscribe (acknowledged)");
+                responses.push(ServerMessage::AuthorizeResult {
+                    id,
+                    authorized: true,
+                    error: None,
+                });
             }
 
             ClientRequest::Unknown { id, method } => {

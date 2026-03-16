@@ -42,6 +42,9 @@ pub enum ClientRequest {
         id: serde_json::Value,
         target: String,
     },
+    ExtranonceSubscribe {
+        id: serde_json::Value,
+    },
     Unknown {
         id: serde_json::Value,
         method: String,
@@ -55,6 +58,7 @@ pub enum ServerMessage {
         id: serde_json::Value,
         session_id: String,
         nonce_1: String,
+        nonce2_size: usize,
     },
     AuthorizeResult {
         id: serde_json::Value,
@@ -63,6 +67,9 @@ pub enum ServerMessage {
     },
     SetTarget {
         target: String,
+    },
+    SetDifficulty {
+        difficulty: f64,
     },
     Notify {
         job_id: String,
@@ -166,6 +173,9 @@ impl ClientRequest {
                     target: arr.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 })
             }
+            "mining.extranonce.subscribe" => {
+                Some(ClientRequest::ExtranonceSubscribe { id })
+            }
             _ => Some(ClientRequest::Unknown { id, method: method.to_string() }),
         }
     }
@@ -175,10 +185,10 @@ impl ServerMessage {
     /// Serialize a server message to a JSON line (without trailing newline).
     pub fn to_json(&self) -> String {
         let raw = match self {
-            ServerMessage::SubscribeResult { id, session_id, nonce_1 } => {
+            ServerMessage::SubscribeResult { id, session_id, nonce_1, nonce2_size } => {
                 serde_json::json!({
                     "id": id,
-                    "result": [session_id, nonce_1],
+                    "result": [["mining.notify", session_id], nonce_1, nonce2_size],
                     "error": null
                 })
             }
@@ -205,6 +215,13 @@ impl ServerMessage {
                     "id": null,
                     "method": "mining.set_target",
                     "params": [target]
+                })
+            }
+            ServerMessage::SetDifficulty { difficulty } => {
+                serde_json::json!({
+                    "id": null,
+                    "method": "mining.set_difficulty",
+                    "params": [difficulty]
                 })
             }
             ServerMessage::Notify {
@@ -314,5 +331,21 @@ mod tests {
         assert_eq!(parsed["method"], "mining.notify");
         assert_eq!(parsed["params"][0], "42");
         assert_eq!(parsed["params"][7], true);
+    }
+
+    #[test]
+    fn serialize_subscribe_result() {
+        let msg = ServerMessage::SubscribeResult {
+            id: serde_json::json!(1),
+            session_id: "abc123".to_string(),
+            nonce_1: "01020304".to_string(),
+            nonce2_size: 28,
+        };
+        let json = msg.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["result"][0][0], "mining.notify");
+        assert_eq!(parsed["result"][0][1], "abc123");
+        assert_eq!(parsed["result"][1], "01020304");
+        assert_eq!(parsed["result"][2], 28);
     }
 }

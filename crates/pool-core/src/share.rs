@@ -10,10 +10,15 @@ use stratum::ServerMessage;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+use node_rpc::ZcashRpcClient;
+
 use crate::block::BlockAssembler;
 use crate::difficulty::{difficulty_to_target_hex, VardiffTracker};
 use crate::job::MiningJob;
 use rewards::PplnsCalculator;
+
+/// Zcash target block interval.
+const BLOCK_TIME_SECS: f64 = 75.0;
 
 const RAW_SOLUTION_SIZE: usize = 1344; // Equihash(200,9)
 
@@ -44,11 +49,15 @@ pub struct ShareValidator {
     jobs: Arc<RwLock<HashMap<String, MiningJob>>>,
     block_assembler: Arc<BlockAssembler>,
     pplns: Arc<PplnsCalculator>,
+    rpc: Arc<ZcashRpcClient>,
+    difficulty_multiplier: f64,
     /// Fallback target for sessions without a vardiff entry yet.
     default_target: [u8; 32],
     /// Per-session difficulty tracking, keyed by session_id.
     session_difficulty: RwLock<HashMap<String, SessionDifficulty>>,
     vardiff_config: VardiffConfig,
+    /// Per-port initial difficulty overrides (port -> difficulty).
+    port_difficulty: HashMap<u16, f64>,
     /// Most recent job notify, sent to miners on connect so they have work immediately.
     latest_notify: Arc<RwLock<Option<ServerMessage>>>,
 }
@@ -62,7 +71,10 @@ impl ShareValidator {
         pplns: Arc<PplnsCalculator>,
         pool_target: [u8; 32],
         vardiff_config: VardiffConfig,
+        port_difficulty: HashMap<u16, f64>,
         latest_notify: Arc<RwLock<Option<ServerMessage>>>,
+        rpc: Arc<ZcashRpcClient>,
+        difficulty_multiplier: f64,
     ) -> Self {
         Self {
             db,
@@ -70,9 +82,12 @@ impl ShareValidator {
             jobs,
             block_assembler,
             pplns,
+            rpc,
+            difficulty_multiplier,
             default_target: pool_target,
             session_difficulty: RwLock::new(HashMap::new()),
             vardiff_config,
+            port_difficulty,
             latest_notify,
         }
     }
@@ -163,18 +178,20 @@ impl ShareValidator {
                         }
                     }
                 }
-                StratumEvent::WorkerConnected { session_id, worker_name, password, addr } => {
-                    info!(%worker_name, %addr, "Worker connected");
+                StratumEvent::WorkerConnected { session_id, worker_name, password, addr, local_port } => {
+                    info!(%worker_name, %addr, port = local_port, "Worker connected");
                     let miner_address = worker_name.split('.').next().unwrap_or(&worker_name);
                     let wname = worker_name.split('.').nth(1).unwrap_or("default");
                     if let Err(e) = self.register_worker(miner_address, wname).await {
                         error!(error = %e, "Failed to register worker");
                     }
 
-                    // Parse initial difficulty from password (e.g. "d=128")
+                    // Priority: password-requested difficulty > per-port difficulty > default
                     let requested_diff = parse_difficulty_from_password(&password);
-                    let (target, tracker) = if let Some(diff) = requested_diff {
-                        info!(%session_id, difficulty = diff, "Using miner-requested initial difficulty");
+                    let initial_diff = requested_diff
+                        .or_else(|| self.port_difficulty.get(&local_port).copied());
+                    let (target, tracker) = if let Some(diff) = initial_diff {
+                        info!(%session_id, difficulty = diff, port = local_port, "Using custom initial difficulty");
                         self.make_target_for_difficulty(diff)
                     } else {
                         self.make_initial_target()
@@ -189,7 +206,13 @@ impl ShareValidator {
                             rate_window_shares: 0,
                         });
                     }
-                    info!(%session_id, target = %target_hex, "Sending initial target");
+                    let difficulty = initial_diff.unwrap_or(self.vardiff_config.initial_difficulty);
+                    info!(%session_id, target = %target_hex, difficulty, "Sending initial target");
+                    self.stratum
+                        .send_to_session(&session_id, ServerMessage::SetDifficulty {
+                            difficulty,
+                        })
+                        .await;
                     self.stratum
                         .send_to_session(&session_id, ServerMessage::SetTarget {
                             target: target_hex,
@@ -260,6 +283,36 @@ impl ShareValidator {
                     target: target_hex,
                 })
                 .await;
+        }
+    }
+
+    /// Compute luck for the block being found right now.
+    /// Returns `Some(luck_percent)` or `None` if data is unavailable.
+    async fn compute_block_luck(&self) -> Result<Option<f64>, String> {
+        let network_hashrate = self.rpc.get_network_sol_ps(Some(120)).await
+            .map_err(|e| format!("RPC error: {e}"))?;
+        if network_hashrate <= 0.0 {
+            return Ok(None);
+        }
+        let expected_work = network_hashrate * BLOCK_TIME_SECS;
+
+        // Get the most recent block's created_at as the start of the window
+        let recent_blocks = self.db.get_recent_blocks(1).await
+            .map_err(|e| format!("DB error: {e}"))?;
+        let since = if let Some(latest) = recent_blocks.first() {
+            latest.created_at.clone()
+        } else {
+            "1970-01-01 00:00:00".to_string()
+        };
+
+        let diff_sum = self.db.get_difficulty_sum_since(&since).await
+            .map_err(|e| format!("DB error: {e}"))?;
+        let actual_work = diff_sum * self.difficulty_multiplier;
+
+        if actual_work > 0.0 {
+            Ok(Some((actual_work / expected_work) * 100.0))
+        } else {
+            Ok(None)
         }
     }
 
@@ -396,7 +449,17 @@ impl ShareValidator {
                             let height = job.template.height as i64;
                             let reward = compute_block_reward(height);
                             let hash_hex = hex::encode(hash_bytes);
-                            match self.db.record_block(height, &hash_hex, reward, worker.id).await {
+
+                            // Compute luck at discovery time
+                            let luck_percent = match self.compute_block_luck().await {
+                                Ok(luck) => luck,
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to compute block luck");
+                                    None
+                                }
+                            };
+
+                            match self.db.record_block(height, &hash_hex, reward, worker.id, luck_percent).await {
                                 Ok(block_id) => {
                                     info!(height, reward, block_id, "Distributing PPLNS rewards");
                                     if let Err(e) = self.pplns.distribute(reward, block_id).await {

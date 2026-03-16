@@ -116,6 +116,16 @@ impl JobManager {
         stratum: Arc<StratumServer>,
         last_template_at_ms: Option<Arc<AtomicI64>>,
     ) -> Self {
+        Self::new_with_stall_tracking_and_notify(rpc, stratum, last_template_at_ms, Arc::new(RwLock::new(None)))
+    }
+
+    /// Full constructor with external latest_notify Arc (shared with stratum server).
+    pub fn new_with_stall_tracking_and_notify(
+        rpc: Arc<ZcashRpcClient>,
+        stratum: Arc<StratumServer>,
+        last_template_at_ms: Option<Arc<AtomicI64>>,
+        latest_notify: Arc<RwLock<Option<ServerMessage>>>,
+    ) -> Self {
         Self {
             rpc,
             stratum,
@@ -124,7 +134,7 @@ impl JobManager {
             last_prev_hash: Arc::new(RwLock::new(String::new())),
             last_non_clean_broadcast: Arc::new(RwLock::new(std::time::Instant::now())),
             last_template_at_ms,
-            latest_notify: Arc::new(RwLock::new(None)),
+            latest_notify,
         }
     }
 
@@ -197,7 +207,16 @@ impl JobManager {
         {
             let mut jobs = self.jobs.write().await;
             if is_new_block {
-                jobs.clear();
+                // Keep the last few jobs so shares found just before a block
+                // change aren't rejected as "Job not found".
+                if jobs.len() > 10 {
+                    let mut ids: Vec<String> = jobs.keys().cloned().collect();
+                    ids.sort();
+                    let remove_count = ids.len().saturating_sub(3);
+                    for id in ids.into_iter().take(remove_count) {
+                        jobs.remove(&id);
+                    }
+                }
             }
             jobs.insert(job_id.clone(), job);
         }

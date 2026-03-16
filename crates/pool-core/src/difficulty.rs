@@ -2,6 +2,7 @@ use std::time::Instant;
 
 /// Variable difficulty (vardiff) tracker for a single miner.
 /// Adjusts the share target to maintain a desired share submission rate.
+/// Uses aggressive 16x jumps to converge quickly for high-hashrate miners.
 pub struct VardiffTracker {
     shares_in_window: u32,
     window_start: Instant,

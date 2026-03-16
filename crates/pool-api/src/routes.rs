@@ -470,7 +470,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="value" id="stat-shares">0</div>
         </div>
         <div class="metric-cell">
-            <div class="label">Luck (24h)</div>
+            <div class="label">Luck</div>
             <div class="value" id="stat-luck">--</div>
         </div>
         <div class="metric-cell">
@@ -489,9 +489,9 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="label">Pool Fee</div>
             <div class="value" id="stat-fee">--</div>
         </div>
-        <div class="metric-cell">
-            <div class="label">Stratum Port</div>
-            <div class="value" id="stat-port">--</div>
+        <div class="metric-cell" style="grid-column: span 2">
+            <div class="label">Stratum Ports</div>
+            <div id="stat-ports" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px"></div>
         </div>
     </div>
 
@@ -814,7 +814,14 @@ async function fetchStats() {
 
         setVal('stat-shares', d.total_shares.toLocaleString());
         setVal('stat-fee', d.fee_percent + '%');
-        setVal('stat-port', d.stratum_port);
+        if (d.stratum_ports && d.stratum_ports.length) {
+            const el = document.getElementById('stat-ports');
+            el.innerHTML = d.stratum_ports.map(p =>
+                '<div style="background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:4px 10px;text-align:center">' +
+                '<div style="font-size:1.1rem;color:#f4b728;font-weight:600">' + p.port + '</div>' +
+                '<div style="font-size:0.65rem;color:#888">' + p.description + '</div></div>'
+            ).join('');
+        }
         setVal('stat-immature', d.immature_blocks);
         setVal('stat-pending-payout', d.pending_payout_blocks);
 

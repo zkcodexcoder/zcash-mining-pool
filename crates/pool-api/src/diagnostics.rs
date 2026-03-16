@@ -581,10 +581,11 @@ function buildDiffChart(shares) {
         byWorker[s.worker].push({ time: s.time, difficulty: s.difficulty });
     }
 
+    // Assign a sequential index to each share per worker for proper x-axis alignment.
     const workerNames = Object.keys(byWorker);
     const datasets = workerNames.map((name, i) => ({
         label: name,
-        data: byWorker[name].map(p => ({ x: p.time, y: p.difficulty })),
+        data: byWorker[name].map((p, idx) => ({ x: idx, y: p.difficulty })),
         borderColor: WORKER_COLORS[i % WORKER_COLORS.length],
         borderWidth: 1.5,
         fill: false,
@@ -615,18 +616,24 @@ function buildDiffChart(shares) {
                     borderWidth: 1,
                     titleFont: { size: 10 },
                     bodyFont: { size: 10, family: "'JetBrains Mono', monospace" },
+                    callbacks: {
+                        title: function(items) {
+                            if (!items.length) return '';
+                            const name = items[0].dataset.label;
+                            const idx = items[0].parsed.x;
+                            const point = byWorker[name] && byWorker[name][idx];
+                            return point ? point.time : '';
+                        }
+                    }
                 }
             },
             scales: {
                 x: {
-                    type: 'category',
-                    labels: reversed.map(s => {
-                        const parts = s.time.split(' ');
-                        return parts.length > 1 ? parts[1] : s.time;
-                    }),
+                    type: 'linear',
                     display: true,
                     grid: { color: '#1a1a1a' },
-                    ticks: { color: '#333', font: { size: 9 }, maxTicksLimit: 10, autoSkip: true }
+                    ticks: { color: '#333', font: { size: 9 }, maxTicksLimit: 10 },
+                    title: { display: true, text: 'Share #', color: '#444', font: { size: 10 } }
                 },
                 y: {
                     display: true,

@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=zec
-Group=zec
-ExecStartPre=/bin/rm -f /home/zec/.zallet/.lock
-ExecStart=/home/zec/zallet/target/release/zallet --datadir /home/zec/.zallet start
+User=zebra
+Group=zebra
+ExecStartPre=/bin/rm -f /home/zebra/.zallet/.lock
+ExecStart=/home/zebra/zallet/target/release/zallet --datadir /home/zebra/.zallet start
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:/home/zec/zallet.log
-StandardError=append:/home/zec/zallet.log
+StandardOutput=append:/home/zebra/zallet.log
+StandardError=append:/home/zebra/zallet.log
 
 # Hardening
 NoNewPrivileges=true

@@ -66,7 +66,7 @@ async fn test_block_recording() {
     let worker = db.get_or_create_worker(miner.id, "asic1").await.unwrap();
 
     let block_id = db
-        .record_block(100, "aabbccdd", 1_000_000_000, worker.id)
+        .record_block(100, "aabbccdd", 1_000_000_000, worker.id, Some(85.5))
         .await
         .unwrap();
     assert!(block_id > 0);

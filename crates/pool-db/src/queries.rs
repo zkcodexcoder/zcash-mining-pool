@@ -24,10 +24,13 @@ impl PoolDb {
         &self.pool
     }
 
-    /// Run migrations from the embedded SQL file.
+    /// Run migrations from the embedded SQL files.
     pub async fn run_migrations(&self) -> Result<(), DbError> {
         let schema = include_str!("../migrations/001_initial.sql");
         sqlx::raw_sql(schema).execute(&self.pool).await?;
+        let migration_002 = include_str!("../migrations/002_block_luck.sql");
+        // ALTER TABLE may fail if column already exists; ignore that error.
+        let _ = sqlx::raw_sql(migration_002).execute(&self.pool).await;
         Ok(())
     }
 
@@ -176,14 +179,16 @@ impl PoolDb {
         hash: &str,
         reward: i64,
         found_by: i64,
+        luck_percent: Option<f64>,
     ) -> Result<i64, DbError> {
         let result = sqlx::query(
-            "INSERT INTO blocks (height, hash, reward, found_by) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO blocks (height, hash, reward, found_by, luck_percent) VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(height)
         .bind(hash)
         .bind(reward)
         .bind(found_by)
+        .bind(luck_percent)
         .execute(&self.pool)
         .await?;
 
@@ -192,7 +197,7 @@ impl PoolDb {
 
     pub async fn get_recent_blocks(&self, limit: i64) -> Result<Vec<Block>, DbError> {
         let blocks: Vec<Block> = sqlx::query_as(
-            "SELECT id, height, hash, reward, status, found_by, created_at \
+            "SELECT id, height, hash, reward, status, found_by, created_at, luck_percent \
              FROM blocks ORDER BY id DESC LIMIT ?1",
         )
         .bind(limit)
@@ -244,6 +249,26 @@ impl PoolDb {
         Ok(row.0)
     }
 
+    pub async fn update_block_luck(&self, block_id: i64, luck_percent: f64) -> Result<(), DbError> {
+        sqlx::query("UPDATE blocks SET luck_percent = ?1 WHERE id = ?2")
+            .bind(luck_percent)
+            .bind(block_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Get all blocks ordered by height ascending (for backfill).
+    pub async fn get_all_blocks_by_height(&self) -> Result<Vec<Block>, DbError> {
+        let blocks: Vec<Block> = sqlx::query_as(
+            "SELECT id, height, hash, reward, status, found_by, created_at, luck_percent \
+             FROM blocks ORDER BY height ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(blocks)
+    }
+
     pub async fn update_block_status(&self, block_id: i64, status: &str) -> Result<(), DbError> {
         sqlx::query("UPDATE blocks SET status = ?1 WHERE id = ?2")
             .bind(status)
@@ -256,7 +281,7 @@ impl PoolDb {
     /// Get all blocks with status 'pending' (not yet confirmed or orphaned).
     pub async fn get_pending_blocks(&self) -> Result<Vec<Block>, DbError> {
         let blocks: Vec<Block> = sqlx::query_as(
-            "SELECT id, height, hash, reward, status, found_by, created_at \
+            "SELECT id, height, hash, reward, status, found_by, created_at, luck_percent \
              FROM blocks WHERE status = 'pending' ORDER BY height ASC",
         )
         .fetch_all(&self.pool)
@@ -558,7 +583,7 @@ impl PoolDb {
     /// Get all blocks found by a specific miner's workers.
     pub async fn get_miner_blocks(&self, miner_id: i64) -> Result<Vec<Block>, DbError> {
         let blocks: Vec<Block> = sqlx::query_as(
-            "SELECT b.id, b.height, b.hash, b.reward, b.status, b.found_by, b.created_at \
+            "SELECT b.id, b.height, b.hash, b.reward, b.status, b.found_by, b.created_at, b.luck_percent \
              FROM blocks b \
              JOIN workers w ON b.found_by = w.id \
              WHERE w.miner_id = ?1 \

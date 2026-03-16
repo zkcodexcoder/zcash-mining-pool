@@ -25,6 +25,8 @@ pub struct ApiState {
     pub pool_fee: f64,
     pub network: String,
     pub stratum_port: u16,
+    /// All stratum ports with their descriptions.
+    pub stratum_ports: Vec<StratumPortInfo>,
     /// Unix timestamp (ms) of last successful getblocktemplate. Used for stall detection.
     pub last_template_at_ms: Option<Arc<std::sync::atomic::AtomicI64>>,
     /// Wallet RPC client (Zallet) for balance/health check. Pool communicates with Zallet only via RPC.
@@ -46,11 +48,18 @@ pub struct ApiState {
     pub stats_history: StatsHistory,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StratumPortInfo {
+    pub port: u16,
+    pub description: String,
+}
+
 #[derive(Serialize)]
 pub struct PoolStats {
     pub name: String,
     pub fee_percent: f64,
     pub stratum_port: u16,
+    pub stratum_ports: Vec<StratumPortInfo>,
     pub connected_miners: i64,
     pub total_blocks: i64,
     pub immature_blocks: i64,
@@ -264,12 +273,22 @@ pub async fn get_pool_stats(
         .await
         .unwrap_or(0) as f64;
 
-    // Luck (effort) over the last 24h: expected_blocks / actual_blocks * 100.
-    let luck_percent = if snap.network_hashrate > 0.0 && snap.pool_hashrate > 0.0 {
-        let window_secs = 24.0 * 3600.0;
-        let expected_blocks = (snap.pool_hashrate / snap.network_hashrate) * (window_secs / BLOCK_TIME_SECS);
-        if actual_blocks_24h > 0.0 {
-            Some((expected_blocks / actual_blocks_24h) * 100.0)
+    // Current luck: work done since last block / expected work * 100.
+    // 0% = just found a block, 100% = block is "due", >100% = overdue.
+    // Lower is better: green ≤100%, yellow ≤150%, red >150%.
+    let luck_percent = if snap.network_hashrate > 0.0 {
+        let expected_work = snap.network_hashrate * BLOCK_TIME_SECS;
+        let recent_blocks = state.db.get_recent_blocks(1).await.unwrap_or_default();
+        let since = if let Some(latest) = recent_blocks.first() {
+            latest.created_at.clone()
+        } else {
+            // No blocks found yet — sum all shares from epoch.
+            "1970-01-01 00:00:00".to_string()
+        };
+        let diff_sum = state.db.get_difficulty_sum_since(&since).await.unwrap_or(0.0);
+        let actual_work = diff_sum * state.difficulty_multiplier;
+        if expected_work > 0.0 {
+            Some((actual_work / expected_work) * 100.0)
         } else {
             None
         }
@@ -288,6 +307,7 @@ pub async fn get_pool_stats(
         name: state.pool_name.clone(),
         fee_percent: state.pool_fee,
         stratum_port: state.stratum_port,
+        stratum_ports: state.stratum_ports.clone(),
         connected_miners: snap.connected_miners,
         total_blocks: snap.total_blocks,
         immature_blocks: immature,
@@ -350,11 +370,11 @@ pub async fn get_pool_stats_nomp(
 
     Json(serde_json::json!({
         "config": {
-            "ports": [{
-                "port": state.stratum_port,
-                "difficulty": 1,
-                "tls": false
-            }],
+            "ports": state.stratum_ports.iter().map(|p| serde_json::json!({
+                "port": p.port,
+                "description": p.description,
+                "tls": false,
+            })).collect::<Vec<_>>(),
             "fee": state.pool_fee,
             "minPaymentThreshold": state.min_payout_zatoshis,
             "paymentScheme": "PPLNS"
@@ -661,53 +681,18 @@ pub async fn get_blocks(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let network_hashrate = state
-        .rpc
-        .get_network_sol_ps(Some(120))
-        .await
-        .unwrap_or(0.0);
-
-    // Per-block luck (effort): actual_work / expected_work * 100.
-    // <100% = lucky (found block faster), >100% = unlucky (took more work).
-    // expected_work = network_hashrate * BLOCK_TIME_SECS (total solutions per block interval).
-    // actual_work = SUM(difficulty) * difficulty_multiplier (vardiff-weighted).
-    let expected_work = network_hashrate * BLOCK_TIME_SECS;
-
-    let mut result = Vec::with_capacity(blocks.len());
-    for (i, b) in blocks.iter().enumerate() {
-        // For the last (oldest) block we don't have the previous block's time,
-        // so we can't compute a meaningful luck value — show "--" instead of
-        // summing all shares from the beginning of time.
-        let luck_percent = if expected_work > 0.0 {
-            if let Some(prev) = blocks.get(i + 1) {
-                let diff_sum = state
-                    .db
-                    .get_difficulty_sum_between(&prev.created_at, &b.created_at)
-                    .await
-                    .unwrap_or(0.0);
-                let actual_work = diff_sum * state.difficulty_multiplier;
-                if actual_work > 0.0 {
-                    Some((actual_work / expected_work) * 100.0)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        result.push(BlockInfo {
+    let result: Vec<BlockInfo> = blocks
+        .iter()
+        .map(|b| BlockInfo {
             height: b.height,
             hash: b.hash.clone(),
             reward_zatoshis: b.reward,
             reward_zec: b.reward as f64 / ZATOSHIS_PER_ZEC,
             status: b.status.clone(),
             found_at: b.created_at.clone(),
-            luck_percent,
-        });
-    }
+            luck_percent: b.luck_percent,
+        })
+        .collect();
 
     Ok(Json(result))
 }

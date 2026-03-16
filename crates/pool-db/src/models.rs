@@ -56,6 +56,7 @@ pub struct Block {
     pub status: String,
     pub found_by: Option<i64>,
     pub created_at: String,
+    pub luck_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
