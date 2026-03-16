@@ -395,6 +395,49 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             .hero-grid { grid-template-columns: 1fr; }
             .metrics-grid { grid-template-columns: repeat(2, 1fr); }
         }
+        /* ── Stratum Config ── */
+        .stratum-config {
+            margin-bottom: 1rem;
+        }
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1px;
+            background: #222;
+            border: 1px solid #222;
+        }
+        .config-item {
+            background: #111;
+            padding: 0.5rem 0.75rem;
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+        }
+        .config-label {
+            font-size: 0.55rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: #555;
+            white-space: nowrap;
+        }
+        .config-value {
+            font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+            font-size: 0.75rem;
+            color: #e0e0e0;
+            word-break: break-all;
+        }
+        .config-coin {
+            font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+            font-size: 0.75rem;
+            color: #555;
+        }
+        @media (max-width: 900px) {
+            .config-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 600px) {
+            .config-grid { grid-template-columns: 1fr; }
+        }
+
         .loading { color: #333; font-style: italic; font-family: inherit; }
         .toggle-row td {
             text-align: center;
@@ -492,6 +535,38 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="metric-cell" style="grid-column: span 2">
             <div class="label">Stratum Ports</div>
             <div id="stat-ports" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px"></div>
+        </div>
+    </div>
+
+    <!-- ── Stratum Configuration ── -->
+    <div class="stratum-config">
+        <div class="section-title">How to Connect</div>
+        <div class="config-grid">
+            <div class="config-item">
+                <span class="config-label">Stratum URL</span>
+                <span class="config-value" id="stratum-url">stratum+tcp://pool.tazminer.com:3333</span>
+            </div>
+            <div class="config-item">
+                <span class="config-label">Algorithm</span>
+                <span class="config-value">Equihash 200,9</span>
+            </div>
+            <div class="config-item">
+                <span class="config-label">Worker</span>
+                <span class="config-value">YOUR_ZCASH_ADDRESS.worker_name</span>
+            </div>
+            <div class="config-item">
+                <span class="config-label">Password</span>
+                <span class="config-value">x</span>
+            </div>
+            <div class="config-item">
+                <span class="config-label">Payout Scheme</span>
+                <span class="config-value">PPLNS</span>
+            </div>
+            <div class="config-item">
+                <span class="config-label">Min Payout</span>
+                <span class="config-value" id="config-min-payout">0.01</span>
+                <span class="config-coin" id="config-coin">TAZ</span>
+            </div>
         </div>
     </div>
 
@@ -824,6 +899,12 @@ async function fetchStats() {
         }
         setVal('stat-immature', d.immature_blocks);
         setVal('stat-pending-payout', d.pending_payout_blocks);
+
+        // Update stratum config section
+        const configCoin = document.getElementById('config-coin');
+        if (configCoin) configCoin.textContent = COIN;
+        const stratumUrl = document.getElementById('stratum-url');
+        if (stratumUrl) stratumUrl.textContent = 'stratum+tcp://pool.tazminer.com:' + d.stratum_port;
 
         const luckEl = document.getElementById('stat-luck');
         if (d.luck_percent != null) {
