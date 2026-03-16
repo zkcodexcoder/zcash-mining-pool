@@ -103,6 +103,8 @@ pub struct JobManager {
     last_template_at_ms: Option<Arc<AtomicI64>>,
     /// Most recent notify message, sent to newly connecting miners.
     latest_notify: Arc<RwLock<Option<ServerMessage>>>,
+    /// Optional tag to inject into coinbase scriptSig (e.g. "Legends").
+    coinbase_tag: Option<Vec<u8>>,
 }
 
 impl JobManager {
@@ -135,7 +137,13 @@ impl JobManager {
             last_non_clean_broadcast: Arc::new(RwLock::new(std::time::Instant::now())),
             last_template_at_ms,
             latest_notify,
+            coinbase_tag: None,
         }
+    }
+
+    /// Set the coinbase tag to inject into each coinbase scriptSig.
+    pub fn set_coinbase_tag(&mut self, tag: Vec<u8>) {
+        self.coinbase_tag = Some(tag);
     }
 
     pub fn jobs(&self) -> Arc<RwLock<HashMap<String, MiningJob>>> {
@@ -169,7 +177,7 @@ impl JobManager {
     /// immediately on new blocks. Non-clean job updates are throttled
     /// to avoid spamming miners that ignore them.
     async fn poll_template(&self) -> Result<bool, node_rpc::RpcError> {
-        let template = self.rpc.get_block_template().await?;
+        let mut template = self.rpc.get_block_template().await?;
         let new_prev_hash = template.previousblockhash.clone();
 
         let is_new_block = {
@@ -194,6 +202,56 @@ impl JobManager {
 
         if !should_broadcast {
             return Ok(false);
+        }
+
+        // Inject coinbase tag if configured
+        if let Some(ref tag) = self.coinbase_tag {
+            if let Some(ref mut cb) = template.coinbasetxn {
+                let chain_history_root = template
+                    .defaultroots
+                    .as_ref()
+                    .and_then(|dr| dr.chainhistoryroot.as_deref())
+                    .unwrap_or("");
+
+                // Collect auth digests from non-coinbase transactions (provided by zebrad)
+                let tx_auth_digests: Vec<String> = template
+                    .transactions
+                    .iter()
+                    .filter_map(|tx| tx.authdigest.clone())
+                    .collect();
+
+                match crate::coinbase::inject_coinbase_tag(
+                    &cb.data,
+                    tag,
+                    chain_history_root,
+                    &tx_auth_digests,
+                ) {
+                    Ok(result) => {
+                        cb.data = result.new_coinbase_hex;
+                        if let Some(new_txid) = result.new_txid {
+                            // v4: update txid and clear cached merkleroot
+                            cb.hash = new_txid;
+                            if let Some(ref mut dr) = template.defaultroots {
+                                dr.merkleroot = None;
+                            }
+                        }
+                        if let Some(new_bc) = result.new_block_commitments {
+                            // v5: update blockcommitmentshash
+                            if let Some(ref mut dr) = template.defaultroots {
+                                dr.blockcommitmentshash = Some(new_bc.clone());
+                            }
+                            template.blockcommitmentshash = Some(new_bc);
+                        }
+                        debug!(
+                            tx_count = template.transactions.len(),
+                            "Injected coinbase tag"
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to inject coinbase tag: {e}");
+                    }
+                }
+            }
         }
 
         let job_id = self

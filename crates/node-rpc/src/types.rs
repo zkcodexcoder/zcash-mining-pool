@@ -9,6 +9,9 @@ pub struct BlockTemplateTransaction {
     pub sigops: u64,
     #[serde(default)]
     pub required: bool,
+    /// Authorizing data digest (v5 transactions). Provided by zebrad.
+    #[serde(default)]
+    pub authdigest: Option<String>,
 }
 
 /// Response from the `getblocktemplate` RPC.

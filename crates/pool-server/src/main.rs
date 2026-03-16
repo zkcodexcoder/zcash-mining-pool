@@ -38,6 +38,9 @@ struct PoolConfig {
     fee_percent: f64,
     #[serde(default = "default_network")]
     network: String,
+    /// Text to inject into coinbase scriptSig for pool identification (e.g. "Legends").
+    #[serde(default)]
+    coinbase_tag: Option<String>,
 }
 
 fn default_network() -> String { "testnet".to_string() }
@@ -259,12 +262,16 @@ async fn main() -> Result<()> {
     let last_template_at_ms = Arc::new(AtomicI64::new(0));
 
     // Initialize Job Manager (updates last_template_at_ms on each successful poll)
-    let job_manager = JobManager::new_with_stall_tracking_and_notify(
+    let mut job_manager = JobManager::new_with_stall_tracking_and_notify(
         Arc::clone(&rpc),
         Arc::clone(&stratum),
         Some(Arc::clone(&last_template_at_ms)),
         Arc::clone(&latest_notify),
     );
+    if let Some(ref tag) = config.pool.coinbase_tag {
+        info!(coinbase_tag = %tag, "Coinbase tag injection enabled");
+        job_manager.set_coinbase_tag(tag.as_bytes().to_vec());
+    }
     let jobs = job_manager.jobs();
 
     // Initialize Block Assembler
