@@ -453,12 +453,12 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         .hidden-rows { display: none; }
     </style>
 </head>
-<body>
+<body style="opacity:0;transition:opacity 0.15s">
 
 <!-- ── Header ── -->
 <div class="header">
     <h1 id="pool-name">ZCASH MINING POOL</h1>
-    <span class="badge" id="network-badge">Testnet</span>
+    <span class="badge" id="network-badge"></span>
     <div class="header-right">
         <span class="status-dot pulsing" id="header-status-dot"></span>
         <span style="font-size:0.6rem;color:#555" id="header-status-text">Connected</span>
@@ -693,7 +693,7 @@ const MAX_HISTORY = 360;
 const REFRESH_STATS = 10000;
 const REFRESH_MINERS = 10000;
 const REFRESH_BLOCKS = 30000;
-let COIN = 'TAZ'; // updated from API response
+let COIN = 'ZEC'; // updated from API response
 
 const history = {
     hashrate: [],
@@ -1127,7 +1127,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     initSparklines();
     initCharts();
     await fetchHistory();
-    fetchStats();
+    await fetchStats();
+    document.body.style.opacity = '1';
     fetchMiners();
     fetchBlocks();
     fetchPayouts();

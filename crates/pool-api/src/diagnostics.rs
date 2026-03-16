@@ -417,7 +417,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
         }
     </style>
 </head>
-<body>
+<body style="opacity:0;transition:opacity 0.15s">
 
 <div class="header">
     <h1>MINER DIAGNOSTICS</h1>
@@ -541,8 +541,8 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
 const WORKER_COLORS = ['#f4b728','#4a9eff','#48bb78','#fc8181','#a78bfa','#f687b3','#68d391','#ed8936'];
 let diffChart = null;
 let refreshTimer = null;
-let COIN = 'TAZ';
-(async function() {
+let COIN = 'ZEC';
+async function initCoin() {
     try {
         const r = await fetch('/api/pool/stats');
         const d = await r.json();
@@ -550,7 +550,7 @@ let COIN = 'TAZ';
         const badge = document.getElementById('network-badge');
         if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
     } catch(e) {}
-})();
+}
 
 function formatHashrate(h) {
     if (h == null || isNaN(h)) return '--';
@@ -760,7 +760,9 @@ async function fetchDiagnostics() {
     }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    await initCoin();
+    document.body.style.opacity = '1';
     fetchDiagnostics();
     refreshTimer = setInterval(fetchDiagnostics, 15000);
 });

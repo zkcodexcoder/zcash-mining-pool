@@ -868,7 +868,7 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         .empty-msg { color: #4a5568; font-size: 0.8rem; padding: 1rem 0; text-align: center; }
     </style>
 </head>
-<body>
+<body style="opacity:0;transition:opacity 0.15s">
     <div class="header">
         <h1>Wallet Status</h1>
         <a href="/">← Pool Dashboard</a>
@@ -952,11 +952,14 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 document.getElementById('maturity-content').innerHTML = '<div class="empty-msg">Failed to load</div>';
             }
         }
-        fetchCoin();
-        fetchStatus();
-        fetchImmature();
-        setInterval(fetchStatus, 5000);
-        setInterval(fetchImmature, 5000);
+        (async () => {
+            await fetchCoin();
+            document.body.style.opacity = '1';
+            fetchStatus();
+            fetchImmature();
+            setInterval(fetchStatus, 5000);
+            setInterval(fetchImmature, 5000);
+        })();
     </script>
 </body>
 </html>

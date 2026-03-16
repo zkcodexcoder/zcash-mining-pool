@@ -580,7 +580,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
         }
     </style>
 </head>
-<body>
+<body style="opacity:0;transition:opacity 0.15s">
 
 <div class="header">
     <h1>NETWORK MINERS</h1>
@@ -661,8 +661,8 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
 </div>
 
 <script>
-let COIN = 'TAZ';
-(async function() {
+let COIN = 'ZEC';
+async function initCoin() {
     try {
         const r = await fetch('/api/pool/stats');
         const d = await r.json();
@@ -670,7 +670,7 @@ let COIN = 'TAZ';
         const badge = document.getElementById('network-badge');
         if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
     } catch(e) {}
-})();
+}
 const CHART_COLORS = [
     '#f4b728', '#4a9eff', '#48bb78', '#fc8181', '#a78bfa',
     '#f687b3', '#68d391', '#63b3ed', '#fbd38d', '#b794f4',
@@ -810,7 +810,9 @@ async function fetchData() {
     }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    await initCoin();
+    document.body.style.opacity = '1';
     fetchData();
     refreshTimer = setInterval(fetchData, REFRESH_MS[currentRange]);
 });
