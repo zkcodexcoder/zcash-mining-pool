@@ -8,7 +8,7 @@ pub struct InjectionResult {
     pub new_coinbase_hex: String,
     /// For v4: new txid (SHA256d of full tx). None for v5.
     pub new_txid: Option<String>,
-    /// For v5: new hashBlockCommitments. None for v4.
+    /// For v5: new hashBlockCommitments (in RPC display byte order). None for v4.
     pub new_block_commitments: Option<String>,
 }
 
@@ -19,12 +19,12 @@ const MAX_SCRIPT_SIG_LEN: usize = 100;
 ///
 /// For v5 transactions, recomputes the auth digest chain and returns
 /// a new `hashBlockCommitments`. The `tx_auth_digests` parameter must
-/// contain the auth digests (hex) of all non-coinbase transactions in
-/// block order (from zebrad's `authdigest` field on each template tx).
+/// contain the auth digests (hex, RPC byte order) of all non-coinbase
+/// transactions in block order (from zebrad's `authdigest` field).
 ///
 /// For v4, returns a new txid.
 ///
-/// `chain_history_root_hex` is needed for v5 block commitments computation.
+/// `chain_history_root_hex` is in RPC byte order (from zebrad's `defaultroots`).
 pub fn inject_coinbase_tag(
     coinbase_hex: &str,
     tag: &[u8],
@@ -73,8 +73,8 @@ pub fn inject_coinbase_tag(
     }
 
     // Read scriptSig length
-    let (script_sig_len, _sig_cs_len) = read_compact_size(&data, script_sig_len_offset)?;
-    let script_sig_offset = script_sig_len_offset + _sig_cs_len;
+    let (script_sig_len, sig_cs_len) = read_compact_size(&data, script_sig_len_offset)?;
+    let script_sig_offset = script_sig_len_offset + sig_cs_len;
     let script_sig_end = script_sig_offset + script_sig_len;
 
     if data.len() < script_sig_end {
@@ -120,10 +120,11 @@ pub fn inject_coinbase_tag(
         // Extract consensus_branch_id from coinbase bytes 8-11
         let consensus_branch_id = &data[8..12];
 
-        // Compute new coinbase auth_digest
+        // Compute new coinbase auth_digest (internal byte order)
         let coinbase_auth = compute_coinbase_auth_digest(consensus_branch_id, new_cs, &new_script_sig);
 
-        // Parse non-coinbase tx auth digests from template
+        // Parse non-coinbase tx auth digests from template.
+        // Zebrad returns auth digests in RPC byte order (reversed); we need internal order.
         let mut leaves = Vec::with_capacity(1 + tx_auth_digests.len());
         leaves.push(coinbase_auth);
         for (i, ad_hex) in tx_auth_digests.iter().enumerate() {
@@ -134,14 +135,15 @@ pub fn inject_coinbase_tag(
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&ad_bytes);
+            arr.reverse(); // RPC order → internal order
             leaves.push(arr);
         }
 
-        // Build auth data merkle root
+        // Build auth data merkle root (internal byte order)
         let auth_data_root = auth_data_merkle_root(&leaves);
 
-        // block_commitments = BLAKE2b("ZcashBlockCommit", chain_history_root || auth_data_root || [0; 32])
-        let chain_history_root = hex::decode(chain_history_root_hex)
+        // chain_history_root from zebrad is in RPC byte order (reversed); reverse to internal.
+        let mut chain_history_root = hex::decode(chain_history_root_hex)
             .map_err(|e| format!("Invalid chain_history_root hex: {e}"))?;
         if chain_history_root.len() != 32 {
             return Err(format!(
@@ -149,12 +151,15 @@ pub fn inject_coinbase_tag(
                 chain_history_root.len()
             ));
         }
+        chain_history_root.reverse(); // RPC order → internal order
 
+        // block_commitments = BLAKE2b("ZcashBlockCommit", chain_history_root || auth_data_root || [0; 32])
         let mut commit_input = [0u8; 96];
         commit_input[..32].copy_from_slice(&chain_history_root);
         commit_input[32..64].copy_from_slice(&auth_data_root);
         // commit_input[64..96] already zero (terminator)
-        let block_commitments = blake2b_256(b"ZcashBlockCommit", &commit_input);
+        let mut block_commitments = blake2b_256(b"ZcashBlockCommit", &commit_input);
+        block_commitments.reverse(); // internal order → RPC order
 
         Ok(InjectionResult {
             new_coinbase_hex: hex::encode(&new_data),
@@ -176,7 +181,10 @@ pub fn inject_coinbase_tag(
 
 /// Compute the auth_digest of a coinbase transaction after scriptSig modification.
 ///
-/// coinbase has no sapling/orchard data, so those auth digests are [0; 32].
+/// Returns the auth_digest in INTERNAL byte order (not RPC display order).
+///
+/// For coinbase: sapling auth = BLAKE2b("ZTxAuthSapliHash", empty),
+/// orchard auth = BLAKE2b("ZTxAuthOrchaHash", empty). These are NOT [0;32].
 fn compute_coinbase_auth_digest(
     consensus_branch_id: &[u8],
     script_sig_cs: u8,
@@ -188,28 +196,37 @@ fn compute_coinbase_auth_digest(
     scripts_input.extend_from_slice(new_script_sig);
     let transparent_scripts_digest = blake2b_256(b"ZTxAuthTransHash", &scripts_input);
 
-    // auth_digest = BLAKE2b("ZTxAuthHash_" || branch_id, transparent || sapling([0;32]) || orchard([0;32]))
+    // Coinbase has no sapling/orchard bundles, but the auth digests are NOT zero —
+    // they are the BLAKE2b hash of empty data with their respective personalizations.
+    let sapling_auth_digest = blake2b_256(b"ZTxAuthSapliHash", &[]);
+    let orchard_auth_digest = blake2b_256(b"ZTxAuthOrchaHash", &[]);
+
+    // auth_digest = BLAKE2b("ZTxAuthHash_" || branch_id, transparent || sapling || orchard)
     let mut auth_perso = [0u8; 16];
     auth_perso[..12].copy_from_slice(b"ZTxAuthHash_");
     auth_perso[12..16].copy_from_slice(consensus_branch_id);
 
     let mut auth_input = [0u8; 96];
     auth_input[..32].copy_from_slice(&transparent_scripts_digest);
-    // auth_input[32..96] already zero (sapling + orchard auth digests for coinbase)
+    auth_input[32..64].copy_from_slice(&sapling_auth_digest);
+    auth_input[64..96].copy_from_slice(&orchard_auth_digest);
     blake2b_256(&auth_perso, &auth_input)
 }
 
-/// Compute the auth data merkle root from a list of transaction auth digests.
+/// Compute the auth data merkle root from a list of transaction auth digests
+/// (in internal byte order).
 ///
 /// Uses a perfect binary tree padded with [0; 32] to the next power of 2.
+/// For 1 leaf, the root IS the leaf (no padding needed).
 /// Hash function: BLAKE2b-256 with personalization "ZcashAuthDatHash".
 fn auth_data_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
         return [0u8; 32];
     }
 
-    // Pad to next power of 2 (minimum 2) with zero leaves
-    let n = leaves.len().next_power_of_two().max(2);
+    // Pad to next power of 2 with zero leaves.
+    // For 1 leaf, next_power_of_two() == 1 so no padding — root IS the leaf.
+    let n = leaves.len().next_power_of_two();
     let mut current: Vec<[u8; 32]> = Vec::with_capacity(n);
     current.extend_from_slice(leaves);
     current.resize(n, [0u8; 32]);
@@ -292,6 +309,13 @@ fn sha256d(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Reverse a hex string's byte order (e.g. "aabb" -> "bbaa").
+fn _reverse_hex(hex_str: &str) -> String {
+    let bytes = hex::decode(hex_str).unwrap_or_default();
+    let reversed: Vec<u8> = bytes.into_iter().rev().collect();
+    hex::encode(reversed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,19 +340,14 @@ mod tests {
 
     #[test]
     fn test_auth_data_merkle_root_single() {
-        // 1 leaf → padded to 2 with [0;32], root = hash(leaf || zeros)
+        // 1 leaf → no padding, root IS the leaf itself
         let leaf = [0xAA; 32];
         let root = auth_data_merkle_root(&[leaf]);
-
-        let mut expected_input = [0u8; 64];
-        expected_input[..32].copy_from_slice(&leaf);
-        let expected = blake2b_256(b"ZcashAuthDatHash", &expected_input);
-        assert_eq!(root, expected);
+        assert_eq!(root, leaf);
     }
 
     #[test]
     fn test_auth_data_merkle_root_two() {
-        // 2 leaves → already power of 2, root = hash(leaf0 || leaf1)
         let leaf0 = [0xAA; 32];
         let leaf1 = [0xBB; 32];
         let root = auth_data_merkle_root(&[leaf0, leaf1]);
@@ -342,7 +361,6 @@ mod tests {
 
     #[test]
     fn test_auth_data_merkle_root_three() {
-        // 3 leaves → padded to 4: hash(hash(l0||l1) || hash(l2||zeros))
         let l0 = [0xAA; 32];
         let l1 = [0xBB; 32];
         let l2 = [0xCC; 32];
@@ -363,5 +381,48 @@ mod tests {
         let expected = blake2b_256(b"ZcashAuthDatHash", &input_top);
 
         assert_eq!(root, expected);
+    }
+
+    /// End-to-end test using real data from zebrad's getblocktemplate.
+    /// Verifies auth_digest and blockcommitmentshash match zebrad's values.
+    #[test]
+    fn test_against_real_template() {
+        // Real data from zebrad testnet getblocktemplate (height 3902854, 0 txs)
+        let coinbase_hex = "050000800a27a726f04dec4d00000000868d3b00010000000000000000000000000000000000000000000000000000000000000000ffffffff0903868d3b7af09fa693000000000240597307000000001976a9143f1d707eae9297983695aa5dbf983e03b638530c88ac20bcbe000000000017a9147a86d6c7eb12ce0aa309d7391a6f338eba3c242b87000000";
+        let chain_history_root = "15a4875bc1c8555d4f9ee74798d796c5a39ad6934d5096048cd9653442822a2e";
+        // zebrad's authdigest and blockcommitmentshash are in RPC byte order (reversed)
+        let expected_authdigest_rpc = "31ffddbecc7bc45a3d182f52ed356128b96be69ddff221f18d8959a3b5cd20df";
+        let expected_blockcommitments_rpc = "782c59d40904570b53ee60d13f89597f0c942d78a364e147b61c33b996dcfd62";
+
+        let data = hex::decode(coinbase_hex).unwrap();
+        let consensus_branch_id = &data[8..12]; // f04dec4d
+
+        // Parse scriptSig
+        let header_len = 20;
+        let (_tx_in_count, cs_len) = read_compact_size(&data, header_len).unwrap();
+        let script_sig_len_offset = header_len + cs_len + 36;
+        let (script_sig_len, sig_cs_len) = read_compact_size(&data, script_sig_len_offset).unwrap();
+        let script_sig_offset = script_sig_len_offset + sig_cs_len;
+        let script_sig = &data[script_sig_offset..script_sig_offset + script_sig_len];
+        let script_sig_cs = script_sig_len as u8;
+
+        // Verify coinbase auth_digest (internal order, reversed = RPC order)
+        let auth = compute_coinbase_auth_digest(consensus_branch_id, script_sig_cs, script_sig);
+        let auth_rpc: Vec<u8> = auth.iter().rev().copied().collect();
+        assert_eq!(hex::encode(&auth_rpc), expected_authdigest_rpc);
+
+        // auth_data_root for 1 tx = the auth_digest itself
+        let root = auth_data_merkle_root(&[auth]);
+        assert_eq!(root, auth);
+
+        // blockcommitmentshash: chr and result are in RPC order (reversed)
+        let mut chr = hex::decode(chain_history_root).unwrap();
+        chr.reverse(); // RPC → internal
+        let mut commit_input = [0u8; 96];
+        commit_input[..32].copy_from_slice(&chr);
+        commit_input[32..64].copy_from_slice(&root);
+        let mut bc = blake2b_256(b"ZcashBlockCommit", &commit_input);
+        bc.reverse(); // internal → RPC
+        assert_eq!(hex::encode(bc), expected_blockcommitments_rpc);
     }
 }
