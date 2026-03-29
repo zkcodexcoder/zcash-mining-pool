@@ -24,6 +24,7 @@ pub struct ApiState {
     pub pool_name: String,
     pub pool_fee: f64,
     pub network: String,
+    pub hostname: String,
     pub stratum_port: u16,
     /// All stratum ports with their descriptions.
     pub stratum_ports: Vec<StratumPortInfo>,
@@ -58,6 +59,7 @@ pub struct StratumPortInfo {
 pub struct PoolStats {
     pub name: String,
     pub fee_percent: f64,
+    pub stratum_url: String,
     pub stratum_port: u16,
     pub stratum_ports: Vec<StratumPortInfo>,
     pub connected_miners: i64,
@@ -306,6 +308,7 @@ pub async fn get_pool_stats(
     Ok(Json(PoolStats {
         name: state.pool_name.clone(),
         fee_percent: state.pool_fee,
+        stratum_url: format!("stratum+tcp://{}:{}", state.hostname, state.stratum_port),
         stratum_port: state.stratum_port,
         stratum_ports: state.stratum_ports.clone(),
         connected_miners: snap.connected_miners,

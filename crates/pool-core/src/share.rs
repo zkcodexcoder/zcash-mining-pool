@@ -279,6 +279,11 @@ impl ShareValidator {
             }
             info!(%session_id, difficulty = diff, target = %target_hex, "Vardiff retarget");
             self.stratum
+                .send_to_session(session_id, ServerMessage::SetDifficulty {
+                    difficulty: diff,
+                })
+                .await;
+            self.stratum
                 .send_to_session(session_id, ServerMessage::SetTarget {
                     target: target_hex,
                 })

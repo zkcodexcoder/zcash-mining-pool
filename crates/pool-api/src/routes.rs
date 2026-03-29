@@ -462,7 +462,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <div class="header-right">
         <span class="status-dot pulsing" id="header-status-dot"></span>
         <span style="font-size:0.6rem;color:#555" id="header-status-text">Connected</span>
-        <a href="http://pool.tazminer.com:3000" target="_blank" rel="noopener" class="header-link" style="color:#f4b728;font-weight:600">Mine in Browser</a>
+        <a id="mine-link" href="#" target="_blank" rel="noopener" class="header-link" style="color:#f4b728;font-weight:600">Mine in Browser</a>
         <a href="/network" class="header-link">Network</a>
         <a href="/zallet" class="header-link">Wallet</a>
         <a href="/previews" class="header-link">Themes</a>
@@ -544,7 +544,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="config-grid">
             <div class="config-item">
                 <span class="config-label">Stratum URL</span>
-                <span class="config-value" id="stratum-url">stratum+tcp://pool.tazminer.com:3333</span>
+                <span class="config-value" id="stratum-url">loading...</span>
             </div>
             <div class="config-item">
                 <span class="config-label">Algorithm</span>
@@ -872,6 +872,11 @@ async function fetchStats() {
         COIN = d.network === 'mainnet' ? 'ZEC' : 'TAZ';
         const badge = document.getElementById('network-badge');
         if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
+        const mineLink = document.getElementById('mine-link');
+        if (mineLink && d.stratum_url) {
+            const host = d.stratum_url.replace(/^stratum\+tcp:\/\//, '').replace(/:\d+$/, '');
+            mineLink.href = 'http://' + host + ':3000';
+        }
 
         const setVal = (id, val) => {
             const el = document.getElementById(id);
@@ -904,7 +909,7 @@ async function fetchStats() {
         const configCoin = document.getElementById('config-coin');
         if (configCoin) configCoin.textContent = COIN;
         const stratumUrl = document.getElementById('stratum-url');
-        if (stratumUrl) stratumUrl.textContent = 'stratum+tcp://pool.tazminer.com:' + d.stratum_port;
+        if (stratumUrl) stratumUrl.textContent = d.stratum_url || ('stratum+tcp://' + window.location.hostname + ':' + d.stratum_port);
 
         const luckEl = document.getElementById('stat-luck');
         if (d.luck_percent != null) {

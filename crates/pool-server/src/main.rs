@@ -38,6 +38,9 @@ struct PoolConfig {
     fee_percent: f64,
     #[serde(default = "default_network")]
     network: String,
+    /// Public hostname or IP for stratum connection URLs shown on the dashboard.
+    #[serde(default)]
+    hostname: Option<String>,
     /// Text to inject into coinbase scriptSig for pool identification (e.g. "Legends").
     #[serde(default)]
     coinbase_tag: Option<String>,
@@ -365,6 +368,7 @@ async fn main() -> Result<()> {
         pool_name: config.pool.name.clone(),
         pool_fee: config.pool.fee_percent,
         network: config.pool.network.clone(),
+        hostname: config.pool.hostname.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
         stratum_port: stratum_addrs.first()
             .and_then(|a| a.split(':').last())
             .and_then(|p| p.parse().ok())
