@@ -234,13 +234,11 @@ pub async fn compute_stats_snapshot(state: &ApiState) -> StatsSnapshot {
         .unwrap_or(0.0);
     let hashrate_current = (diff_sum_1m / 60.0) * state.difficulty_multiplier;
 
-    let network_hashrate = state
-        .rpc
-        .get_network_sol_ps(Some(120))
-        .await
-        .unwrap_or(0.0);
-
-    let wallet_ok = check_wallet_rpc(state).await;
+    // Run slow RPC calls concurrently to avoid blocking the snapshot.
+    let (network_hashrate, wallet_ok) = tokio::join!(
+        async { state.rpc.get_network_sol_ps(Some(120)).await.unwrap_or(0.0) },
+        check_wallet_rpc(state),
+    );
 
     StatsSnapshot {
         timestamp_ms: chrono::Utc::now().timestamp_millis(),
