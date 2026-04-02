@@ -31,8 +31,9 @@ pub struct VardiffConfig {
 }
 
 /// Maximum shares per second before the session is rate-limited.
-/// Even at 100 MH/s, shares should never exceed this with proper difficulty.
-const MAX_SHARES_PER_SEC: f64 = 20.0;
+/// Set high so vardiff handles rate control; this is just a safety net
+/// against broken or malicious clients.
+const MAX_SHARES_PER_SEC: f64 = 500.0;
 
 /// Per-session state: vardiff tracker + current target + rate limiter.
 struct SessionDifficulty {
