@@ -47,6 +47,10 @@ pub struct ApiState {
     pub network_blocks_cache: tokio::sync::RwLock<std::collections::HashMap<String, (crate::network::NetworkMiningStats, i64)>>,
     /// In-memory ring buffer of stats snapshots (1 hour @ 10s = 360 entries).
     pub stats_history: StatsHistory,
+    /// Accepted share count since startup (atomic, no DB).
+    pub shares_accepted: Arc<std::sync::atomic::AtomicU64>,
+    /// Rejected share count since startup (atomic, no DB).
+    pub shares_rejected: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

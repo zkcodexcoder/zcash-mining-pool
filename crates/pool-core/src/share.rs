@@ -60,6 +60,10 @@ pub struct ShareValidator {
     port_difficulty: HashMap<u16, f64>,
     /// Most recent job notify, sent to miners on connect so they have work immediately.
     latest_notify: Arc<RwLock<Option<ServerMessage>>>,
+    /// Accepted share counter (shared with API for stats).
+    shares_accepted: Arc<std::sync::atomic::AtomicU64>,
+    /// Rejected share counter (shared with API for stats).
+    shares_rejected: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ShareValidator {
@@ -75,6 +79,8 @@ impl ShareValidator {
         latest_notify: Arc<RwLock<Option<ServerMessage>>>,
         rpc: Arc<ZcashRpcClient>,
         difficulty_multiplier: f64,
+        shares_accepted: Arc<std::sync::atomic::AtomicU64>,
+        shares_rejected: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             db,
@@ -89,6 +95,8 @@ impl ShareValidator {
             vardiff_config,
             port_difficulty,
             latest_notify,
+            shares_accepted,
+            shares_rejected,
         }
     }
 
@@ -128,6 +136,7 @@ impl ShareValidator {
                 } => {
                     // Rate-limit check before expensive validation
                     if self.check_rate_limit(&session_id).await {
+                        self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(worker = %worker_name, "Share rate limit exceeded, rejecting");
                         self.stratum
                             .send_to_session(&session_id, ServerMessage::SubmitResult {
@@ -159,6 +168,7 @@ impl ShareValidator {
                             } else {
                                 debug!(worker = %worker_name, job = %job_id, "Share accepted");
                             }
+                            self.shares_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             self.stratum
                                 .send_to_session(&session_id, ServerMessage::SubmitResult {
                                     id: request_id, accepted: true, error: None,
@@ -169,6 +179,7 @@ impl ShareValidator {
                             self.maybe_retarget(&session_id).await;
                         }
                         Err(e) => {
+                            self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             warn!(worker = %worker_name, error = %e, "Share rejected");
                             self.stratum
                                 .send_to_session(&session_id, ServerMessage::SubmitResult {

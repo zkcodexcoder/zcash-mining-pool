@@ -387,6 +387,10 @@ async fn main() -> Result<()> {
         if target_f64 > 0.0 { 2.0f64.powi(256) / target_f64 } else { 1.0 }
     };
 
+    // Shared counters for accepted/rejected shares (used by both validator and API).
+    let shares_accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let shares_rejected = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     let share_validator = ShareValidator::new(
         db.clone(),
         Arc::clone(&stratum),
@@ -399,6 +403,8 @@ async fn main() -> Result<()> {
         latest_notify,
         Arc::clone(&rpc),
         difficulty_multiplier,
+        Arc::clone(&shares_accepted),
+        Arc::clone(&shares_rejected),
     );
 
     // Wallet RPC for Zallet monitoring (and payouts)
@@ -438,6 +444,8 @@ async fn main() -> Result<()> {
         maturity_confirmations: config.payout.maturity_confirmations,
         network_blocks_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         stats_history: pool_api::StatsHistory::new(),
+        shares_accepted: Arc::clone(&shares_accepted),
+        shares_rejected: Arc::clone(&shares_rejected),
         difficulty_multiplier: {
             // Convert shares/sec → Sol/s.  Each share means a hash below pool_target,
             // so on average each share takes 2^256 / target hashes to find.

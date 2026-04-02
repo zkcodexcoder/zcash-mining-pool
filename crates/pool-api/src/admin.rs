@@ -326,6 +326,9 @@ struct AdminHealth {
     uptime_secs: i64,
     connected_miners: i64,
     connected_workers: i64,
+    shares_accepted: u64,
+    shares_rejected: u64,
+    shares_rejection_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -382,6 +385,11 @@ async fn api_health(
     let connected_miners = state.app.db.get_connected_miners_count().await.unwrap_or(0);
     let connected_workers = state.app.db.get_connected_workers_count().await.unwrap_or(0);
 
+    let accepted = state.app.shares_accepted.load(Ordering::Relaxed);
+    let rejected = state.app.shares_rejected.load(Ordering::Relaxed);
+    let total = accepted + rejected;
+    let rejection_rate = if total > 0 { (rejected as f64 / total as f64) * 100.0 } else { 0.0 };
+
     Json(AdminHealth {
         node_ok,
         node_height,
@@ -392,6 +400,9 @@ async fn api_health(
         uptime_secs: now - state.started_at,
         connected_miners,
         connected_workers,
+        shares_accepted: accepted,
+        shares_rejected: rejected,
+        shares_rejection_rate: rejection_rate,
     })
 }
 
@@ -914,6 +925,10 @@ async function fetchHealth() {
         html += '<tr><td>Uptime</td><td>' + fmtDuration(d.uptime_secs) + '</td></tr>';
         html += '<tr><td>Connected Miners</td><td>' + d.connected_miners + '</td></tr>';
         html += '<tr><td>Connected Workers</td><td>' + d.connected_workers + '</td></tr>';
+        html += '<tr><td>Shares Accepted</td><td>' + d.shares_accepted.toLocaleString() + '</td></tr>';
+        html += '<tr><td>Shares Rejected</td><td>' + d.shares_rejected.toLocaleString() + '</td></tr>';
+        const rateColor = d.shares_rejection_rate > 5 ? '#fc8181' : d.shares_rejection_rate > 1 ? '#f4b728' : '#68d391';
+        html += '<tr><td>Rejection Rate</td><td style="color:' + rateColor + '">' + d.shares_rejection_rate.toFixed(2) + '%</td></tr>';
         html += '</table>';
         document.getElementById('health-content').innerHTML = html;
     } catch (e) {
