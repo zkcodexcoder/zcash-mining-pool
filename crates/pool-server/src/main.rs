@@ -65,24 +65,76 @@ fn default_network() -> String { "testnet".to_string() }
 
 #[derive(Debug, Deserialize)]
 struct StratumConfig {
+    /// Legacy: single listen address.
     #[serde(default)]
     listen_addr: Option<String>,
+    /// Legacy: list of listen addresses.
     #[serde(default)]
     listen_addrs: Option<Vec<String>>,
     nonce1_size: usize,
-    /// Per-port initial difficulty overrides (port number as string -> difficulty).
+    /// Legacy: per-port difficulty overrides (port number as string -> difficulty).
     #[serde(default)]
     port_difficulty: HashMap<String, f64>,
+    /// Structured port definitions (preferred over legacy fields).
+    #[serde(default)]
+    ports: Vec<StratumPortConfig>,
 }
+
+#[derive(Debug, Deserialize)]
+struct StratumPortConfig {
+    addr: String,
+    #[serde(default = "default_port_description")]
+    description: String,
+    #[serde(default)]
+    initial_difficulty: Option<f64>,
+}
+
+fn default_port_description() -> String { "Default".to_string() }
 
 impl StratumConfig {
     fn addrs(&self) -> Vec<String> {
-        if let Some(ref addrs) = self.listen_addrs {
+        if !self.ports.is_empty() {
+            self.ports.iter().map(|p| p.addr.clone()).collect()
+        } else if let Some(ref addrs) = self.listen_addrs {
             addrs.clone()
         } else if let Some(ref addr) = self.listen_addr {
             vec![addr.clone()]
         } else {
             vec!["0.0.0.0:3333".to_string()]
+        }
+    }
+
+    /// Build port_difficulty map, merging structured ports with legacy overrides.
+    fn resolved_port_difficulty(&self) -> HashMap<u16, f64> {
+        let mut map: HashMap<u16, f64> = self.port_difficulty.iter()
+            .filter_map(|(k, &v)| k.parse::<u16>().ok().map(|port| (port, v)))
+            .collect();
+        // Structured ports override legacy entries
+        for p in &self.ports {
+            if let Some(diff) = p.initial_difficulty {
+                if let Some(port) = p.addr.split(':').last().and_then(|s| s.parse::<u16>().ok()) {
+                    map.insert(port, diff);
+                }
+            }
+        }
+        map
+    }
+
+    /// Build dashboard port info from structured config or legacy fallback.
+    fn port_info(&self) -> Vec<pool_api::StratumPortInfo> {
+        if !self.ports.is_empty() {
+            self.ports.iter().map(|p| {
+                let port: u16 = p.addr.split(':').last().and_then(|s| s.parse().ok()).unwrap_or(0);
+                pool_api::StratumPortInfo {
+                    port,
+                    description: p.description.clone(),
+                }
+            }).collect()
+        } else {
+            self.addrs().iter().map(|addr| {
+                let port: u16 = addr.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(0);
+                pool_api::StratumPortInfo { port, description: "Default".to_string() }
+            }).collect()
         }
     }
 }
@@ -323,9 +375,7 @@ async fn main() -> Result<()> {
     ));
 
     // Initialize Share Validator
-    let port_difficulty: HashMap<u16, f64> = config.stratum.port_difficulty.iter()
-        .filter_map(|(k, &v)| k.parse::<u16>().ok().map(|port| (port, v)))
-        .collect();
+    let port_difficulty = config.stratum.resolved_port_difficulty();
     if !port_difficulty.is_empty() {
         info!(?port_difficulty, "Per-port difficulty overrides loaded");
     }
@@ -364,17 +414,8 @@ async fn main() -> Result<()> {
             Arc::new(rpc)
         });
 
-    // Build stratum port info for the dashboard.
-    let stratum_ports: Vec<pool_api::StratumPortInfo> = stratum_addrs.iter().map(|addr| {
-        let port: u16 = addr.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let description = match port {
-            3334 => "300 KSol/s - 3 MSol/s".to_string(),
-            3335 => "3-50 MSol/s".to_string(),
-            3336 => "50+ MSol/s".to_string(),
-            _ => "Default".to_string(),
-        };
-        pool_api::StratumPortInfo { port, description }
-    }).collect();
+    // Build stratum port info for the dashboard from config.
+    let stratum_ports = config.stratum.port_info();
 
     // Initialize API (shares last_template_at_ms for /health and pool stats)
     let api_state: AppState = Arc::new(ApiState {
