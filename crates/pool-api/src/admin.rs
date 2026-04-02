@@ -197,7 +197,7 @@ async fn handle_login(
 
     let cookie = make_session_cookie(&state.signing_key);
     let set_cookie = format!(
-        "{SESSION_COOKIE_NAME}={cookie}; Path=/admin; HttpOnly; SameSite=Lax; Secure; Max-Age={SESSION_MAX_AGE_SECS}"
+        "{SESSION_COOKIE_NAME}={cookie}; Path=/admin; HttpOnly; SameSite=Lax; Max-Age={SESSION_MAX_AGE_SECS}"
     );
     (
         [(axum::http::header::SET_COOKIE, set_cookie)],
