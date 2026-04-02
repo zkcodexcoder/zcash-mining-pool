@@ -392,8 +392,8 @@ async fn api_restart() -> Json<serde_json::Value> {
     // so the HTTP response can be sent first.
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let _ = tokio::process::Command::new("systemctl")
-            .args(["restart", "zcash-pool"])
+        let _ = tokio::process::Command::new("sudo")
+            .args(["systemctl", "restart", "zcash-pool"])
             .status()
             .await;
     });
