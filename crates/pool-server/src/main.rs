@@ -656,9 +656,9 @@ async fn run_payout_loop(
     network: &str,
 ) {
     info!("Payout loop started");
+    // Short initial delay to let stratum/API bind before doing RPC work.
+    tokio::time::sleep(Duration::from_secs(30)).await;
     loop {
-        tokio::time::sleep(interval).await;
-
         // Phase 1: Check block maturity
         if let Err(e) = check_block_maturity(&db, &node_rpc, maturity_confirmations).await {
             error!(error = %e, "Block maturity check failed");
@@ -681,6 +681,8 @@ async fn run_payout_loop(
                 error!(error = %e, "Payout round failed");
             }
         }
+
+        tokio::time::sleep(interval).await;
     }
 }
 
