@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 use crate::handlers::AppState;
 
 /// Number of blocks to fetch concurrently per batch.
-const CONCURRENCY: usize = 25;
+const CONCURRENCY: usize = 50;
 
 #[derive(Deserialize)]
 pub struct NetworkQuery {
