@@ -396,7 +396,7 @@ impl PoolDb {
     /// Find miners with pending balance >= min_amount (in zatoshis).
     pub async fn get_pending_payouts(&self, min_amount: i64) -> Result<Vec<PendingPayout>, DbError> {
         let rows: Vec<SqliteRow> = sqlx::query(
-            "SELECT b.miner_id, m.address, b.pending \
+            "SELECT b.miner_id, m.address, b.pending, m.created_at \
              FROM balances b \
              JOIN miners m ON m.id = b.miner_id \
              WHERE b.pending >= ?1 \
@@ -412,6 +412,7 @@ impl PoolDb {
                 miner_id: row.get("miner_id"),
                 address: row.get("address"),
                 amount: row.get("pending"),
+                created_at: row.get("created_at"),
             })
             .collect();
 
@@ -703,6 +704,7 @@ pub struct PendingPayout {
     pub miner_id: i64,
     pub address: String,
     pub amount: i64,
+    pub created_at: String,
 }
 
 /// Aggregated share data for PPLNS calculation.

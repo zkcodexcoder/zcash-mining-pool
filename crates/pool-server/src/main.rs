@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::mpsc;
@@ -671,7 +672,7 @@ async fn run_payout_loop(
         }
 
         // Phase 3: Pay miners from shielded pool (only if balance is sufficient)
-        match process_payouts(&db, &wallet_rpc, pool_address, min_payout_zatoshis, network).await {
+        match process_payouts(&db, &wallet_rpc, pool_address, mining_address, min_payout_zatoshis, network).await {
             Ok(count) => {
                 if count > 0 {
                     info!(payouts = count, "Payout round completed");
@@ -912,6 +913,7 @@ async fn process_payouts(
     db: &PoolDb,
     rpc: &ZcashRpcClient,
     pool_address: &str,
+    mining_address: &str,
     min_payout_zatoshis: i64,
     network: &str,
 ) -> anyhow::Result<usize> {
@@ -961,22 +963,38 @@ async fn process_payouts(
         available_zec / total_payout_zec
     };
 
-    // Build scaled payout list in zatoshis, skipping miners below minimum
-    // or with invalid addresses.
-    let mut payout_list: Vec<(usize, i64)> = Vec::new(); // (index into pending, scaled_zatoshis)
+    // Build scaled payout list in zatoshis, skipping miners below minimum.
+    // Invalid addresses are redirected to the mining address after 2 days.
+    let mut payout_list: Vec<(usize, i64, String)> = Vec::new(); // (index, scaled_zatoshis, pay-to address)
+    let two_days_ago = Utc::now()
+        .checked_sub_signed(chrono::Duration::days(2))
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+
     for (i, p) in pending.iter().enumerate() {
-        // Skip invalid addresses: must start with a known Zcash prefix
-        if !is_valid_zcash_address(&p.address, network) {
+        let pay_to = if is_valid_zcash_address(&p.address, network) {
+            p.address.clone()
+        } else if p.created_at <= two_days_ago {
+            // Miner registered >2 days ago with unpayable address — redirect to mining address.
             warn!(
                 miner_id = p.miner_id,
                 address = %p.address,
-                "Skipping payout: invalid address format"
+                created_at = %p.created_at,
+                amount_zec = p.amount as f64 / ZATOSHIS_PER_ZEC,
+                "Redirecting payout to mining address (unpayable address, >2 days old)"
+            );
+            mining_address.to_string()
+        } else {
+            warn!(
+                miner_id = p.miner_id,
+                address = %p.address,
+                "Skipping payout: invalid address format (account < 2 days old)"
             );
             continue;
-        }
+        };
         let scaled_zatoshis = (p.amount as f64 * scale).floor() as i64;
         if scaled_zatoshis >= min_payout_zatoshis {
-            payout_list.push((i, scaled_zatoshis));
+            payout_list.push((i, scaled_zatoshis, pay_to));
         }
     }
 
@@ -989,7 +1007,7 @@ async fn process_payouts(
         return Ok(0);
     }
 
-    let actual_total_zatoshis: i64 = payout_list.iter().map(|(_, amt)| *amt).sum();
+    let actual_total_zatoshis: i64 = payout_list.iter().map(|(_, amt, _)| *amt).sum();
     let actual_total_zec = actual_total_zatoshis as f64 / ZATOSHIS_PER_ZEC;
     info!(
         miners = payout_list.len(),
@@ -1007,7 +1025,7 @@ async fn process_payouts(
         loop {
             let amounts: Vec<(&str, f64)> = current_list
                 .iter()
-                .map(|(i, zats)| (pending[*i].address.as_str(), *zats as f64 / ZATOSHIS_PER_ZEC))
+                .map(|(_, zats, addr)| (addr.as_str(), *zats as f64 / ZATOSHIS_PER_ZEC))
                 .collect();
 
             match rpc.z_sendmany(pool_address, &amounts).await {
@@ -1019,7 +1037,7 @@ async fn process_payouts(
                         if let Some(have_zats) = parse_have_balance(&msg) {
                             // Use 95% of actual spendable balance to leave room for fees
                             let actual_available = have_zats as f64 * 0.95;
-                            let current_total: f64 = current_list.iter().map(|(_, z)| *z as f64).sum();
+                            let current_total: f64 = current_list.iter().map(|(_, z, _)| *z as f64).sum();
                             if actual_available < min_payout_zatoshis as f64 || current_total <= 0.0 {
                                 return Err(anyhow::anyhow!("Wallet balance too low: {msg}"));
                             }
@@ -1032,10 +1050,10 @@ async fn process_payouts(
                             );
                             current_list = current_list
                                 .into_iter()
-                                .filter_map(|(i, old_zats)| {
+                                .filter_map(|(i, old_zats, addr)| {
                                     let new_zats = (old_zats as f64 * rescale).floor() as i64;
                                     if new_zats >= min_payout_zatoshis {
-                                        Some((i, new_zats))
+                                        Some((i, new_zats, addr))
                                     } else {
                                         None
                                     }
@@ -1069,7 +1087,7 @@ async fn process_payouts(
 
     // Record the actual (scaled) payout amounts in the database.
     let mut count = 0;
-    for (i, amt_zatoshis) in &payout_list {
+    for (i, amt_zatoshis, pay_to) in &payout_list {
         let p = &pending[*i];
         if let Err(e) = db.create_payout(p.miner_id, *amt_zatoshis, &txid).await {
             error!(miner_id = p.miner_id, error = %e, "Failed to record payout");
@@ -1077,6 +1095,7 @@ async fn process_payouts(
             info!(
                 miner_id = p.miner_id,
                 address = %p.address,
+                pay_to = %pay_to,
                 amount_zec = *amt_zatoshis as f64 / ZATOSHIS_PER_ZEC,
                 txid = %txid,
                 "Payout recorded"

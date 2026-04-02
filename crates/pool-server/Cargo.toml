@@ -24,3 +24,4 @@ rewards = { path = "../rewards" }
 toml = "0.8"
 sqlx.workspace = true
 axum.workspace = true
+chrono.workspace = true
