@@ -887,9 +887,13 @@ async function fetchStats() {
         const badge = document.getElementById('network-badge');
         if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
         const mineLink = document.getElementById('mine-link');
-        if (mineLink && d.stratum_url) {
-            const host = d.stratum_url.replace(/^stratum\+tcp:\/\//, '').replace(/:\d+$/, '');
-            mineLink.href = 'http://' + host + ':3000';
+        if (mineLink) {
+            if (d.network === 'mainnet') {
+                mineLink.style.display = 'none';
+            } else if (d.stratum_url) {
+                const host = d.stratum_url.replace(/^stratum\+tcp:\/\//, '').replace(/:\d+$/, '');
+                mineLink.href = 'http://' + host + ':3000';
+            }
         }
 
         const setVal = (id, val) => {
