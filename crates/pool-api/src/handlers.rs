@@ -51,6 +51,8 @@ pub struct ApiState {
     pub shares_accepted: Arc<std::sync::atomic::AtomicU64>,
     /// Rejected share count since startup (atomic, no DB).
     pub shares_rejected: Arc<std::sync::atomic::AtomicU64>,
+    /// Optional banner message shown at the top of the public dashboard.
+    pub banner: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +85,8 @@ pub struct PoolStats {
     pub last_template_at: Option<String>,
     pub wallet_ok: bool,
     pub network: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -329,6 +333,7 @@ pub async fn get_pool_stats(
         last_template_at,
         wallet_ok: check_wallet_rpc(&state).await,
         network: state.network.clone(),
+        banner: state.banner.clone(),
     }))
 }
 

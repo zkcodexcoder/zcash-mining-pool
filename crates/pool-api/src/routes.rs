@@ -68,11 +68,15 @@ async fn get_pool_info(
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
     let coin = if state.network == "mainnet" { "ZEC" } else { "TAZ" };
-    Json(serde_json::json!({
+    let mut info = serde_json::json!({
         "network": state.network,
         "coin": coin,
         "pool_name": state.pool_name,
-    }))
+    });
+    if let Some(ref banner) = state.banner {
+        info["banner"] = serde_json::json!(banner);
+    }
+    Json(info)
 }
 
 async fn dashboard() -> Html<String> {
@@ -482,6 +486,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <a href="/previews" class="header-link">Themes</a>
     </div>
 </div>
+<div id="banner" style="display:none;background:#2d1f00;border-bottom:1px solid #f4b728;padding:0.5rem 1.5rem;font-size:0.8rem;color:#f4b728;text-align:center"></div>
 
 <div class="container">
 
@@ -894,6 +899,14 @@ async function fetchStats() {
                 const host = d.stratum_url.replace(/^stratum\+tcp:\/\//, '').replace(/:\d+$/, '');
                 mineLink.href = 'http://' + host + ':3000';
             }
+        }
+
+        const bannerEl = document.getElementById('banner');
+        if (d.banner) {
+            bannerEl.textContent = d.banner;
+            bannerEl.style.display = 'block';
+        } else {
+            bannerEl.style.display = 'none';
         }
 
         const setVal = (id, val) => {

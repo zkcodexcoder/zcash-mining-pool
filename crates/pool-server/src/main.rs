@@ -59,6 +59,9 @@ struct PoolConfig {
     /// Text to inject into coinbase scriptSig for pool identification (e.g. "Legends").
     #[serde(default)]
     coinbase_tag: Option<String>,
+    /// Optional warning/info banner shown at the top of the public dashboard.
+    #[serde(default)]
+    banner: Option<String>,
 }
 
 fn default_network() -> String { "testnet".to_string() }
@@ -446,6 +449,7 @@ async fn main() -> Result<()> {
         stats_history: pool_api::StatsHistory::new(),
         shares_accepted: Arc::clone(&shares_accepted),
         shares_rejected: Arc::clone(&shares_rejected),
+        banner: config.pool.banner.clone(),
         difficulty_multiplier: {
             // Convert shares/sec → Sol/s.  Each share means a hash below pool_target,
             // so on average each share takes 2^256 / target hashes to find.
