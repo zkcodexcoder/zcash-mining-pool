@@ -541,12 +541,12 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
 const WORKER_COLORS = ['#f4b728','#4a9eff','#48bb78','#fc8181','#a78bfa','#f687b3','#68d391','#ed8936'];
 let diffChart = null;
 let refreshTimer = null;
-let COIN = 'ZEC';
+let COIN = 'TAZ';
 async function initCoin() {
     try {
-        const r = await fetch('/api/pool/stats');
+        const r = await fetch('/api/pool/info');
         const d = await r.json();
-        COIN = d.network === 'mainnet' ? 'ZEC' : 'TAZ';
+        COIN = d.coin || 'TAZ';
         const badge = document.getElementById('network-badge');
         if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
     } catch(e) {}

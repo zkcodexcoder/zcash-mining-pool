@@ -1,4 +1,5 @@
-use axum::response::Html;
+use axum::extract::State;
+use axum::response::{Html, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
@@ -23,7 +24,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/pool/stats/history", get(get_stats_history))
         .route("/api/network/blocks", get(network::get_network_blocks))
         .route("/health", get(get_health))
-        .route("/api/miner/{address}/diagnostics", get(diagnostics::get_miner_diagnostics));
+        .route("/api/miner/{address}/diagnostics", get(diagnostics::get_miner_diagnostics))
+        .route("/api/pool/info", get(get_pool_info));
 
     Router::new()
         .merge(api)
@@ -59,6 +61,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/previews", get(previews::gallery))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Lightweight endpoint returning just network/coin info (no RPC calls).
+async fn get_pool_info(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let coin = if state.network == "mainnet" { "ZEC" } else { "TAZ" };
+    Json(serde_json::json!({
+        "network": state.network,
+        "coin": coin,
+        "pool_name": state.pool_name,
+    }))
 }
 
 async fn dashboard() -> Html<String> {
@@ -693,7 +707,7 @@ const MAX_HISTORY = 360;
 const REFRESH_STATS = 10000;
 const REFRESH_MINERS = 10000;
 const REFRESH_BLOCKS = 30000;
-let COIN = 'ZEC'; // updated from API response
+let COIN = 'TAZ'; // updated from /api/pool/info
 
 const history = {
     hashrate: [],

@@ -902,9 +902,9 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         let COIN = 'TAZ';
         async function fetchCoin() {
             try {
-                const r = await fetch('/api/pool/stats');
+                const r = await fetch('/api/pool/info');
                 const d = await r.json();
-                COIN = d.network === 'mainnet' ? 'ZEC' : 'TAZ';
+                COIN = d.coin || 'TAZ';
             } catch(e) {}
         }
         async function fetchStatus() {
