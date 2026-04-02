@@ -1023,10 +1023,13 @@ async fn process_payouts(
         let mut current_list = payout_list;
         let mut retries = 0u32;
         loop {
-            let amounts: Vec<(&str, f64)> = current_list
-                .iter()
-                .map(|(_, zats, addr)| (addr.as_str(), *zats as f64 / ZATOSHIS_PER_ZEC))
-                .collect();
+            // Merge entries with the same pay-to address (e.g. multiple bad addresses
+            // redirected to mining_address) since z_sendmany rejects duplicates.
+            let mut merged: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
+            for (_, zats, addr) in &current_list {
+                *merged.entry(addr.as_str()).or_insert(0.0) += *zats as f64 / ZATOSHIS_PER_ZEC;
+            }
+            let amounts: Vec<(&str, f64)> = merged.into_iter().collect();
 
             match rpc.z_sendmany(pool_address, &amounts).await {
                 Ok(opid) => break (opid, current_list),
