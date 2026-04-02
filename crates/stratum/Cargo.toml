@@ -14,3 +14,4 @@ hex.workspace = true
 rand.workspace = true
 futures.workspace = true
 bytes = "1"
+socket2 = { version = "0.5", features = ["all"] }
