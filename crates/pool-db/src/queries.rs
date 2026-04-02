@@ -31,6 +31,8 @@ impl PoolDb {
         let migration_002 = include_str!("../migrations/002_block_luck.sql");
         // ALTER TABLE may fail if column already exists; ignore that error.
         let _ = sqlx::raw_sql(migration_002).execute(&self.pool).await;
+        let migration_003 = include_str!("../migrations/003_share_indexes.sql");
+        let _ = sqlx::raw_sql(migration_003).execute(&self.pool).await;
         Ok(())
     }
 
