@@ -10,6 +10,126 @@ use std::sync::atomic::Ordering;
 use crate::handlers::AppState;
 
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
+
+#[derive(Serialize)]
+struct SystemStats {
+    load_1m: f64,
+    load_5m: f64,
+    load_15m: f64,
+    cpu_count: usize,
+    mem_total_mb: u64,
+    mem_used_mb: u64,
+    mem_percent: f64,
+    swap_total_mb: u64,
+    swap_used_mb: u64,
+    disk_total_gb: f64,
+    disk_used_gb: f64,
+    disk_percent: f64,
+    db_size_mb: f64,
+    open_fds: usize,
+    fd_limit: usize,
+}
+
+fn read_system_stats() -> Option<SystemStats> {
+    // Only works on Linux
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+
+    // Load average
+    let loadavg = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let parts: Vec<&str> = loadavg.split_whitespace().collect();
+    let load_1m: f64 = parts.first()?.parse().ok()?;
+    let load_5m: f64 = parts.get(1)?.parse().ok()?;
+    let load_15m: f64 = parts.get(2)?.parse().ok()?;
+
+    // CPU count
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let cpu_count = cpuinfo.lines().filter(|l| l.starts_with("processor")).count().max(1);
+
+    // Memory
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let parse_kb = |key: &str| -> u64 {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let mem_total_kb = parse_kb("MemTotal:");
+    let mem_available_kb = parse_kb("MemAvailable:");
+    let swap_total_kb = parse_kb("SwapTotal:");
+    let swap_free_kb = parse_kb("SwapFree:");
+
+    let mem_total_mb = mem_total_kb / 1024;
+    let mem_used_mb = mem_total_kb.saturating_sub(mem_available_kb) / 1024;
+    let mem_percent = if mem_total_kb > 0 {
+        (mem_total_kb - mem_available_kb) as f64 / mem_total_kb as f64 * 100.0
+    } else {
+        0.0
+    };
+    let swap_total_mb = swap_total_kb / 1024;
+    let swap_used_mb = swap_total_kb.saturating_sub(swap_free_kb) / 1024;
+
+    // Disk usage via libc statvfs
+    let disk_path = std::ffi::CString::new(".").ok()?;
+    let (disk_total_gb, disk_used_gb, disk_percent) = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(disk_path.as_ptr(), &mut stat) == 0 {
+            let block_size = stat.f_frsize as f64;
+            let total = stat.f_blocks as f64 * block_size;
+            let used = total - (stat.f_bfree as f64 * block_size);
+            let gb = 1024.0 * 1024.0 * 1024.0;
+            let pct = if total > 0.0 { used / total * 100.0 } else { 0.0 };
+            (total / gb, used / gb, pct)
+        } else {
+            (0.0, 0.0, 0.0)
+        }
+    };
+
+    // DB size
+    let db_size_mb = std::fs::metadata("pool.db")
+        .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0);
+
+    // Open file descriptors
+    let open_fds = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0);
+
+    // FD limit
+    let fd_limit = std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Max open files"))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .nth(3) // "Max open files" (3 words) then soft limit
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
+        })
+        .unwrap_or(0);
+
+    Some(SystemStats {
+        load_1m,
+        load_5m,
+        load_15m,
+        cpu_count,
+        mem_total_mb,
+        mem_used_mb,
+        mem_percent,
+        swap_total_mb,
+        swap_used_mb,
+        disk_total_gb,
+        disk_used_gb,
+        disk_percent,
+        db_size_mb,
+        open_fds,
+        fd_limit,
+    })
+}
 const SESSION_COOKIE_NAME: &str = "admin_session";
 const SESSION_MAX_AGE_SECS: i64 = 86400; // 24 hours
 
@@ -329,6 +449,7 @@ struct AdminHealth {
     shares_accepted: u64,
     shares_rejected: u64,
     shares_rejection_rate: f64,
+    system: Option<SystemStats>,
 }
 
 #[derive(Serialize)]
@@ -390,6 +511,8 @@ async fn api_health(
     let total = accepted + rejected;
     let rejection_rate = if total > 0 { (rejected as f64 / total as f64) * 100.0 } else { 0.0 };
 
+    let system = read_system_stats();
+
     Json(AdminHealth {
         node_ok,
         node_height,
@@ -403,6 +526,7 @@ async fn api_health(
         shares_accepted: accepted,
         shares_rejected: rejected,
         shares_rejection_rate: rejection_rate,
+        system,
     })
 }
 
@@ -933,6 +1057,52 @@ async function fetchHealth() {
         const rateColor = d.shares_rejection_rate > 5 ? '#fc8181' : d.shares_rejection_rate > 1 ? '#f4b728' : '#68d391';
         html += '<tr><td>Rejection Rate</td><td style="color:' + rateColor + '">' + d.shares_rejection_rate.toFixed(2) + '%</td></tr>';
         html += '</table>';
+
+        // System stats (Linux only)
+        if (d.system) {
+            const s = d.system;
+            html += '<h2 style="font-size:0.9rem;color:#a0aec0;margin:1.25rem 0 0.75rem;padding-bottom:0.5rem;border-bottom:1px solid #2d3748">System Resources</h2>';
+            html += '<table class="kv-table">';
+
+            // Load average
+            const loadColor = (v) => v >= s.cpu_count * 2 ? '#fc8181' : v >= s.cpu_count ? '#f4b728' : '#68d391';
+            html += '<tr><td>Load Average</td><td>' +
+                '<span style="color:' + loadColor(s.load_1m) + '">' + s.load_1m.toFixed(2) + '</span> / ' +
+                '<span style="color:' + loadColor(s.load_5m) + '">' + s.load_5m.toFixed(2) + '</span> / ' +
+                '<span style="color:' + loadColor(s.load_15m) + '">' + s.load_15m.toFixed(2) + '</span>' +
+                ' <span style="color:#718096">(' + s.cpu_count + ' CPUs)</span></td></tr>';
+
+            // Memory
+            const memColor = s.mem_percent >= 95 ? '#fc8181' : s.mem_percent >= 80 ? '#f4b728' : '#68d391';
+            html += '<tr><td>Memory</td><td style="color:' + memColor + '">' +
+                s.mem_used_mb.toLocaleString() + ' / ' + s.mem_total_mb.toLocaleString() + ' MB (' + s.mem_percent.toFixed(1) + '%)</td></tr>';
+
+            // Swap
+            if (s.swap_total_mb > 0) {
+                const swapPct = s.swap_used_mb / s.swap_total_mb * 100;
+                const swapColor = swapPct >= 80 ? '#fc8181' : swapPct >= 50 ? '#f4b728' : '#68d391';
+                html += '<tr><td>Swap</td><td style="color:' + swapColor + '">' +
+                    s.swap_used_mb.toLocaleString() + ' / ' + s.swap_total_mb.toLocaleString() + ' MB (' + swapPct.toFixed(1) + '%)</td></tr>';
+            }
+
+            // Disk
+            const diskColor = s.disk_percent >= 95 ? '#fc8181' : s.disk_percent >= 80 ? '#f4b728' : '#68d391';
+            html += '<tr><td>Disk</td><td style="color:' + diskColor + '">' +
+                s.disk_used_gb.toFixed(1) + ' / ' + s.disk_total_gb.toFixed(1) + ' GB (' + s.disk_percent.toFixed(1) + '%)</td></tr>';
+
+            // DB size
+            const dbColor = s.db_size_mb >= 1024 ? '#fc8181' : s.db_size_mb >= 500 ? '#f4b728' : '#68d391';
+            html += '<tr><td>DB Size (pool.db)</td><td style="color:' + dbColor + '">' + s.db_size_mb.toFixed(1) + ' MB</td></tr>';
+
+            // File descriptors
+            const fdPct = s.fd_limit > 0 ? s.open_fds / s.fd_limit * 100 : 0;
+            const fdColor = fdPct >= 80 ? '#fc8181' : fdPct >= 50 ? '#f4b728' : '#68d391';
+            html += '<tr><td>File Descriptors</td><td style="color:' + fdColor + '">' +
+                s.open_fds.toLocaleString() + ' / ' + s.fd_limit.toLocaleString() + (s.fd_limit > 0 ? ' (' + fdPct.toFixed(1) + '%)' : '') + '</td></tr>';
+
+            html += '</table>';
+        }
+
         document.getElementById('health-content').innerHTML = html;
     } catch (e) {
         document.getElementById('health-content').innerHTML = '<span style="color:#fc8181">Failed: ' + e + '</span>';

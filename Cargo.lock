@@ -1389,6 +1389,7 @@ dependencies = [
  "blake2b_simd",
  "chrono",
  "hex",
+ "libc",
  "node-rpc",
  "pool-db",
  "rand",
