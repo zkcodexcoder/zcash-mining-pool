@@ -684,6 +684,15 @@ document.querySelectorAll('.tab').forEach(tab => {
 
 let allMiners = [];
 
+// Safe JSON fetch: returns null on non-JSON responses (502, redirects, etc.)
+async function fetchJson(url, opts) {
+    const r = await fetch(url, opts || {});
+    if (r.status === 401) { window.location.href = '/admin/login'; return null; }
+    const ct = r.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) return null;
+    return r.json();
+}
+
 function refreshTab(tab) {
     if (tab === 'config') fetchConfig();
     else if (tab === 'payouts') { fetchWalletBal(); fetchImmature(); }
@@ -693,8 +702,8 @@ function refreshTab(tab) {
 
 async function fetchConfig() {
     try {
-        const r = await fetch('/admin/api/config');
-        const d = await r.json();
+        const d = await fetchJson('/admin/api/config');
+        if (!d) return;
         let html = '<table class="kv-table">';
         const rows = [
             ['Pool Name', d.pool_name],
@@ -721,10 +730,9 @@ async function fetchConfig() {
     }
     // Load raw TOML into editor
     try {
-        const r = await fetch('/admin/api/config/raw');
-        const d = await r.json();
+        const d = await fetchJson('/admin/api/config/raw');
         const editor = document.getElementById('config-editor');
-        if (editor && d.content) editor.value = d.content;
+        if (editor && d && d.content) editor.value = d.content;
     } catch (e) {}
 }
 
@@ -734,17 +742,16 @@ async function saveConfig() {
     el.textContent = 'Saving...';
     el.style.color = '#718096';
     try {
-        const r = await fetch('/admin/api/config/raw', {
+        const d = await fetchJson('/admin/api/config/raw', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content }),
         });
-        const d = await r.json();
-        if (r.ok) {
+        if (d && !d.error) {
             el.textContent = 'Saved. Restart pool to apply.';
             el.style.color = '#68d391';
         } else {
-            el.textContent = d.error || 'Save failed';
+            el.textContent = (d && d.error) || 'Save failed';
             el.style.color = '#fc8181';
         }
     } catch (e) {
@@ -771,8 +778,8 @@ async function restartPool() {
 
 async function fetchWalletBal() {
     try {
-        const r = await fetch('/admin/api/health');
-        const d = await r.json();
+        const d = await fetchJson('/admin/api/health');
+        if (!d) return;
         if (d.wallet_balance) {
             const b = d.wallet_balance;
             document.getElementById('wallet-bal').innerHTML =
@@ -791,11 +798,8 @@ async function fetchWalletBal() {
 
 async function fetchImmature() {
     try {
-        const r = await fetch('/admin/api/health');
-        const h = await r.json();
-        // Use the public API for immature blocks detail
-        const r2 = await fetch('/admin/api/config');
-        // We'll just show block count from health for now; for full detail we can't hit the public API from admin port
+        const h = await fetchJson('/admin/api/health');
+        if (!h) return;
         document.getElementById('immature-content').innerHTML =
             '<p style="font-size:0.85rem;color:#a0aec0">See the public dashboard for detailed immature block info. Node height: <span class="gold">' + (h.node_height || '?') + '</span></p>';
     } catch (e) {
@@ -811,9 +815,8 @@ async function triggerPayout() {
     el.className = 'status-msg';
     el.style.display = 'none';
     try {
-        const r = await fetch('/admin/api/payout/trigger', { method: 'POST' });
-        const d = await r.json();
-        if (r.ok) {
+        const d = await fetchJson('/admin/api/payout/trigger', { method: 'POST' });
+        if (d && !d.error) {
             el.className = 'status-msg ok';
             el.textContent = JSON.stringify(d, null, 2);
             el.style.display = 'block';
@@ -836,8 +839,9 @@ async function triggerPayout() {
 
 async function fetchMiners() {
     try {
-        const r = await fetch('/admin/api/miners');
-        allMiners = await r.json();
+        const d = await fetchJson('/admin/api/miners');
+        if (!d) return;
+        allMiners = d;
         renderMiners(allMiners);
     } catch (e) {
         document.getElementById('miners-content').innerHTML = '<span style="color:#fc8181">Failed: ' + e + '</span>';
@@ -882,13 +886,12 @@ async function adjustBalance(address, minerId) {
     if (isNaN(val) || val === 0) { alert('Enter a non-zero amount'); return; }
     if (!confirm('Adjust ' + address.slice(0, 12) + '... by ' + val + ' zatoshis?')) return;
     try {
-        const r = await fetch('/admin/api/miner/adjust', {
+        const d = await fetchJson('/admin/api/miner/adjust', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ address: address, amount_zatoshis: val }),
         });
-        const d = await r.json();
-        if (r.ok) {
+        if (d && d.status === 'ok') {
             input.value = '';
             fetchMiners();
         } else {
@@ -912,8 +915,8 @@ function fmtDuration(secs) {
 
 async function fetchHealth() {
     try {
-        const r = await fetch('/admin/api/health');
-        const d = await r.json();
+        const d = await fetchJson('/admin/api/health');
+        if (!d) return;
         let html = '<table class="kv-table">';
         html += '<tr><td>Zebrad (Node)</td><td>' + (d.node_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline/Stalled</span>') + '</td></tr>';
         html += '<tr><td>Node Height</td><td>' + (d.node_height || '?') + '</td></tr>';
