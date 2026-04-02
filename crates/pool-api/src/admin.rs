@@ -152,6 +152,7 @@ pub fn build_admin_router(state: AdminState) -> Router {
         .route("/admin/api/miners", get(api_miners))
         .route("/admin/api/health", get(api_health))
         .route("/admin/api/payout/trigger", post(api_trigger_payout))
+        .route("/admin/api/restart", post(api_restart))
         .route("/admin/api/miner/adjust", post(api_adjust_balance))
         .route("/admin/logout", post(handle_logout))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -385,6 +386,20 @@ async fn api_health(
     })
 }
 
+async fn api_restart() -> Json<serde_json::Value> {
+    tracing::info!("Pool restart requested via admin panel");
+    // Spawn a background process that restarts us after a short delay
+    // so the HTTP response can be sent first.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = tokio::process::Command::new("systemctl")
+            .args(["restart", "zcash-pool"])
+            .status()
+            .await;
+    });
+    Json(serde_json::json!({"status": "ok", "message": "Restarting pool..."}))
+}
+
 async fn api_trigger_payout(
     State(state): State<AdminState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -588,6 +603,12 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
         </div>
         <p style="font-size:0.7rem;color:#718096;margin-top:0.5rem">Changes are saved to disk. Restart the pool service to apply.</p>
     </div>
+    <div class="card">
+        <h2>Restart Pool</h2>
+        <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Restart the pool process to apply config changes. This will briefly disconnect all miners.</p>
+        <button class="btn btn-danger" onclick="restartPool()">Restart Pool</button>
+        <span id="restart-status" style="font-size:0.8rem;margin-left:1rem"></span>
+    </div>
 </div>
 
 <!-- Payouts Tab -->
@@ -708,6 +729,22 @@ async function saveConfig() {
         }
     } catch (e) {
         el.textContent = 'Request failed: ' + e;
+        el.style.color = '#fc8181';
+    }
+}
+
+async function restartPool() {
+    if (!confirm('Restart the pool? All miners will be briefly disconnected.')) return;
+    const el = document.getElementById('restart-status');
+    el.textContent = 'Restarting...';
+    el.style.color = '#f4b728';
+    try {
+        await fetch('/admin/api/restart', { method: 'POST' });
+        el.textContent = 'Restart signal sent. Page will reload...';
+        el.style.color = '#68d391';
+        setTimeout(() => location.reload(), 5000);
+    } catch (e) {
+        el.textContent = 'Failed: ' + e;
         el.style.color = '#fc8181';
     }
 }
