@@ -30,6 +30,21 @@ struct Config {
     payout: PayoutConfig,
     api: ApiConfig,
     database: DatabaseConfig,
+    #[serde(default)]
+    admin: Option<AdminConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_admin_addr")]
+    listen_addr: String,
+    password: String,
+}
+
+fn default_admin_addr() -> String {
+    "127.0.0.1:9090".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -412,7 +427,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let router = pool_api::build_router(api_state);
+    let router = pool_api::build_router(Arc::clone(&api_state));
 
     // Spawn all services — one stratum listener per address
     let mut stratum_handles = Vec::new();
@@ -444,6 +459,48 @@ async fn main() -> Result<()> {
             .await
             .expect("API server failed");
     });
+
+    // Spawn admin server (separate port, password-protected)
+    let admin_handle = if let Some(ref admin_cfg) = config.admin {
+        if admin_cfg.enabled {
+            let config_view = pool_api::admin::PoolConfigView {
+                pool_name: config.pool.name.clone(),
+                pool_fee: config.pool.fee_percent,
+                network: config.pool.network.clone(),
+                stratum_ports: stratum_addrs.clone(),
+                difficulty_multiplier,
+                min_payout_zec: config.payout.minimum_payout,
+                maturity_confirmations: config.payout.maturity_confirmations,
+                pool_address: config.payout.pool_address.clone(),
+                mining_address: config.payout.mining_address.clone(),
+                node_rpc_url: config.node.rpc_url.clone(),
+                wallet_rpc_url: config.payout.wallet_rpc_url.clone(),
+                coinbase_tag: config.pool.coinbase_tag.clone(),
+                payout_interval_secs: config.payout.interval_secs,
+            };
+            let admin_state = pool_api::AdminState::new(
+                Arc::clone(&api_state),
+                &admin_cfg.password,
+                config_view,
+            );
+            let admin_router = pool_api::admin::build_admin_router(admin_state);
+            let admin_addr = admin_cfg.listen_addr.clone();
+            Some(tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(&admin_addr)
+                    .await
+                    .expect("Failed to bind admin listener");
+                info!(address = %admin_addr, "Admin server listening");
+                axum::serve(listener, admin_router)
+                    .await
+                    .expect("Admin server failed");
+            }))
+        } else {
+            info!("Admin server disabled");
+            None
+        }
+    } else {
+        None
+    };
 
     let payout_handle = if config.payout.enabled {
         let pool_address = config.payout.pool_address.clone()
@@ -486,15 +543,21 @@ async fn main() -> Result<()> {
         None
     };
 
+    let admin_info = config.admin.as_ref()
+        .filter(|a| a.enabled)
+        .map(|a| format!("\n         Admin: http://{}", a.listen_addr))
+        .unwrap_or_default();
+
     info!(
         "Pool is running!\n\
          \n\
          Stratum: {:?}\n\
          Dashboard: http://{}\n\
-         API: http://{}/api/pool/stats\n",
+         API: http://{}/api/pool/stats{}\n",
         stratum_addrs,
         config.api.listen_addr,
         config.api.listen_addr,
+        admin_info,
     );
 
     // Wait for shutdown signal
@@ -507,6 +570,7 @@ async fn main() -> Result<()> {
     job_handle.abort();
     share_handle.abort();
     api_handle.abort();
+    if let Some(h) = admin_handle { h.abort(); }
     history_handle.abort();
     net_cache_handle.abort();
     if let Some(h) = payout_handle { h.abort(); }

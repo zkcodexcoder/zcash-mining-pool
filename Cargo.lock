@@ -1386,10 +1386,12 @@ name = "pool-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake2b_simd",
  "chrono",
  "hex",
  "node-rpc",
  "pool-db",
+ "rand",
  "rewards",
  "serde",
  "serde_json",

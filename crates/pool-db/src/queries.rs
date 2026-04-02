@@ -634,6 +634,65 @@ impl PoolDb {
 
         Ok(entries)
     }
+
+    /// Adjust a miner's pending balance by delta (can be negative).
+    /// Returns the new pending balance. Clamps to 0 minimum.
+    pub async fn adjust_miner_balance(&self, miner_id: i64, delta_zatoshis: i64) -> Result<i64, DbError> {
+        sqlx::query("INSERT OR IGNORE INTO balances (miner_id) VALUES (?1)")
+            .bind(miner_id)
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("UPDATE balances SET pending = MAX(0, pending + ?1) WHERE miner_id = ?2")
+            .bind(delta_zatoshis)
+            .bind(miner_id)
+            .execute(&self.pool)
+            .await?;
+
+        let row: (i64,) = sqlx::query_as(
+            "SELECT pending FROM balances WHERE miner_id = ?1",
+        )
+        .bind(miner_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.0)
+    }
+
+    /// Get all miners with full admin details (pending, paid, last_seen, shares).
+    pub async fn get_all_miners_admin(&self) -> Result<Vec<AdminMinerEntry>, DbError> {
+        let rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT m.id, m.address, m.created_at, \
+                    COALESCE(b.pending, 0) as pending, \
+                    COALESCE(b.paid, 0) as paid, \
+                    (SELECT COUNT(*) FROM shares s \
+                     JOIN workers w ON s.worker_id = w.id \
+                     WHERE w.miner_id = m.id) as share_count, \
+                    (SELECT COUNT(*) FROM workers w WHERE w.miner_id = m.id) as worker_count, \
+                    (SELECT MAX(w2.last_seen) FROM workers w2 WHERE w2.miner_id = m.id) as last_seen \
+             FROM miners m \
+             LEFT JOIN balances b ON b.miner_id = m.id \
+             ORDER BY pending DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries = rows
+            .iter()
+            .map(|row| AdminMinerEntry {
+                id: row.get("id"),
+                address: row.get("address"),
+                created_at: row.get("created_at"),
+                pending: row.get("pending"),
+                paid: row.get("paid"),
+                share_count: row.get("share_count"),
+                worker_count: row.get("worker_count"),
+                last_seen: row.get("last_seen"),
+            })
+            .collect();
+
+        Ok(entries)
+    }
 }
 
 /// A miner eligible for payout.
@@ -649,6 +708,19 @@ pub struct PendingPayout {
 pub struct PplnsShareEntry {
     pub miner_id: i64,
     pub total_difficulty: f64,
+}
+
+/// Admin miner entry with full details.
+#[derive(Debug, Clone)]
+pub struct AdminMinerEntry {
+    pub id: i64,
+    pub address: String,
+    pub created_at: String,
+    pub pending: i64,
+    pub paid: i64,
+    pub share_count: i64,
+    pub worker_count: i64,
+    pub last_seen: Option<String>,
 }
 
 /// Miner summary for the miners list.
