@@ -194,6 +194,10 @@ impl StatsHistory {
     pub async fn get_all(&self) -> Vec<StatsSnapshot> {
         self.buffer.read().await.iter().cloned().collect()
     }
+
+    pub async fn latest(&self) -> Option<StatsSnapshot> {
+        self.buffer.read().await.back().cloned()
+    }
 }
 
 /// Compute a stats snapshot from the DB + RPC. Used by both the polling handler
@@ -249,7 +253,12 @@ const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
 pub async fn get_pool_stats(
     State(state): State<AppState>,
 ) -> Result<Json<PoolStats>, StatusCode> {
-    let snap = compute_stats_snapshot(&state).await;
+    // Use cached snapshot (updated every 10s in background) to avoid blocking
+    // on slow RPC calls. Fall back to computing fresh only on first request.
+    let snap = match state.stats_history.latest().await {
+        Some(s) => s,
+        None => compute_stats_snapshot(&state).await,
+    };
 
     let immature = state.db.get_immature_blocks_count().await.unwrap_or(0);
     let pending_payout = state.db.get_pending_payout_blocks_count().await.unwrap_or(0);
@@ -413,11 +422,15 @@ async fn check_wallet_rpc(state: &ApiState) -> bool {
     match &state.wallet_rpc {
         Some(rpc) => {
             // Use z_gettotalbalance as a lightweight health check -- it's wallet-specific
-            // and confirms Zallet is running and responsive.
-            let result: Result<serde_json::Value, _> = rpc.call_raw(
+            // and confirms Zallet is running and responsive. Timeout after 3s to avoid
+            // blocking the dashboard when Zallet is unresponsive.
+            let fut = rpc.call_raw::<serde_json::Value>(
                 "z_gettotalbalance", serde_json::json!([0, true])
-            ).await;
-            result.is_ok()
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(3), fut)
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
         }
         None => false,
     }

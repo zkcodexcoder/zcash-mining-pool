@@ -481,15 +481,19 @@ async fn api_health(
         }
     };
 
-    let node_height = state.app.rpc.get_block_count().await.ok();
+    let node_height = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        state.app.rpc.get_block_count(),
+    ).await.ok().and_then(|r| r.ok());
 
     let (wallet_ok, wallet_balance) = match &state.app.wallet_rpc {
         Some(rpc) => {
-            match rpc.call_raw::<serde_json::Value>(
+            let fut = rpc.call_raw::<serde_json::Value>(
                 "z_gettotalbalance",
                 serde_json::json!([0, true]),
-            ).await {
-                Ok(v) => {
+            );
+            match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+                Ok(Ok(v)) => {
                     let bal = v.as_object().map(|obj| WalletBalanceInfo {
                         transparent: obj.get("transparent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
                         private: obj.get("private").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
@@ -497,7 +501,7 @@ async fn api_health(
                     });
                     (true, bal)
                 }
-                Err(_) => (false, None),
+                _ => (false, None),
             }
         }
         None => (false, None),
