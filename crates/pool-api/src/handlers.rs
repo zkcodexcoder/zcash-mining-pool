@@ -167,6 +167,9 @@ pub struct StatsSnapshot {
     pub connected_miners: i64,
     pub total_blocks: i64,
     pub total_shares: i64,
+    /// Cached wallet reachability (checked in background, not per-request).
+    #[serde(skip)]
+    pub wallet_ok: bool,
 }
 
 /// Fixed-capacity ring buffer that holds up to 360 snapshots (1 hour @ 10s).
@@ -237,6 +240,8 @@ pub async fn compute_stats_snapshot(state: &ApiState) -> StatsSnapshot {
         .await
         .unwrap_or(0.0);
 
+    let wallet_ok = check_wallet_rpc(state).await;
+
     StatsSnapshot {
         timestamp_ms: chrono::Utc::now().timestamp_millis(),
         pool_hashrate: hashrate,
@@ -245,6 +250,7 @@ pub async fn compute_stats_snapshot(state: &ApiState) -> StatsSnapshot {
         connected_miners: connected,
         total_blocks: blocks,
         total_shares: shares,
+        wallet_ok,
     }
 }
 
@@ -340,7 +346,7 @@ pub async fn get_pool_stats(
         pool_percent_24h,
         node_ok,
         last_template_at,
-        wallet_ok: check_wallet_rpc(&state).await,
+        wallet_ok: snap.wallet_ok,
         network: state.network.clone(),
         banner: state.banner.clone(),
     }))
