@@ -482,6 +482,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&api_state),
                 &admin_cfg.password,
                 config_view,
+                config_path.clone(),
             );
             let admin_router = pool_api::admin::build_admin_router(admin_state);
             let admin_addr = admin_cfg.listen_addr.clone();

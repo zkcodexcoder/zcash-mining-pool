@@ -1398,6 +1398,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "toml",
  "tower-http",
  "tracing",
 ]

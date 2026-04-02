@@ -37,6 +37,7 @@ pub struct AdminState {
     pub app: AppState,
     signing_key: [u8; 32],
     pub config_view: PoolConfigView,
+    pub config_path: String,
     pub started_at: i64,
 }
 
@@ -45,6 +46,7 @@ impl AdminState {
         app: AppState,
         password: &str,
         config_view: PoolConfigView,
+        config_path: String,
     ) -> Self {
         let signing_key = derive_signing_key(password);
         let started_at = chrono::Utc::now().timestamp();
@@ -52,6 +54,7 @@ impl AdminState {
             app,
             signing_key,
             config_view,
+            config_path,
             started_at,
         }
     }
@@ -145,6 +148,7 @@ pub fn build_admin_router(state: AdminState) -> Router {
     let protected = Router::new()
         .route("/admin", get(admin_dashboard))
         .route("/admin/api/config", get(api_config))
+        .route("/admin/api/config/raw", get(api_config_raw).post(api_config_save))
         .route("/admin/api/miners", get(api_miners))
         .route("/admin/api/health", get(api_health))
         .route("/admin/api/payout/trigger", post(api_trigger_payout))
@@ -209,6 +213,53 @@ async fn admin_dashboard() -> Html<&'static str> {
 
 async fn api_config(State(state): State<AdminState>) -> Json<PoolConfigView> {
     Json(state.config_view.clone())
+}
+
+async fn api_config_raw(
+    State(state): State<AdminState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let content = tokio::fs::read_to_string(&state.config_path)
+        .await
+        .map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to read config: {e}")})),
+        ))?;
+    Ok(Json(serde_json::json!({"content": content})))
+}
+
+#[derive(Deserialize)]
+struct ConfigSaveRequest {
+    content: String,
+}
+
+async fn api_config_save(
+    State(state): State<AdminState>,
+    Json(req): Json<ConfigSaveRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Validate it's parseable TOML before saving
+    if let Err(e) = req.content.parse::<toml::Table>() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid TOML: {e}")})),
+        );
+    }
+
+    // Write to file
+    if let Err(e) = tokio::fs::write(&state.config_path, &req.content).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write config: {e}")})),
+        );
+    }
+
+    tracing::info!("Config file updated via admin panel");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "message": "Config saved. Restart the pool to apply changes."
+        })),
+    )
 }
 
 #[derive(Serialize)]
@@ -525,8 +576,17 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
 <!-- Config Tab -->
 <div class="panel active" id="panel-config">
     <div class="card">
-        <h2>Running Configuration</h2>
+        <h2>Running Configuration (read-only snapshot)</h2>
         <div id="config-content" class="loading">Loading...</div>
+    </div>
+    <div class="card">
+        <h2>Edit pool.toml</h2>
+        <textarea id="config-editor" spellcheck="false" style="width:100%;height:420px;background:#0d1117;color:#e2e8f0;border:1px solid #2d3748;border-radius:4px;padding:0.75rem;font-family:'JetBrains Mono','Fira Code',monospace;font-size:0.8rem;resize:vertical;line-height:1.5;tab-size:4"></textarea>
+        <div style="margin-top:0.75rem;display:flex;align-items:center;gap:1rem">
+            <button class="btn btn-primary" onclick="saveConfig()">Save</button>
+            <span id="config-save-status" style="font-size:0.8rem"></span>
+        </div>
+        <p style="font-size:0.7rem;color:#718096;margin-top:0.5rem">Changes are saved to disk. Restart the pool service to apply.</p>
     </div>
 </div>
 
@@ -617,6 +677,38 @@ async function fetchConfig() {
         document.getElementById('config-content').innerHTML = html;
     } catch (e) {
         document.getElementById('config-content').innerHTML = '<span style="color:#fc8181">Failed to load: ' + e + '</span>';
+    }
+    // Load raw TOML into editor
+    try {
+        const r = await fetch('/admin/api/config/raw');
+        const d = await r.json();
+        const editor = document.getElementById('config-editor');
+        if (editor && d.content) editor.value = d.content;
+    } catch (e) {}
+}
+
+async function saveConfig() {
+    const content = document.getElementById('config-editor').value;
+    const el = document.getElementById('config-save-status');
+    el.textContent = 'Saving...';
+    el.style.color = '#718096';
+    try {
+        const r = await fetch('/admin/api/config/raw', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content }),
+        });
+        const d = await r.json();
+        if (r.ok) {
+            el.textContent = 'Saved. Restart pool to apply.';
+            el.style.color = '#68d391';
+        } else {
+            el.textContent = d.error || 'Save failed';
+            el.style.color = '#fc8181';
+        }
+    } catch (e) {
+        el.textContent = 'Request failed: ' + e;
+        el.style.color = '#fc8181';
     }
 }
 
