@@ -124,7 +124,7 @@ fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-/// Auth middleware: redirects to login if no valid session.
+/// Auth middleware: redirects to login for pages, returns 401 for API calls.
 async fn auth_middleware(
     State(state): State<AdminState>,
     request: axum::extract::Request,
@@ -137,6 +137,15 @@ async fn auth_middleware(
         .unwrap_or(false);
 
     if !authenticated {
+        // API endpoints get JSON 401; pages get redirect to login
+        let path = request.uri().path().to_string();
+        if path.contains("/admin/api/") {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Not authenticated"})),
+            )
+                .into_response();
+        }
         return Redirect::to("/admin/login").into_response();
     }
 
@@ -188,7 +197,7 @@ async fn handle_login(
 
     let cookie = make_session_cookie(&state.signing_key);
     let set_cookie = format!(
-        "{SESSION_COOKIE_NAME}={cookie}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age={SESSION_MAX_AGE_SECS}"
+        "{SESSION_COOKIE_NAME}={cookie}; Path=/admin; HttpOnly; SameSite=Lax; Secure; Max-Age={SESSION_MAX_AGE_SECS}"
     );
     (
         [(axum::http::header::SET_COOKIE, set_cookie)],
