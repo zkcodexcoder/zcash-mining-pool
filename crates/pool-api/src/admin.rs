@@ -482,7 +482,7 @@ async fn api_health(
     };
 
     let node_height = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(10),
         state.app.rpc.get_block_count(),
     ).await.ok().and_then(|r| r.ok());
 
@@ -492,7 +492,7 @@ async fn api_health(
                 "z_gettotalbalance",
                 serde_json::json!([0, true]),
             );
-            match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), fut).await {
                 Ok(Ok(v)) => {
                     let bal = v.as_object().map(|obj| WalletBalanceInfo {
                         transparent: obj.get("transparent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),

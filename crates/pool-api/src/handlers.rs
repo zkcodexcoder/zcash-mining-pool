@@ -428,12 +428,12 @@ async fn check_wallet_rpc(state: &ApiState) -> bool {
     match &state.wallet_rpc {
         Some(rpc) => {
             // Use z_gettotalbalance as a lightweight health check -- it's wallet-specific
-            // and confirms Zallet is running and responsive. Timeout after 3s to avoid
-            // blocking the dashboard when Zallet is unresponsive.
+            // and confirms Zallet is running and responsive. Timeout after 30s —
+            // z_gettotalbalance can take 15s+ when Zallet is scanning.
             let fut = rpc.call_raw::<serde_json::Value>(
                 "z_gettotalbalance", serde_json::json!([0, true])
             );
-            tokio::time::timeout(std::time::Duration::from_secs(3), fut)
+            tokio::time::timeout(std::time::Duration::from_secs(30), fut)
                 .await
                 .map(|r| r.is_ok())
                 .unwrap_or(false)
