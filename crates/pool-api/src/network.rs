@@ -810,9 +810,9 @@ async function fetchData() {
     }
 }
 
-document.addEventListener('DOMContentLoaded', async () => {
-    await initCoin();
+document.addEventListener('DOMContentLoaded', () => {
     document.body.style.opacity = '1';
+    initCoin(); // non-blocking, coin label updates when ready
     fetchData();
     refreshTimer = setInterval(fetchData, REFRESH_MS[currentRange]);
 });

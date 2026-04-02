@@ -955,8 +955,8 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 document.getElementById('maturity-content').innerHTML = '<div class="empty-msg">Failed to load</div>';
             }
         }
-        (async () => {
-            await fetchCoin();
+        (() => {
+            fetchCoin();
             document.body.style.opacity = '1';
             fetchStatus();
             fetchImmature();

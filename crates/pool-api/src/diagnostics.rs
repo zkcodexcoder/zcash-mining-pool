@@ -760,9 +760,9 @@ async function fetchDiagnostics() {
     }
 }
 
-document.addEventListener('DOMContentLoaded', async () => {
-    await initCoin();
+document.addEventListener('DOMContentLoaded', () => {
     document.body.style.opacity = '1';
+    initCoin();
     fetchDiagnostics();
     refreshTimer = setInterval(fetchDiagnostics, 15000);
 });

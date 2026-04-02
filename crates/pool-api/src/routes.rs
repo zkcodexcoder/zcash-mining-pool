@@ -1128,12 +1128,12 @@ async function fetchHistory() {
 }
 
 /* ── Init ── */
-document.addEventListener('DOMContentLoaded', async () => {
+document.addEventListener('DOMContentLoaded', () => {
+    document.body.style.opacity = '1';
     initSparklines();
     initCharts();
-    await fetchHistory();
-    await fetchStats();
-    document.body.style.opacity = '1';
+    fetchHistory();
+    fetchStats();
     fetchMiners();
     fetchBlocks();
     fetchPayouts();
