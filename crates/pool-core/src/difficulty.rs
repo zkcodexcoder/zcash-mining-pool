@@ -2,7 +2,12 @@ use std::time::Instant;
 
 /// Variable difficulty (vardiff) tracker for a single miner.
 /// Adjusts the share target to maintain a desired share submission rate.
-/// Uses aggressive 16x jumps to converge quickly for high-hashrate miners.
+///
+/// Two phases:
+/// - **Ramp-up** (ratio > 4x or < 0.25x): aggressive jumps to find the
+///   right ballpark quickly for new or mismatched miners.
+/// - **Steady-state**: gentle EMA-dampened adjustments with a dead zone
+///   (0.8x–1.2x) to avoid oscillation.
 pub struct VardiffTracker {
     shares_in_window: u32,
     window_start: Instant,
@@ -11,6 +16,8 @@ pub struct VardiffTracker {
     current_difficulty: f64,
     min_difficulty: f64,
     max_difficulty: f64,
+    /// Smoothed ratio (EMA) for steady-state dampening.
+    smoothed_ratio: f64,
 }
 
 impl VardiffTracker {
@@ -28,6 +35,7 @@ impl VardiffTracker {
             min_difficulty: initial_difficulty.min(1.0),
             // 10 billion — enough for miners up to ~1 TH/s
             max_difficulty: 10_000_000_000.0,
+            smoothed_ratio: 1.0,
         }
     }
 
@@ -51,11 +59,30 @@ impl VardiffTracker {
         let shares_per_minute = (self.shares_in_window as f64 / elapsed) * 60.0;
         let ratio = shares_per_minute / self.target_shares_per_minute;
 
-        // Allow up to 16x adjustment per retarget so high-hashrate miners
-        // converge quickly instead of taking many 30s intervals.
-        let adjustment = ratio.clamp(0.25, 16.0);
-        let new_difficulty = (self.current_difficulty * adjustment)
-            .clamp(self.min_difficulty, self.max_difficulty);
+        let new_difficulty = if ratio > 4.0 || ratio < 0.25 {
+            // RAMP-UP: way off target, aggressive jump to converge fast.
+            let adjustment = ratio.clamp(0.25, 16.0);
+            self.smoothed_ratio = 1.0; // reset EMA after big jump
+            (self.current_difficulty * adjustment)
+                .clamp(self.min_difficulty, self.max_difficulty)
+        } else {
+            // STEADY-STATE: use EMA to smooth out variance.
+            // Alpha = 0.3 means ~30% weight on new sample, 70% on history.
+            let alpha = 0.3;
+            self.smoothed_ratio = alpha * ratio + (1.0 - alpha) * self.smoothed_ratio;
+
+            // Dead zone: if smoothed ratio is between 0.8 and 1.2, don't change.
+            if self.smoothed_ratio > 0.8 && self.smoothed_ratio < 1.2 {
+                self.shares_in_window = 0;
+                self.window_start = Instant::now();
+                return None;
+            }
+
+            // Gentle clamp: max 1.5x up, 0.67x down per interval.
+            let adjustment = self.smoothed_ratio.clamp(0.67, 1.5);
+            (self.current_difficulty * adjustment)
+                .clamp(self.min_difficulty, self.max_difficulty)
+        };
 
         self.current_difficulty = new_difficulty;
         self.shares_in_window = 0;

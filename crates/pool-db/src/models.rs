@@ -35,6 +35,7 @@ pub struct Worker {
     pub miner_id: i64,
     pub name: String,
     pub last_seen: String,
+    pub last_difficulty: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

@@ -367,9 +367,9 @@ pub async fn get_pool_stats_nomp(
         Ok(info) => info
             .get("difficulty")
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0),
+            .filter(|&d| d > 0.0)
+            .unwrap_or_else(|| snap.network_hashrate * BLOCK_TIME_SECS / 8192.0),
         Err(_) => {
-            // Equihash approximation: difficulty ≈ hashrate * block_time / 2^13
             snap.network_hashrate * BLOCK_TIME_SECS / 8192.0
         }
     };

@@ -65,6 +65,8 @@ pub struct ShareValidator {
     shares_accepted: Arc<std::sync::atomic::AtomicU64>,
     /// Rejected share counter (shared with API for stats).
     shares_rejected: Arc<std::sync::atomic::AtomicU64>,
+    /// Maps session_id -> worker_id for persisting difficulty on retarget.
+    session_worker_id: RwLock<HashMap<String, i64>>,
 }
 
 impl ShareValidator {
@@ -98,6 +100,7 @@ impl ShareValidator {
             latest_notify,
             shares_accepted,
             shares_rejected,
+            session_worker_id: RwLock::new(HashMap::new()),
         }
     }
 
@@ -194,16 +197,30 @@ impl ShareValidator {
                     info!(%worker_name, %addr, port = local_port, "Worker connected");
                     let miner_address = worker_name.split('.').next().unwrap_or(&worker_name);
                     let wname = worker_name.split('.').nth(1).unwrap_or("default");
-                    if let Err(e) = self.register_worker(miner_address, wname).await {
-                        error!(error = %e, "Failed to register worker");
-                    }
 
-                    // Priority: password-requested difficulty > per-port difficulty > default
+                    // Register worker and look up last known difficulty
+                    let db_difficulty = match self.register_worker_and_get_difficulty(miner_address, wname).await {
+                        Ok((worker_id, last_diff)) => {
+                            // Track session -> worker_id for persisting difficulty on retarget
+                            self.session_worker_id.write().await.insert(session_id.clone(), worker_id);
+                            last_diff
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to register worker");
+                            None
+                        }
+                    };
+
+                    // Priority: password-requested > DB last_difficulty > per-port > default
                     let requested_diff = parse_difficulty_from_password(&password);
                     let initial_diff = requested_diff
+                        .or(db_difficulty)
                         .or_else(|| self.port_difficulty.get(&local_port).copied());
                     let (target, tracker) = if let Some(diff) = initial_diff {
-                        info!(%session_id, difficulty = diff, port = local_port, "Using custom initial difficulty");
+                        let source = if requested_diff.is_some() { "password" }
+                            else if db_difficulty.is_some() { "restored" }
+                            else { "port" };
+                        info!(%session_id, difficulty = diff, port = local_port, source, "Using initial difficulty");
                         self.make_target_for_difficulty(diff)
                     } else {
                         self.make_initial_target()
@@ -239,8 +256,8 @@ impl ShareValidator {
                 }
                 StratumEvent::SessionDisconnected { session_id } => {
                     debug!(%session_id, "Session disconnected");
-                    let mut sessions = self.session_difficulty.write().await;
-                    sessions.remove(&session_id);
+                    self.session_difficulty.write().await.remove(&session_id);
+                    self.session_worker_id.write().await.remove(&session_id);
                 }
                 StratumEvent::TargetSuggested { session_id, target } => {
                     debug!(%session_id, %target, "Target suggestion received (ignored, using vardiff)");
@@ -290,6 +307,12 @@ impl ShareValidator {
                 }
             }
             info!(%session_id, difficulty = diff, target = %target_hex, "Vardiff retarget");
+            // Persist difficulty to DB for restoration on reconnect
+            if let Some(&worker_id) = self.session_worker_id.read().await.get(session_id) {
+                if let Err(e) = self.db.update_worker_difficulty(worker_id, diff).await {
+                    warn!(error = %e, "Failed to persist worker difficulty");
+                }
+            }
             self.stratum
                 .send_to_session(session_id, ServerMessage::SetDifficulty {
                     difficulty: diff,
@@ -333,10 +356,15 @@ impl ShareValidator {
         }
     }
 
-    async fn register_worker(&self, address: &str, worker: &str) -> Result<(), pool_db::DbError> {
+    /// Register worker in DB and return (worker_id, last_difficulty).
+    async fn register_worker_and_get_difficulty(
+        &self,
+        address: &str,
+        worker: &str,
+    ) -> Result<(i64, Option<f64>), pool_db::DbError> {
         let miner = self.db.get_or_create_miner(address).await?;
-        self.db.get_or_create_worker(miner.id, worker).await?;
-        Ok(())
+        let w = self.db.get_or_create_worker(miner.id, worker).await?;
+        Ok((w.id, w.last_difficulty))
     }
 
     async fn validate_share(

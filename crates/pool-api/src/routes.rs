@@ -483,7 +483,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <a id="mine-link" href="#" target="_blank" rel="noopener" class="header-link" style="color:#f4b728;font-weight:600">Mine in Browser</a>
         <a href="/network" class="header-link">Network</a>
         <a href="/zallet" class="header-link">Wallet</a>
-        <a href="/previews" class="header-link">Themes</a>
+        <a id="themes-link" href="/previews" class="header-link">Themes</a>
     </div>
 </div>
 <div id="banner" style="display:none;background:#2d1f00;border-bottom:1px solid #f4b728;padding:0.5rem 1.5rem;font-size:0.8rem;color:#f4b728;text-align:center"></div>
@@ -899,6 +899,10 @@ async function fetchStats() {
                 const host = d.stratum_url.replace(/^stratum\+tcp:\/\//, '').replace(/:\d+$/, '');
                 mineLink.href = 'http://' + host + ':3000';
             }
+        }
+        const themesLink = document.getElementById('themes-link');
+        if (themesLink && d.network === 'mainnet') {
+            themesLink.style.display = 'none';
         }
 
         const bannerEl = document.getElementById('banner');

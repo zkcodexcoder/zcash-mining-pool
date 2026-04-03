@@ -33,6 +33,8 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_002).execute(&self.pool).await;
         let migration_003 = include_str!("../migrations/003_share_indexes.sql");
         let _ = sqlx::raw_sql(migration_003).execute(&self.pool).await;
+        let migration_004 = include_str!("../migrations/004_worker_difficulty.sql");
+        let _ = sqlx::raw_sql(migration_004).execute(&self.pool).await;
         Ok(())
     }
 
@@ -87,7 +89,7 @@ impl PoolDb {
         .await?;
 
         let worker: Worker = sqlx::query_as(
-            "SELECT id, miner_id, name, last_seen FROM workers WHERE miner_id = ?1 AND name = ?2",
+            "SELECT id, miner_id, name, last_seen, last_difficulty FROM workers WHERE miner_id = ?1 AND name = ?2",
         )
         .bind(miner_id)
         .bind(name)
@@ -97,9 +99,18 @@ impl PoolDb {
         Ok(worker)
     }
 
+    pub async fn update_worker_difficulty(&self, worker_id: i64, difficulty: f64) -> Result<(), DbError> {
+        sqlx::query("UPDATE workers SET last_difficulty = ?1 WHERE id = ?2")
+            .bind(difficulty)
+            .bind(worker_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_workers_for_miner(&self, miner_id: i64) -> Result<Vec<Worker>, DbError> {
         let workers: Vec<Worker> = sqlx::query_as(
-            "SELECT id, miner_id, name, last_seen FROM workers WHERE miner_id = ?1",
+            "SELECT id, miner_id, name, last_seen, last_difficulty FROM workers WHERE miner_id = ?1",
         )
         .bind(miner_id)
         .fetch_all(&self.pool)
