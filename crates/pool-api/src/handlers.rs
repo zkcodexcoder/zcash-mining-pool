@@ -265,7 +265,8 @@ pub async fn get_pool_stats(
     };
 
     let immature = state.db.get_immature_blocks_count().await.unwrap_or(0);
-    let pending_payout = state.db.get_pending_payout_blocks_count().await.unwrap_or(0);
+    let pending_payout = state.db.get_pending_payouts(state.min_payout_zatoshis).await
+        .map(|v| v.len() as i64).unwrap_or(0);
 
     let (node_ok, last_template_at) = match &state.last_template_at_ms {
         None => (true, None),
