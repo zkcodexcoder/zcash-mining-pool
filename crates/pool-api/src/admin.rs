@@ -280,6 +280,7 @@ pub fn build_admin_router(state: AdminState) -> Router {
         .route("/admin/api/health", get(api_health))
         .route("/admin/api/payout/trigger", post(api_trigger_payout))
         .route("/admin/api/restart", post(api_restart))
+        .route("/admin/api/restart-dashboard", post(api_restart_dashboard))
         .route("/admin/api/miner/adjust", post(api_adjust_balance))
         .route("/admin/logout", post(handle_logout))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -524,8 +525,6 @@ async fn api_health(
 
 async fn api_restart() -> Json<serde_json::Value> {
     tracing::info!("Pool restart requested via admin panel");
-    // Spawn a background process that restarts us after a short delay
-    // so the HTTP response can be sent first.
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let _ = tokio::process::Command::new("sudo")
@@ -534,6 +533,18 @@ async fn api_restart() -> Json<serde_json::Value> {
             .await;
     });
     Json(serde_json::json!({"status": "ok", "message": "Restarting pool..."}))
+}
+
+async fn api_restart_dashboard() -> Json<serde_json::Value> {
+    tracing::info!("Dashboard restart requested via admin panel");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = tokio::process::Command::new("sudo")
+            .args(["systemctl", "restart", "zcash-dashboard"])
+            .status()
+            .await;
+    });
+    Json(serde_json::json!({"status": "ok", "message": "Restarting dashboard..."}))
 }
 
 async fn api_trigger_payout(
@@ -740,10 +751,19 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
         <p style="font-size:0.7rem;color:#718096;margin-top:0.5rem">Changes are saved to disk. Restart the pool service to apply.</p>
     </div>
     <div class="card">
-        <h2>Restart Pool</h2>
-        <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Restart the pool process to apply config changes. This will briefly disconnect all miners.</p>
-        <button class="btn btn-danger" onclick="restartPool()">Restart Pool</button>
-        <span id="restart-status" style="font-size:0.8rem;margin-left:1rem"></span>
+        <h2>Restart Services</h2>
+        <div style="display:flex;gap:1rem;align-items:flex-start;flex-wrap:wrap">
+            <div>
+                <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Restart the pool (miners reconnect briefly).</p>
+                <button class="btn btn-danger" onclick="restartPool()">Restart Pool</button>
+                <span id="restart-status" style="font-size:0.8rem;margin-left:0.5rem"></span>
+            </div>
+            <div>
+                <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Restart the dashboard (zero miner impact).</p>
+                <button class="btn btn-primary" onclick="restartDashboard()">Restart Dashboard</button>
+                <span id="restart-dash-status" style="font-size:0.8rem;margin-left:0.5rem"></span>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -883,7 +903,22 @@ async function restartPool() {
     el.style.color = '#f4b728';
     try {
         await fetch('/admin/api/restart', { method: 'POST' });
-        el.textContent = 'Restart signal sent. Page will reload...';
+        el.textContent = 'Restart signal sent.';
+        el.style.color = '#68d391';
+    } catch (e) {
+        el.textContent = 'Failed: ' + e;
+        el.style.color = '#fc8181';
+    }
+}
+
+async function restartDashboard() {
+    if (!confirm('Restart the dashboard? This page will reload. No miner impact.')) return;
+    const el = document.getElementById('restart-dash-status');
+    el.textContent = 'Restarting...';
+    el.style.color = '#f4b728';
+    try {
+        await fetch('/admin/api/restart-dashboard', { method: 'POST' });
+        el.textContent = 'Restarting... page will reload.';
         el.style.color = '#68d391';
         setTimeout(() => location.reload(), 5000);
     } catch (e) {
