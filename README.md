@@ -124,6 +124,79 @@ sudo systemctl restart zcash-pool
 sudo systemctl restart zcash-pool zcash-dashboard
 ```
 
+## Upgrading
+
+### From single-binary to two-binary architecture
+
+Older versions ran everything in a single `zcash-pool` binary (stratum + API + dashboard + admin). The new architecture splits this into `zcash-pool` (mining only) and `zcash-dashboard` (everything else). This means dashboard deploys no longer disconnect miners.
+
+**Upgrade steps on an existing server:**
+
+```bash
+# 1. Pull latest code and build both binaries
+cd ~/zcash-mining-pool && git pull
+source ~/.cargo/env && cargo build --release
+
+# 2. Install the new dashboard service file
+sudo cp systemd/zcash-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# 3. Also update the pool service file if it's stale
+sudo cp systemd/zcash-pool.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# 4. Restart the pool (picks up mining-only binary, frees port 8080)
+#    Miners will reconnect automatically within seconds.
+sudo systemctl restart zcash-pool
+
+# 5. Start the dashboard (takes over port 8080)
+sudo systemctl enable --now zcash-dashboard
+
+# 6. Verify
+systemctl status zcash-pool        # should be active (running)
+systemctl status zcash-dashboard   # should be active (running)
+curl -s http://localhost:8080/health   # should return {"status":"ok"}
+```
+
+**What changes:**
+- `zcash-pool` no longer serves HTTP — no API, no dashboard, no admin panel
+- `zcash-pool` writes `last_template_at_ms`, `shares_accepted`, `shares_rejected` to a `pool_status` SQLite table every 5s
+- `zcash-dashboard` reads from the same database (WAL mode enables concurrent access) and serves the dashboard/API/admin
+- The database auto-migrates: a new `pool_status` table is created on first run
+- Both binaries read the same `config/pool.toml` — no config changes needed
+
+**Rollback:** If something goes wrong, you can revert to the old single-binary by checking out the previous commit and rebuilding. The `pool_status` table is harmless and will be ignored by the old binary.
+
+### Testnet to Mainnet
+
+Edit `config/pool.toml`:
+
+```toml
+[pool]
+network = "mainnet"
+
+[node]
+rpc_url = "http://<mainnet-zebrad-ip>:8232"
+
+[payout]
+pool_address = "u1..."          # mainnet unified address
+mining_address = "t1..."        # mainnet transparent address
+wallet_rpc_url = "http://127.0.0.1:8232"
+wallet_rpc_user = "<user>"
+wallet_rpc_password = "<password>"
+```
+
+Also update `config/zebrad.toml`: `network = "Mainnet"`, ports `8232`/`8233`.
+
+Then rebuild and restart:
+
+```bash
+cargo build --release
+sudo systemctl restart zcash-pool zcash-dashboard
+```
+
+The `network` setting controls address validation prefixes, currency symbol (TAZ/ZEC), and badge text on the dashboard.
+
 ## Endpoints
 
 | Endpoint | Description |
