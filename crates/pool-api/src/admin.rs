@@ -445,7 +445,8 @@ struct AdminHealth {
     wallet_version: Option<String>,
     wallet_balance: Option<WalletBalanceInfo>,
     pool_version: &'static str,
-    uptime_secs: i64,
+    dashboard_uptime_secs: i64,
+    pool_uptime_secs: Option<i64>,
     connected_miners: i64,
     connected_workers: i64,
     shares_accepted: u64,
@@ -541,7 +542,11 @@ async fn api_health(
         wallet_version,
         wallet_balance,
         pool_version: env!("CARGO_PKG_VERSION"),
-        uptime_secs: now - state.started_at,
+        dashboard_uptime_secs: now - state.started_at,
+        pool_uptime_secs: state.app.db.get_pool_status("pool_started_at").await
+            .ok().flatten()
+            .and_then(|(v, _)| v.parse::<i64>().ok())
+            .map(|started| now - started),
         connected_miners,
         connected_workers,
         shares_accepted: accepted,
@@ -1105,7 +1110,8 @@ async function fetchHealth() {
             html += '<tr><td>Wallet Total</td><td class="gold">' + d.wallet_balance.total + ' ZEC</td></tr>';
         }
         html += '<tr><td>Pool Version</td><td>' + (d.pool_version || '?') + '</td></tr>';
-        html += '<tr><td>Uptime</td><td>' + fmtDuration(d.uptime_secs) + '</td></tr>';
+        html += '<tr><td>Pool Uptime</td><td>' + (d.pool_uptime_secs != null ? fmtDuration(d.pool_uptime_secs) : '<span style="color:#718096">N/A</span>') + '</td></tr>';
+        html += '<tr><td>Dashboard Uptime</td><td>' + fmtDuration(d.dashboard_uptime_secs) + '</td></tr>';
         html += '<tr><td>Connected Miners</td><td>' + d.connected_miners + '</td></tr>';
         html += '<tr><td>Connected Workers</td><td>' + d.connected_workers + '</td></tr>';
         html += '<tr><td>Shares Accepted</td><td>' + d.shares_accepted.toLocaleString() + '</td></tr>';
