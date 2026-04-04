@@ -756,7 +756,7 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
 <div class="header">
     <h1>Pool Admin</h1>
     <div class="header-right">
-        <a href="/" target="_blank">Public Dashboard</a>
+        <a id="pub-dash-link" href="/" target="_blank">Public Dashboard</a>
         <form method="POST" action="/admin/logout" style="display:inline"><button type="submit" class="logout-btn">Logout</button></form>
     </div>
 </div>
@@ -1170,6 +1170,9 @@ async function fetchHealth() {
         document.getElementById('health-content').innerHTML = '<span style="color:#fc8181">Failed: ' + e + '</span>';
     }
 }
+
+// Set public dashboard link to port 8080 on same host
+document.getElementById('pub-dash-link').href = 'http://' + window.location.hostname + ':8080';
 
 // Initial load + auto-refresh
 fetchConfig();
