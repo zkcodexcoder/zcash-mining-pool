@@ -191,7 +191,7 @@ impl StratumServer {
         // the connection alive through WebSocket proxies, NAT, and firewalls.
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         ping_interval.tick().await; // consume the immediate first tick
-        let mut ping_id: u64 = 1;
+        let mut ping_id: u64 = 1_000_000;
 
         // Idle timeout: disconnect if no data received for 5 minutes.
         let idle_timeout = Duration::from_secs(300);
