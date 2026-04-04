@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePoolOptions;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use node_rpc::ZcashRpcClient;
@@ -423,6 +424,46 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Spawn payout loop if configured
+    let payout_handle = if config.payout.enabled {
+        let pool_address = config.payout.pool_address.clone()
+            .expect("payout.pool_address is required when payouts are enabled");
+        let mining_address = config.payout.mining_address.clone()
+            .unwrap_or_else(|| pool_address.clone());
+        let wallet_url = config.payout.wallet_rpc_url.clone()
+            .expect("payout.wallet_rpc_url is required when payouts are enabled");
+        let payout_wallet_rpc = match (&config.payout.wallet_rpc_user, &config.payout.wallet_rpc_password) {
+            (Some(user), Some(pass)) => Arc::new(ZcashRpcClient::with_auth(&wallet_url, user, pass)),
+            _ => Arc::new(ZcashRpcClient::new(&wallet_url)),
+        };
+        let min_payout_zatoshis = (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64;
+        let interval = Duration::from_secs(config.payout.interval_secs);
+        let maturity = config.payout.maturity_confirmations;
+        let payout_db = db.clone();
+        let node_rpc = Arc::clone(&rpc);
+        let payout_network = config.pool.network.clone();
+        info!(
+            pool_address = %pool_address,
+            mining_address = %mining_address,
+            wallet_rpc = %wallet_url,
+            min_payout_zec = config.payout.minimum_payout,
+            interval_secs = config.payout.interval_secs,
+            maturity_confirmations = maturity,
+            "Payout loop enabled"
+        );
+        Some(tokio::spawn(async move {
+            run_payout_loop(
+                payout_db, node_rpc, payout_wallet_rpc,
+                &pool_address, &mining_address,
+                min_payout_zatoshis, maturity, interval,
+                &payout_network,
+            ).await;
+        }))
+    } else {
+        info!("Payouts disabled");
+        None
+    };
+
     let admin_info = config
         .admin
         .as_ref()
@@ -450,6 +491,9 @@ async fn main() -> Result<()> {
     }
     history_handle.abort();
     net_cache_handle.abort();
+    if let Some(h) = payout_handle {
+        h.abort();
+    }
 
     info!("Dashboard shut down gracefully");
     Ok(())
@@ -468,4 +512,430 @@ fn pool_core_parse_target(hex_str: &str) -> Result<[u8; 32]> {
     let offset = 32 - bytes.len();
     target[offset..].copy_from_slice(&bytes);
     Ok(target)
+}
+
+// -- Payout loop --
+
+/// Maximum number of shielding batches per payout cycle.
+/// Each batch shields up to 50 UTXOs (~5s proof time each).
+const MAX_SHIELD_BATCHES_PER_CYCLE: u32 = 10;
+
+/// Timeout for waiting on a single async operation (shield or sendmany).
+const OP_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn run_payout_loop(
+    db: PoolDb,
+    node_rpc: Arc<ZcashRpcClient>,
+    wallet_rpc: Arc<ZcashRpcClient>,
+    pool_address: &str,
+    mining_address: &str,
+    min_payout_zatoshis: i64,
+    maturity_confirmations: u64,
+    interval: Duration,
+    network: &str,
+) {
+    info!("Payout loop started");
+    // Short initial delay to let dashboard fully start before doing RPC work.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    loop {
+        // Phase 1: Check block maturity
+        if let Err(e) = check_block_maturity(&db, &node_rpc, maturity_confirmations).await {
+            error!(error = %e, "Block maturity check failed");
+        }
+
+        // Phase 2: Shield mature coinbase UTXOs (transparent -> shielded).
+        // Shields in batches of 50 UTXOs, up to MAX_SHIELD_BATCHES_PER_CYCLE per cycle.
+        if let Err(e) = shield_coinbase(&wallet_rpc, mining_address, pool_address).await {
+            error!(error = %e, "Coinbase shielding failed (will retry next cycle)");
+        }
+
+        // Phase 3: Pay miners from shielded pool (only if balance is sufficient)
+        match process_payouts(&db, &wallet_rpc, pool_address, mining_address, min_payout_zatoshis, network).await {
+            Ok(count) => {
+                if count > 0 {
+                    info!(payouts = count, "Payout round completed");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Payout round failed");
+            }
+        }
+
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn reverse_hex_bytes(hex_str: &str) -> String {
+    let bytes = hex::decode(hex_str).unwrap_or_default();
+    let reversed: Vec<u8> = bytes.into_iter().rev().collect();
+    hex::encode(reversed)
+}
+
+async fn check_block_maturity(
+    db: &PoolDb,
+    node_rpc: &ZcashRpcClient,
+    maturity_confirmations: u64,
+) -> anyhow::Result<()> {
+    let current_height = node_rpc.get_block_count().await
+        .map_err(|e| anyhow::anyhow!("getblockcount failed: {e}"))?;
+
+    let pending_blocks = db.get_pending_blocks().await?;
+    if pending_blocks.is_empty() {
+        return Ok(());
+    }
+
+    for block in &pending_blocks {
+        let confs = current_height as i64 - block.height;
+        if confs < maturity_confirmations as i64 {
+            continue;
+        }
+
+        let chain_hash = node_rpc.get_block_hash(block.height as u64).await
+            .map_err(|e| anyhow::anyhow!("getblockhash failed: {e}"))?;
+
+        let pool_hash_reversed = reverse_hex_bytes(&block.hash);
+        if chain_hash == pool_hash_reversed || chain_hash == block.hash {
+            db.update_block_status(block.id, "confirmed").await?;
+            info!(
+                height = block.height,
+                confirmations = confs,
+                "Block confirmed (mature)"
+            );
+        } else {
+            db.update_block_status(block.id, "orphaned").await?;
+            db.reverse_block_credits(block.reward).await?;
+            info!(
+                height = block.height,
+                "Block orphaned (hash mismatch, credits reversed)"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn shield_coinbase(
+    wallet_rpc: &ZcashRpcClient,
+    mining_address: &str,
+    pool_address: &str,
+) -> anyhow::Result<()> {
+    if mining_address == pool_address {
+        return Ok(());
+    }
+
+    let mut total_shielded_utxos: u64 = 0;
+    let mut total_shielded_value: f64 = 0.0;
+
+    for batch in 1..=MAX_SHIELD_BATCHES_PER_CYCLE {
+        let result = match wallet_rpc.z_shield_coinbase(mining_address, pool_address, Some(50)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("No spendable transparent outputs")
+                    || msg.contains("Insufficient")
+                    || msg.contains("No funds")
+                {
+                    if total_shielded_utxos > 0 {
+                        info!(
+                            total_utxos = total_shielded_utxos,
+                            total_value = total_shielded_value,
+                            batches = batch - 1,
+                            "Shielding complete, no more UTXOs"
+                        );
+                    }
+                    return Ok(());
+                }
+                return Err(anyhow::anyhow!("z_shieldcoinbase failed: {e}"));
+            }
+        };
+
+        let shielding_utxos = result.get("shieldingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0);
+        let shielding_value = result.get("shieldingValue").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let remaining_utxos = result.get("remainingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0);
+        let opid = result.get("opid").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+        if shielding_utxos == 0 {
+            break;
+        }
+
+        info!(
+            batch,
+            opid = %opid,
+            utxos = shielding_utxos,
+            value_zec = shielding_value,
+            remaining = remaining_utxos,
+            "Shielding coinbase batch"
+        );
+
+        match wait_for_operation(wallet_rpc, &opid).await? {
+            OpResult::Success(txid) => {
+                total_shielded_utxos += shielding_utxos;
+                total_shielded_value += shielding_value;
+                info!(batch, txid = %txid, "Shielding batch complete");
+            }
+            OpResult::Failed(msg) => {
+                if msg.contains("Insufficient") || msg.contains("No funds") {
+                    warn!(batch, error = %msg, "Shielding batch skipped (insufficient for fee)");
+                    break;
+                }
+                return Err(anyhow::anyhow!("Shielding batch {batch} failed: {msg}"));
+            }
+        }
+
+        if remaining_utxos == 0 {
+            break;
+        }
+    }
+
+    if total_shielded_utxos > 0 {
+        info!(
+            total_utxos = total_shielded_utxos,
+            total_value_zec = total_shielded_value,
+            "Shielding round complete, waiting for confirmations"
+        );
+
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if let Ok(bal) = wallet_rpc.call_raw::<serde_json::Value>(
+                "z_gettotalbalance", serde_json::json!([1, true])
+            ).await {
+                let private = bal.get("private")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                if private > 0.0 {
+                    info!(private_balance = private, "Shielded funds confirmed (1+ conf)");
+                    return Ok(());
+                }
+            }
+        }
+        warn!("Timed out waiting for shielded fund confirmations");
+    }
+
+    Ok(())
+}
+
+enum OpResult {
+    Success(String),
+    Failed(String),
+}
+
+async fn wait_for_operation(
+    wallet_rpc: &ZcashRpcClient,
+    opid: &str,
+) -> anyhow::Result<OpResult> {
+    let deadline = tokio::time::Instant::now() + OP_POLL_TIMEOUT;
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        if tokio::time::Instant::now() > deadline {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for operation {opid} after {}s",
+                OP_POLL_TIMEOUT.as_secs()
+            ));
+        }
+
+        let statuses = wallet_rpc.z_get_operation_status(&[opid]).await
+            .map_err(|e| anyhow::anyhow!("z_getoperationstatus failed: {e}"))?;
+
+        if let Some(status) = statuses.first() {
+            let state = status.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            match state {
+                "success" => {
+                    let txid = status.get("result")
+                        .and_then(|r| r.get("txid"))
+                        .or_else(|| {
+                            status.get("result")
+                                .and_then(|r| r.get("txids"))
+                                .and_then(|a| a.as_array())
+                                .and_then(|a| a.first())
+                        })
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    return Ok(OpResult::Success(txid));
+                }
+                "failed" => {
+                    let msg = status.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown error")
+                        .to_string();
+                    return Ok(OpResult::Failed(msg));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+async fn process_payouts(
+    db: &PoolDb,
+    rpc: &ZcashRpcClient,
+    pool_address: &str,
+    mining_address: &str,
+    min_payout_zatoshis: i64,
+    network: &str,
+) -> anyhow::Result<usize> {
+    let pending = db.get_pending_payouts(min_payout_zatoshis).await?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let total_payout_zatoshis: i64 = pending.iter().map(|p| p.amount).sum();
+    let total_payout_zec = total_payout_zatoshis as f64 / ZATOSHIS_PER_ZEC;
+
+    let private_balance = match rpc.call_raw::<serde_json::Value>(
+        "z_gettotalbalance", serde_json::json!([3, true])
+    ).await {
+        Ok(bal) => {
+            bal.get("private")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to check wallet balance: {e}"));
+        }
+    };
+
+    let available_zec = (private_balance * 0.90).max(0.0);
+
+    if available_zec < min_payout_zatoshis as f64 / ZATOSHIS_PER_ZEC {
+        info!(private_balance, available_zec, "Shielded balance too low for any payouts");
+        return Ok(0);
+    }
+
+    let scale = if available_zec >= total_payout_zec { 1.0 } else { available_zec / total_payout_zec };
+
+    let mut payout_list: Vec<(usize, i64, String)> = Vec::new();
+    let two_days_ago = Utc::now()
+        .checked_sub_signed(chrono::Duration::days(2))
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+
+    for (i, p) in pending.iter().enumerate() {
+        let pay_to = if is_valid_zcash_address(&p.address, network) {
+            p.address.clone()
+        } else if p.created_at <= two_days_ago {
+            warn!(
+                miner_id = p.miner_id, address = %p.address, created_at = %p.created_at,
+                amount_zec = p.amount as f64 / ZATOSHIS_PER_ZEC,
+                "Redirecting payout to mining address (unpayable address, >2 days old)"
+            );
+            mining_address.to_string()
+        } else {
+            warn!(miner_id = p.miner_id, address = %p.address,
+                "Skipping payout: invalid address format (account < 2 days old)");
+            continue;
+        };
+        let scaled_zatoshis = (p.amount as f64 * scale).floor() as i64;
+        if scaled_zatoshis >= min_payout_zatoshis {
+            payout_list.push((i, scaled_zatoshis, pay_to));
+        }
+    }
+
+    if payout_list.is_empty() {
+        info!(private_balance, scale, "All scaled payouts below minimum, waiting for more shielding");
+        return Ok(0);
+    }
+
+    let actual_total_zatoshis: i64 = payout_list.iter().map(|(_, amt, _)| *amt).sum();
+    let actual_total_zec = actual_total_zatoshis as f64 / ZATOSHIS_PER_ZEC;
+    info!(miners = payout_list.len(), total_zec = actual_total_zec, private_balance, scale, "Processing payouts");
+
+    let (opid, payout_list) = {
+        let mut current_list = payout_list;
+        let mut retries = 0u32;
+        loop {
+            let mut merged: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
+            for (_, zats, addr) in &current_list {
+                *merged.entry(addr.as_str()).or_insert(0.0) += *zats as f64 / ZATOSHIS_PER_ZEC;
+            }
+            let amounts: Vec<(&str, f64)> = merged.into_iter().collect();
+
+            match rpc.z_sendmany(pool_address, &amounts).await {
+                Ok(opid) => break (opid, current_list),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if retries < 2 && msg.contains("Insufficient balance") {
+                        if let Some(have_zats) = parse_have_balance(&msg) {
+                            let actual_available = have_zats as f64 * 0.95;
+                            let current_total: f64 = current_list.iter().map(|(_, z, _)| *z as f64).sum();
+                            if actual_available < min_payout_zatoshis as f64 || current_total <= 0.0 {
+                                return Err(anyhow::anyhow!("Wallet balance too low: {msg}"));
+                            }
+                            let rescale = actual_available / current_total;
+                            info!(have_zats, rescale, retry = retries + 1, "Rescaling payouts based on actual wallet balance");
+                            current_list = current_list
+                                .into_iter()
+                                .filter_map(|(i, old_zats, addr)| {
+                                    let new_zats = (old_zats as f64 * rescale).floor() as i64;
+                                    if new_zats >= min_payout_zatoshis { Some((i, new_zats, addr)) } else { None }
+                                })
+                                .collect();
+                            if current_list.is_empty() {
+                                return Err(anyhow::anyhow!("All payouts below minimum after rescaling"));
+                            }
+                            retries += 1;
+                            continue;
+                        }
+                    }
+                    return Err(anyhow::anyhow!("z_sendmany failed: {e}"));
+                }
+            }
+        }
+    };
+
+    info!(opid = %opid, "z_sendmany submitted, waiting for completion");
+
+    let txid = match wait_for_operation(rpc, &opid).await? {
+        OpResult::Success(txid) => {
+            info!(opid = %opid, txid = %txid, "Payout transaction broadcast");
+            txid
+        }
+        OpResult::Failed(msg) => {
+            return Err(anyhow::anyhow!("z_sendmany failed: {msg}"));
+        }
+    };
+
+    let mut count = 0;
+    for (i, amt_zatoshis, pay_to) in &payout_list {
+        let p = &pending[*i];
+        if let Err(e) = db.create_payout(p.miner_id, *amt_zatoshis, &txid).await {
+            error!(miner_id = p.miner_id, error = %e, "Failed to record payout");
+        } else {
+            info!(
+                miner_id = p.miner_id, address = %p.address, pay_to = %pay_to,
+                amount_zec = *amt_zatoshis as f64 / ZATOSHIS_PER_ZEC, txid = %txid,
+                "Payout recorded"
+            );
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
+fn parse_have_balance(msg: &str) -> Option<i64> {
+    let marker = "have ";
+    let start = msg.find(marker)? + marker.len();
+    let rest = &msg[start..];
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    rest[..end].parse::<i64>().ok()
+}
+
+fn is_valid_zcash_address(addr: &str, network: &str) -> bool {
+    if network == "mainnet" {
+        addr.starts_with("t1")
+            || addr.starts_with("t3")
+            || addr.starts_with("zs")
+            || (addr.starts_with('u') && !addr.starts_with("utest"))
+    } else {
+        addr.starts_with("tm")
+            || addr.starts_with("t2")
+            || addr.starts_with("ztestsapling")
+            || addr.starts_with("utest")
+    }
 }
