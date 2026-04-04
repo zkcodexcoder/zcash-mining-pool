@@ -19,9 +19,7 @@ node-rpc = { path = "../node-rpc" }
 stratum = { path = "../stratum" }
 pool-core = { path = "../pool-core" }
 pool-db = { path = "../pool-db" }
-pool-api = { path = "../pool-api" }
 rewards = { path = "../rewards" }
 toml = "0.8"
 sqlx.workspace = true
-axum.workspace = true
 chrono.workspace = true

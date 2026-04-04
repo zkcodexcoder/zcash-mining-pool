@@ -12,7 +12,6 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use node_rpc::ZcashRpcClient;
-use pool_api::{ApiState, AppState};
 use pool_core::{BlockAssembler, JobManager, ShareValidator, VardiffConfig};
 use pool_db::PoolDb;
 use rewards::PplnsCalculator;
@@ -21,6 +20,7 @@ use stratum::StratumServer;
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Config {
     pool: PoolConfig,
     stratum: StratumConfig,
@@ -36,6 +36,7 @@ struct Config {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AdminConfig {
     #[serde(default)]
     enabled: bool,
@@ -49,6 +50,7 @@ fn default_admin_addr() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct PoolConfig {
     name: String,
     fee_percent: f64,
@@ -85,6 +87,7 @@ struct StratumConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct StratumPortConfig {
     addr: String,
     #[serde(default = "default_port_description")]
@@ -124,23 +127,6 @@ impl StratumConfig {
         map
     }
 
-    /// Build dashboard port info from structured config or legacy fallback.
-    fn port_info(&self) -> Vec<pool_api::StratumPortInfo> {
-        if !self.ports.is_empty() {
-            self.ports.iter().map(|p| {
-                let port: u16 = p.addr.split(':').last().and_then(|s| s.parse().ok()).unwrap_or(0);
-                pool_api::StratumPortInfo {
-                    port,
-                    description: p.description.clone(),
-                }
-            }).collect()
-        } else {
-            self.addrs().iter().map(|addr| {
-                let port: u16 = addr.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(0);
-                pool_api::StratumPortInfo { port, description: "Default".to_string() }
-            }).collect()
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,85 +400,10 @@ async fn main() -> Result<()> {
         Arc::clone(&shares_rejected),
     );
 
-    // Wallet RPC for Zallet monitoring (and payouts)
-    let wallet_rpc = config
-        .payout
-        .wallet_rpc_url
-        .as_ref()
-        .map(|url| {
-            let rpc = match (&config.payout.wallet_rpc_user, &config.payout.wallet_rpc_password) {
-                (Some(u), Some(p)) => ZcashRpcClient::with_auth(url, u, p),
-                _ => ZcashRpcClient::new(url),
-            };
-            Arc::new(rpc)
-        });
-
-    // Build stratum port info for the dashboard from config.
-    let stratum_ports = config.stratum.port_info();
-
-    // Initialize API (shares last_template_at_ms for /health and pool stats)
-    let api_state: AppState = Arc::new(ApiState {
-        db: db.clone(),
-        rpc: Arc::clone(&rpc),
-        pool_name: config.pool.name.clone(),
-        pool_fee: config.pool.fee_percent,
-        network: config.pool.network.clone(),
-        hostname: config.pool.hostname.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
-        stratum_port: stratum_addrs.first()
-            .and_then(|a| a.split(':').last())
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(3333),
-        stratum_ports,
-        last_template_at_ms: Some(last_template_at_ms),
-        wallet_rpc,
-        pool_address: config.payout.pool_address.clone(),
-        mining_address: config.payout.mining_address.clone(),
-        min_payout_zatoshis: (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64,
-        maturity_confirmations: config.payout.maturity_confirmations,
-        network_blocks_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        stats_history: pool_api::StatsHistory::new(),
-        shares_accepted: Arc::clone(&shares_accepted),
-        shares_rejected: Arc::clone(&shares_rejected),
-        banner: config.pool.banner.clone(),
-        difficulty_multiplier: {
-            // Convert shares/sec → Sol/s.  Each share means a hash below pool_target,
-            // so on average each share takes 2^256 / target hashes to find.
-            let target_f64 = pool_target.iter().enumerate().fold(0.0f64, |acc, (i, &b)| {
-                acc + (b as f64) * 256.0f64.powi(31 - i as i32)
-            });
-            if target_f64 > 0.0 { 2.0f64.powi(256) / target_f64 } else { 1.0 }
-        },
-    });
-    // Spawn background stats history recorder (10s snapshots, 1hr ring buffer).
-    let history_state = Arc::clone(&api_state);
-    let history_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let snapshot = pool_api::compute_stats_snapshot(&history_state).await;
-            history_state.stats_history.push(snapshot).await;
-        }
-    });
-
-    // Spawn background network cache warmer so /network page loads instantly.
-    // Warms 1h first (fast, ~60 blocks) so default view is ready quickly,
-    // then warms heavier ranges. Runs every 55s; warm_cache skips fresh ranges.
-    let net_cache_state = Arc::clone(&api_state);
-    let net_cache_handle = tokio::spawn(async move {
-        // Warm 1h immediately so first page load is fast
-        pool_api::warm_network_cache(&net_cache_state, &["1h"]).await;
-        // Then warm heavier ranges
-        pool_api::warm_network_cache(&net_cache_state, &["24h", "1w"]).await;
-        loop {
-            tokio::time::sleep(Duration::from_secs(55)).await;
-            pool_api::warm_network_cache(&net_cache_state, &["1h", "24h", "1w"]).await;
-        }
-    });
-
     // Write pool_started_at once, then update live stats every 5s into pool_status
     // so the standalone dashboard binary can read them.
     let status_db = db.clone();
-    let status_template = Arc::clone(api_state.last_template_at_ms.as_ref()
-        .expect("pool-server always has live last_template_at_ms"));
+    let status_template = Arc::clone(&last_template_at_ms);
     let status_accepted = Arc::clone(&shares_accepted);
     let status_rejected = Arc::clone(&shares_rejected);
     let status_handle = tokio::spawn(async move {
@@ -510,8 +421,6 @@ async fn main() -> Result<()> {
             let _ = status_db.set_pool_status("shares_rejected", &rej.to_string()).await;
         }
     });
-
-    let router = pool_api::build_router(Arc::clone(&api_state));
 
     // Spawn all services — one stratum listener per address
     let mut stratum_handles = Vec::new();
@@ -532,60 +441,6 @@ async fn main() -> Result<()> {
     let share_handle = tokio::spawn(async move {
         share_validator.run(event_rx).await;
     });
-
-    let api_addr = config.api.listen_addr.clone();
-    let api_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(&api_addr)
-            .await
-            .expect("Failed to bind API listener");
-        info!(address = %api_addr, "API server listening");
-        axum::serve(listener, router)
-            .await
-            .expect("API server failed");
-    });
-
-    // Spawn admin server (separate port, password-protected)
-    let admin_handle = if let Some(ref admin_cfg) = config.admin {
-        if admin_cfg.enabled {
-            let config_view = pool_api::admin::PoolConfigView {
-                pool_name: config.pool.name.clone(),
-                pool_fee: config.pool.fee_percent,
-                network: config.pool.network.clone(),
-                stratum_ports: stratum_addrs.clone(),
-                difficulty_multiplier,
-                min_payout_zec: config.payout.minimum_payout,
-                maturity_confirmations: config.payout.maturity_confirmations,
-                pool_address: config.payout.pool_address.clone(),
-                mining_address: config.payout.mining_address.clone(),
-                node_rpc_url: config.node.rpc_url.clone(),
-                wallet_rpc_url: config.payout.wallet_rpc_url.clone(),
-                coinbase_tag: config.pool.coinbase_tag.clone(),
-                payout_interval_secs: config.payout.interval_secs,
-            };
-            let admin_state = pool_api::AdminState::new(
-                Arc::clone(&api_state),
-                &admin_cfg.password,
-                config_view,
-                config_path.clone(),
-            );
-            let admin_router = pool_api::admin::build_admin_router(admin_state);
-            let admin_addr = admin_cfg.listen_addr.clone();
-            Some(tokio::spawn(async move {
-                let listener = tokio::net::TcpListener::bind(&admin_addr)
-                    .await
-                    .expect("Failed to bind admin listener");
-                info!(address = %admin_addr, "Admin server listening");
-                axum::serve(listener, admin_router)
-                    .await
-                    .expect("Admin server failed");
-            }))
-        } else {
-            info!("Admin server disabled");
-            None
-        }
-    } else {
-        None
-    };
 
     let payout_handle = if config.payout.enabled {
         let pool_address = config.payout.pool_address.clone()
@@ -628,21 +483,11 @@ async fn main() -> Result<()> {
         None
     };
 
-    let admin_info = config.admin.as_ref()
-        .filter(|a| a.enabled)
-        .map(|a| format!("\n         Admin: http://{}", a.listen_addr))
-        .unwrap_or_default();
-
     info!(
-        "Pool is running!\n\
+        "Pool is running! (mining only — dashboard served by zcash-dashboard)\n\
          \n\
-         Stratum: {:?}\n\
-         Dashboard: http://{}\n\
-         API: http://{}/api/pool/stats{}\n",
+         Stratum: {:?}\n",
         stratum_addrs,
-        config.api.listen_addr,
-        config.api.listen_addr,
-        admin_info,
     );
 
     // Wait for shutdown signal
@@ -654,10 +499,6 @@ async fn main() -> Result<()> {
     for h in &stratum_handles { h.abort(); }
     job_handle.abort();
     share_handle.abort();
-    api_handle.abort();
-    if let Some(h) = admin_handle { h.abort(); }
-    history_handle.abort();
-    net_cache_handle.abort();
     status_handle.abort();
     if let Some(h) = payout_handle { h.abort(); }
 
