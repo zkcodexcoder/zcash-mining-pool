@@ -1171,8 +1171,8 @@ async function fetchHealth() {
     }
 }
 
-// Set public dashboard link to port 8080 on same host
-document.getElementById('pub-dash-link').href = 'http://' + window.location.hostname + ':8080';
+// Set public dashboard link to HTTPS on same hostname
+document.getElementById('pub-dash-link').href = 'https://' + window.location.hostname;
 
 // Initial load + auto-refresh
 fetchConfig();
