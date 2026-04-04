@@ -256,7 +256,10 @@ async fn main() -> Result<()> {
     db.run_migrations()
         .await
         .with_context(|| "Failed to run migrations")?;
-    info!("Database initialized");
+    db.set_wal_mode()
+        .await
+        .with_context(|| "Failed to enable WAL mode")?;
+    info!("Database initialized (WAL mode)");
 
     // Backfill luck_percent for any blocks that don't have it yet.
     // This runs once at startup using the current network hashrate as an approximation.
@@ -485,6 +488,29 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Write pool_started_at once, then update live stats every 5s into pool_status
+    // so the standalone dashboard binary can read them.
+    let status_db = db.clone();
+    let status_template = Arc::clone(api_state.last_template_at_ms.as_ref()
+        .expect("pool-server always has live last_template_at_ms"));
+    let status_accepted = Arc::clone(&shares_accepted);
+    let status_rejected = Arc::clone(&shares_rejected);
+    let status_handle = tokio::spawn(async move {
+        let _ = status_db.set_pool_status(
+            "pool_started_at",
+            &chrono::Utc::now().timestamp().to_string(),
+        ).await;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let ms = status_template.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("last_template_at_ms", &ms.to_string()).await;
+            let acc = status_accepted.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("shares_accepted", &acc.to_string()).await;
+            let rej = status_rejected.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("shares_rejected", &rej.to_string()).await;
+        }
+    });
+
     let router = pool_api::build_router(Arc::clone(&api_state));
 
     // Spawn all services — one stratum listener per address
@@ -632,6 +658,7 @@ async fn main() -> Result<()> {
     if let Some(h) = admin_handle { h.abort(); }
     history_handle.abort();
     net_cache_handle.abort();
+    status_handle.abort();
     if let Some(h) = payout_handle { h.abort(); }
 
     info!("Pool shut down gracefully");

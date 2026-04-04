@@ -7,6 +7,7 @@ members = [
     "crates/pool-db",
     "crates/pool-api",
     "crates/pool-server",
+    "crates/pool-dashboard",
     "crates/cpu-miner",
 ]
 resolver = "2"

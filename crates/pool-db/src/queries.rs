@@ -35,7 +35,41 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_003).execute(&self.pool).await;
         let migration_004 = include_str!("../migrations/004_worker_difficulty.sql");
         let _ = sqlx::raw_sql(migration_004).execute(&self.pool).await;
+        let migration_005 = include_str!("../migrations/005_pool_status.sql");
+        let _ = sqlx::raw_sql(migration_005).execute(&self.pool).await;
         Ok(())
+    }
+
+    /// Enable WAL mode for concurrent reads (dashboard) + single writer (pool).
+    pub async fn set_wal_mode(&self) -> Result<(), DbError> {
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Upsert a key/value pair into pool_status.
+    pub async fn set_pool_status(&self, key: &str, value: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO pool_status (key, value, updated_at) VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read a value from pool_status. Returns (value, updated_at) if found.
+    pub async fn get_pool_status(&self, key: &str) -> Result<Option<(String, String)>, DbError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT value, updated_at FROM pool_status WHERE key = ?1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     // -- Miners --

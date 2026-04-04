@@ -1,7 +1,6 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, Json};
-use chrono::TimeZone;
 use node_rpc::ZcashRpcClient;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -53,6 +52,60 @@ pub struct ApiState {
     pub shares_rejected: Arc<std::sync::atomic::AtomicU64>,
     /// Optional banner message shown at the top of the public dashboard.
     pub banner: Option<String>,
+}
+
+impl ApiState {
+    /// Get last_template_at_ms: from live atomic if connected, else from pool_status DB.
+    pub async fn get_last_template_ms(&self) -> (bool, Option<String>) {
+        // Try live atomic first
+        if let Some(ref at) = self.last_template_at_ms {
+            let ms = at.load(Ordering::Relaxed);
+            if ms > 0 {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let age_ms = now_ms - ms;
+                let ok = age_ms < STALL_THRESHOLD_MS;
+                let ts = chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, ms)
+                    .single()
+                    .map(|dt| dt.to_rfc3339());
+                return (ok, ts);
+            }
+        }
+        // Fallback: read from pool_status DB table
+        if let Ok(Some((val, _updated))) = self.db.get_pool_status("last_template_at_ms").await {
+            if let Ok(ms) = val.parse::<i64>() {
+                if ms > 0 {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let age_ms = now_ms - ms;
+                    let ok = age_ms < STALL_THRESHOLD_MS;
+                    let ts = chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, ms)
+                        .single()
+                        .map(|dt| dt.to_rfc3339());
+                    return (ok, ts);
+                }
+            }
+        }
+        // No data at all — stall tracking not configured
+        (true, None)
+    }
+
+    /// Get shares accepted/rejected: from live atomics if non-zero, else from pool_status DB.
+    pub async fn get_shares_counters(&self) -> (u64, u64) {
+        let accepted = self.shares_accepted.load(Ordering::Relaxed);
+        let rejected = self.shares_rejected.load(Ordering::Relaxed);
+        if accepted > 0 || rejected > 0 {
+            return (accepted, rejected);
+        }
+        // Fallback: read from DB
+        let db_accepted = self.db.get_pool_status("shares_accepted").await
+            .ok().flatten()
+            .and_then(|(v, _)| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let db_rejected = self.db.get_pool_status("shares_rejected").await
+            .ok().flatten()
+            .and_then(|(v, _)| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        (db_accepted, db_rejected)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -268,23 +321,7 @@ pub async fn get_pool_stats(
     let pending_payout = state.db.get_pending_payouts(state.min_payout_zatoshis).await
         .map(|v| v.len() as i64).unwrap_or(0);
 
-    let (node_ok, last_template_at) = match &state.last_template_at_ms {
-        None => (true, None),
-        Some(at) => {
-            let ms = at.load(Ordering::Relaxed);
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let age_ms = now_ms - ms;
-            let ok = ms > 0 && age_ms < STALL_THRESHOLD_MS;
-            let ts = if ms > 0 {
-                chrono::Utc.timestamp_millis_opt(ms)
-                    .single()
-                    .map(|dt| dt.to_rfc3339())
-            } else {
-                None
-            };
-            (ok, ts)
-        }
-    };
+    let (node_ok, last_template_at) = state.get_last_template_ms().await;
 
     // Query 24h block count once for both luck and network share.
     let since_24h = chrono::Utc::now()
@@ -443,21 +480,8 @@ async fn check_wallet_rpc(state: &ApiState) -> bool {
 
 /// Health check: 200 if node is returning templates recently, 503 if stalled.
 pub async fn get_health(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let (ok, reason) = match &state.last_template_at_ms {
-        None => (true, "stall tracking not configured"),
-        Some(at) => {
-            let ms = at.load(Ordering::Relaxed);
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let age_ms = now_ms - ms;
-            if ms == 0 {
-                (false, "no template received yet")
-            } else if age_ms >= STALL_THRESHOLD_MS {
-                (false, "node has not returned a block template recently; pool may be stalled")
-            } else {
-                (true, "ok")
-            }
-        }
-    };
+    let (ok, _last_template_at) = state.get_last_template_ms().await;
+    let reason = if ok { "ok" } else { "node has not returned a block template recently; pool may be stalled" };
     let status = if ok {
         StatusCode::OK
     } else {

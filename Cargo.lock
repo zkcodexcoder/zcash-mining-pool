@@ -1426,6 +1426,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pool-dashboard"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "hex",
+ "node-rpc",
+ "pool-api",
+ "pool-db",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pool-db"
 version = "0.1.0"
 dependencies = [

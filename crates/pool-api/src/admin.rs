@@ -5,8 +5,6 @@ use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::Ordering;
-
 use crate::handlers::AppState;
 
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
@@ -465,21 +463,12 @@ async fn api_health(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let now = chrono::Utc::now().timestamp();
 
-    let (node_ok, last_template_at, last_template_age_secs) = match &state.app.last_template_at_ms {
-        None => (true, None, None),
-        Some(at) => {
-            let ms = at.load(Ordering::Relaxed);
-            if ms > 0 {
-                let age_ms = now_ms - ms;
-                let ok = age_ms < 90_000;
-                let ts = chrono::DateTime::from_timestamp_millis(ms)
-                    .map(|dt| dt.to_rfc3339());
-                (ok, ts, Some(age_ms / 1000))
-            } else {
-                (false, None, None)
-            }
-        }
-    };
+    let (node_ok, last_template_at) = state.app.get_last_template_ms().await;
+    let last_template_age_secs = last_template_at.as_ref().and_then(|ts| {
+        chrono::DateTime::parse_from_rfc3339(ts).ok().map(|dt| {
+            (now_ms - dt.timestamp_millis()) / 1000
+        })
+    });
 
     let node_height = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -510,8 +499,7 @@ async fn api_health(
     let connected_miners = state.app.db.get_connected_miners_count().await.unwrap_or(0);
     let connected_workers = state.app.db.get_connected_workers_count().await.unwrap_or(0);
 
-    let accepted = state.app.shares_accepted.load(Ordering::Relaxed);
-    let rejected = state.app.shares_rejected.load(Ordering::Relaxed);
+    let (accepted, rejected) = state.app.get_shares_counters().await;
     let total = accepted + rejected;
     let rejection_rate = if total > 0 { (rejected as f64 / total as f64) * 100.0 } else { 0.0 };
 
