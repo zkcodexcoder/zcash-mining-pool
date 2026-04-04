@@ -469,6 +469,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
         .toggle-row:hover td { color: #f4b728; background: #151515; }
         .hidden-rows { display: none; }
+        .tip { position: relative; cursor: help; border-bottom: 1px dotted #555; }
+        .tip::after {
+            content: attr(data-tip);
+            position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+            background: #1a1f2e; color: #a0aec0; border: 1px solid #2d3748; border-radius: 6px;
+            padding: 0.5rem 0.7rem; font-size: 0.7rem; line-height: 1.45; letter-spacing: normal;
+            text-transform: none; white-space: normal; width: 220px; text-align: left;
+            pointer-events: none; opacity: 0; transition: opacity 0.15s; z-index: 10;
+        }
+        .tip:hover::after { opacity: 1; }
+        th .tip::after { width: 200px; }
     </style>
 </head>
 <body style="opacity:0;transition:opacity 0.15s">
@@ -532,7 +543,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="value" id="stat-shares">0</div>
         </div>
         <div class="metric-cell">
-            <div class="label">Luck</div>
+            <div class="label"><span class="tip" data-tip="Work done since last block vs expected. Lower is better: green ≤100% (lucky), yellow ≤150%, red >150% (overdue).">Luck</span></div>
             <div class="value" id="stat-luck">--</div>
         </div>
         <div class="metric-cell">
@@ -658,7 +669,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                     <th>Height</th>
                     <th>Hash</th>
                     <th>Reward</th>
-                    <th>Luck</th>
+                    <th><span class="tip" data-tip="Work the pool did to find this block vs the expected amount. Lower = luckier. 50% means it was found in half the expected time.">Luck</span></th>
                     <th>Status</th>
                     <th>Found</th>
                 </tr>
