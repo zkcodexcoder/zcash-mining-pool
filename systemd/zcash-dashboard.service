@@ -5,14 +5,14 @@ Wants=network-online.target zcash-pool.service
 
 [Service]
 Type=simple
-User=zebra
-Group=zebra
-WorkingDirectory=/home/zebra/zecminer/pool
-ExecStart=/home/zebra/zecminer/pool/target/release/zcash-dashboard config/pool.toml
+User=zec
+Group=zec
+WorkingDirectory=/home/zec/zcash-mining-pool
+ExecStart=/home/zec/zcash-mining-pool/target/release/zcash-dashboard config/pool.toml
 Restart=on-failure
 RestartSec=3
-StandardOutput=append:/home/zebra/zecminer/pool/dashboard.log
-StandardError=append:/home/zebra/zecminer/pool/dashboard.log
+StandardOutput=append:/home/zec/zcash-mining-pool/dashboard.log
+StandardError=append:/home/zec/zcash-mining-pool/dashboard.log
 
 # Hardening
 NoNewPrivileges=true
