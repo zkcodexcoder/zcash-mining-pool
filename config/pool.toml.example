@@ -1,29 +1,51 @@
-[pool]
-name = "ZcashTestPool"
-fee_percent = 1.0
-# "testnet" or "mainnet" — controls address validation, currency symbol (TAZ/ZEC), and badge
-network = "testnet"
+# Zcash Mining Pool Configuration
+#
+# This file is read by both zcash-pool (mining) and zcash-dashboard (API/payouts).
+# Restart requirements after changes:
+#   [pool]       — name/hostname/banner: dashboard only. fee_percent/coinbase_tag: pool. network: both.
+#   [stratum]    — pool restart (miners reconnect)
+#   [node]       — both restart
+#   [difficulty]  — pool restart
+#   [pplns]      — pool restart
+#   [payout]     — dashboard restart only (zero miner impact)
+#   [api]        — dashboard restart only
+#   [admin]      — dashboard restart only
+#   [database]   — both restart
 
+[pool]
+name = "ZcashTestPool"                  # dashboard restart
+fee_percent = 1.0                       # pool restart (used by PPLNS at block credit time)
+# "testnet" or "mainnet" — controls address validation, currency symbol (TAZ/ZEC), and badge
+network = "testnet"                     # both restart
+# hostname = "pool.example.com"         # dashboard restart — shown in stratum URL on dashboard
+# coinbase_tag = "MyPool"               # pool restart — injected into coinbase scriptSig
+# banner = "Welcome to the pool!"       # dashboard restart — shown at top of public dashboard
+
+# All stratum settings require a pool restart (miners reconnect).
 [stratum]
 listen_addr = "0.0.0.0:3333"
 # Bytes used for nonce1 (remaining 32 - nonce1_size bytes are nonce2 for miner)
 nonce1_size = 4
 
+# Both zcash-pool and zcash-dashboard connect to the node. Changes require both restart.
 [node]
 rpc_url = "http://127.0.0.1:18232"
 # rpc_user = "your_rpc_user"
 # rpc_password = "your_rpc_password"
 
+# All difficulty settings require a pool restart.
 [difficulty]
 initial_target = "0800000000000000000000000000000000000000000000000000000000000000"
 # Target shares per minute from each miner (~60 Sol/s produces ~80-120 shares/min at diff 1)
 target_shares_per_minute = 100.0
 retarget_interval_secs = 30
 
+# PPLNS settings require a pool restart.
 [pplns]
 # Window size as a multiple of expected shares per block
 window_multiplier = 2.0
 
+# All payout settings require a dashboard restart only (zero miner impact).
 # Payout pipeline: check_block_maturity -> shield_coinbase -> process_payouts
 # Phase 2 calls z_shieldcoinbase (batches of 50 UTXOs, up to 10 batches/cycle)
 # Phase 3 calls z_sendmany from shielded pool_address to miners
@@ -38,8 +60,16 @@ wallet_rpc_password = "your_wallet_password"
 minimum_payout = 0.01
 interval_secs = 300
 
+# Dashboard restart only.
 [api]
 listen_addr = "0.0.0.0:8080"
 
+# Dashboard restart only.
+# [admin]
+# enabled = true
+# listen_addr = "127.0.0.1:9091"
+# password = "your_admin_password"
+
+# Both restart.
 [database]
 url = "sqlite://pool.db?mode=rwc"
