@@ -5,12 +5,19 @@ A Rust-based mining pool for Zcash testnet, built with Zebrad + Zallet.
 ## Architecture
 
 ```
-Miners ──stratum──► zcash-pool ──rpc──► zebrad (remote)
+Miners ──stratum──► zcash-pool ──writes──► pool.db (SQLite WAL)
                         │
-                        └──rpc──► zallet (local wallet)
+                        └──rpc──► zebrad (remote)
+
+Browser ──http──► zcash-dashboard ──reads──► pool.db + zebrad RPC + zallet RPC
 ```
 
-**Crates:** `node-rpc`, `stratum`, `pool-core`, `pool-db` (SQLite), `pool-api` (Axum), `pool-server`, `rewards` (PPLNS), `cpu-miner`
+Two independent binaries share the same SQLite database (WAL mode):
+
+- **`zcash-pool`** — Mining only: stratum server, job manager, share validator, payouts. Writes live stats to `pool_status` table every 5s.
+- **`zcash-dashboard`** — Dashboard, API, and admin panel. Reads from the same DB. Can be restarted without disconnecting miners.
+
+**Crates:** `node-rpc`, `stratum`, `pool-core`, `pool-db` (SQLite), `pool-api` (Axum), `pool-server`, `pool-dashboard`, `rewards` (PPLNS), `cpu-miner`
 
 ## Building
 
@@ -18,11 +25,13 @@ Miners ──stratum──► zcash-pool ──rpc──► zebrad (remote)
 cargo build --release
 ```
 
-Binary: `target/release/zcash-pool`
+Binaries: `target/release/zcash-pool` and `target/release/zcash-dashboard`
 
 ## Configuration
 
-Edit `config/pool.toml` — see the file for all options (stratum port, node RPC, wallet RPC, payout settings, etc.)
+Edit `config/pool.toml` — see `config/pool.toml.example` for all options (stratum port, node RPC, wallet RPC, payout settings, etc.)
+
+Both binaries read the same `pool.toml`. The dashboard ignores mining-specific sections (stratum, pplns).
 
 ## Running
 
@@ -30,46 +39,50 @@ Edit `config/pool.toml` — see the file for all options (stratum port, node RPC
 
 ```bash
 cd /path/to/zcash-mining-pool
+
+# Start mining server
 ./target/release/zcash-pool config/pool.toml
+
+# Start dashboard (in another terminal)
+./target/release/zcash-dashboard config/pool.toml
+
+# Dashboard with port override (for side-by-side testing)
+./target/release/zcash-dashboard config/pool.toml --port 8081
 ```
 
 The working directory **must** be the project root (the SQLite DB path is relative).
 
 ### Systemd (Production)
 
-Service files are in `systemd/`. The pool depends on Zallet, so Zallet starts first.
+Service files are in `systemd/`. The pool depends on Zallet; the dashboard is independent.
 
 #### Install services
 
 ```bash
-# Copy service files (requires sudo)
 sudo cp systemd/zallet.service /etc/systemd/system/
 sudo cp systemd/zcash-pool.service /etc/systemd/system/
-
-# Reload systemd
+sudo cp systemd/zcash-dashboard.service /etc/systemd/system/
 sudo systemctl daemon-reload
-
-# Enable services to start on boot
-sudo systemctl enable zallet
-sudo systemctl enable zcash-pool
+sudo systemctl enable zallet zcash-pool zcash-dashboard
 ```
 
 #### Start / Stop / Restart
 
 ```bash
-# Start both (pool auto-starts with zallet due to Requires=)
+# Start all
 sudo systemctl start zallet
 sudo systemctl start zcash-pool
+sudo systemctl start zcash-dashboard
 
-# Restart just the pool (zallet stays up)
+# Dashboard changes only (zero miner impact)
+sudo systemctl restart zcash-dashboard
+
+# Mining changes (miners reconnect briefly)
 sudo systemctl restart zcash-pool
 
-# Restart both
+# Restart everything
 sudo systemctl restart zallet   # pool auto-restarts due to Requires=
-
-# Stop both
-sudo systemctl stop zcash-pool
-sudo systemctl stop zallet
+sudo systemctl restart zcash-dashboard
 ```
 
 #### Check status
@@ -77,45 +90,38 @@ sudo systemctl stop zallet
 ```bash
 sudo systemctl status zallet
 sudo systemctl status zcash-pool
+sudo systemctl status zcash-dashboard
 ```
 
 #### View logs
 
 ```bash
-# Systemd journal
-journalctl -u zcash-pool -f          # follow pool logs
-journalctl -u zallet -f              # follow zallet logs
-journalctl -u zcash-pool --since "1 hour ago"
-
-# Log files (services also append to these)
+# Log files
 tail -f ~/zcash-mining-pool/pool.log
-tail -f ~/zallet.log
+tail -f ~/zcash-mining-pool/dashboard.log
+
+# Systemd journal
+journalctl -u zcash-pool -f
+journalctl -u zcash-dashboard -f
+journalctl -u zallet -f
 ```
 
-#### After rebuilding
+#### Deploy workflow
 
 ```bash
+# Local: commit & push
+# Server:
 cd ~/zcash-mining-pool && git pull
-cargo build --release
+source ~/.cargo/env && cargo build --release
+
+# Dashboard changes only (zero miner impact):
+sudo systemctl restart zcash-dashboard
+
+# Mining changes (miners reconnect):
 sudo systemctl restart zcash-pool
-```
 
-#### First-time migration from nohup
-
-If processes are currently running via nohup, stop them first:
-
-```bash
-# Kill existing nohup processes
-pkill -f zcash-pool
-pkill -f start-zallet.sh
-pkill -f 'zallet.*start'
-
-# Install and start services
-sudo cp systemd/zallet.service /etc/systemd/system/
-sudo cp systemd/zcash-pool.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now zallet
-sudo systemctl enable --now zcash-pool
+# Both:
+sudo systemctl restart zcash-pool zcash-dashboard
 ```
 
 ## Endpoints
@@ -128,6 +134,7 @@ sudo systemctl enable --now zcash-pool
 | `http://HOST:8080/api/pool/stats` | Pool stats JSON |
 | `http://HOST:8080/api/pool/stats/history` | Stats history (1hr ring buffer) |
 | `http://HOST:8080/health` | Health check |
+| `http://HOST:9091/admin` | Admin panel (password-protected) |
 | `stratum+tcp://HOST:3333` | Stratum mining |
 
 ## Server
