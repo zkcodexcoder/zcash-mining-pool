@@ -485,7 +485,12 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             </table>
         </div>
 
-        <div class="section-title">Difficulty History (per worker)</div>
+        <div class="section-title" style="display:flex;align-items:center;gap:1rem">
+            Difficulty History
+            <select id="worker-filter" onchange="applyWorkerFilter()" style="background:#111;border:1px solid #333;color:#999;padding:0.2rem 0.5rem;font-size:0.7rem;font-family:inherit;cursor:pointer">
+                <option value="">All Workers</option>
+            </select>
+        </div>
         <div class="chart-panel">
             <canvas id="diff-chart"></canvas>
         </div>
@@ -542,6 +547,8 @@ const WORKER_COLORS = ['#f4b728','#4a9eff','#48bb78','#fc8181','#a78bfa','#f687b
 let diffChart = null;
 let refreshTimer = null;
 let COIN = 'TAZ';
+let allShares = [];
+let allWorkerNames = [];
 async function initCoin() {
     try {
         const r = await fetch('/api/pool/info');
@@ -647,6 +654,30 @@ function buildDiffChart(shares) {
     });
 }
 
+function applyWorkerFilter() {
+    const selected = document.getElementById('worker-filter').value;
+    const filtered = selected ? allShares.filter(s => s.worker === selected) : allShares;
+    buildDiffChart(filtered);
+    renderSharesTable(filtered);
+}
+
+function renderSharesTable(shares) {
+    const sTbody = document.querySelector('#shares-table tbody');
+    const display = shares.slice(0, 200);
+    if (display.length === 0) {
+        sTbody.innerHTML = '<tr><td colspan="4" class="empty-msg">No shares found</td></tr>';
+    } else {
+        sTbody.innerHTML = display.map(s =>
+            '<tr class="' + (s.is_block ? 'block-row' : '') + '">' +
+            '<td>' + s.time + '</td>' +
+            '<td>' + s.worker + '</td>' +
+            '<td>' + s.difficulty.toFixed(4) + '</td>' +
+            '<td>' + (s.is_block ? 'BLOCK' : '') + '</td>' +
+            '</tr>'
+        ).join('');
+    }
+}
+
 async function fetchDiagnostics() {
     const addr = getAddress();
     if (!addr) {
@@ -700,26 +731,17 @@ async function fetchDiagnostics() {
             ).join('');
         }
 
-        // Difficulty chart
-        if (d.recent_shares.length > 0) {
-            buildDiffChart(d.recent_shares);
-        }
+        // Store shares globally and populate worker filter
+        allShares = d.recent_shares;
+        const workerSet = new Set(allShares.map(s => s.worker));
+        allWorkerNames = [...workerSet].sort();
+        const filterEl = document.getElementById('worker-filter');
+        const prevSelection = filterEl.value;
+        filterEl.innerHTML = '<option value="">All Workers</option>' +
+            allWorkerNames.map(n => '<option value="' + n + '"' + (n === prevSelection ? ' selected' : '') + '>' + n + '</option>').join('');
 
-        // Recent shares table (show last 200)
-        const sTbody = document.querySelector('#shares-table tbody');
-        const displayShares = d.recent_shares.slice(0, 200);
-        if (displayShares.length === 0) {
-            sTbody.innerHTML = '<tr><td colspan="4" class="empty-msg">No shares found</td></tr>';
-        } else {
-            sTbody.innerHTML = displayShares.map(s =>
-                '<tr class="' + (s.is_block ? 'block-row' : '') + '">' +
-                '<td>' + s.time + '</td>' +
-                '<td>' + s.worker + '</td>' +
-                '<td>' + s.difficulty.toFixed(4) + '</td>' +
-                '<td>' + (s.is_block ? 'BLOCK' : '') + '</td>' +
-                '</tr>'
-            ).join('');
-        }
+        // Apply current filter to chart + shares table
+        applyWorkerFilter();
 
         // Blocks table
         const bTbody = document.querySelector('#blocks-table tbody');
