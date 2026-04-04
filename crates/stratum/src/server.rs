@@ -191,7 +191,6 @@ impl StratumServer {
         // the connection alive through WebSocket proxies, NAT, and firewalls.
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         ping_interval.tick().await; // consume the immediate first tick
-        let mut ping_id: u64 = 1_000_000;
 
         // Idle timeout: disconnect if no data received for 5 minutes.
         let idle_timeout = Duration::from_secs(300);
@@ -265,12 +264,14 @@ impl StratumServer {
                         info!(%peer_addr, session_id = %session.session_id, "Idle timeout, disconnecting");
                         break;
                     }
+                    // Use id:null so miners treat this as a notification, not a
+                    // request/response. nheqminer was interpreting numbered IDs as
+                    // rejected share responses.
                     let ping = serde_json::json!({
-                        "id": ping_id,
+                        "id": null,
                         "method": "mining.ping",
                         "params": []
                     });
-                    ping_id += 1;
                     if framed.send(serde_json::to_string(&ping).unwrap()).await.is_err() {
                         break;
                     }
