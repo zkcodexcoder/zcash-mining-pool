@@ -438,10 +438,13 @@ async fn api_miners(
 struct AdminHealth {
     node_ok: bool,
     node_height: Option<u64>,
+    node_version: Option<String>,
     last_template_at: Option<String>,
     last_template_age_secs: Option<i64>,
     wallet_ok: bool,
+    wallet_version: Option<String>,
     wallet_balance: Option<WalletBalanceInfo>,
+    pool_version: &'static str,
     uptime_secs: i64,
     connected_miners: i64,
     connected_workers: i64,
@@ -471,30 +474,52 @@ async fn api_health(
         })
     });
 
-    let node_height = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        state.app.rpc.get_block_count(),
-    ).await.ok().and_then(|r| r.ok());
+    // Fetch node height + version concurrently
+    let (node_height, node_version) = {
+        let height_fut = state.app.rpc.get_block_count();
+        let info_fut = state.app.rpc.call_raw::<serde_json::Value>("getinfo", serde_json::json!([]));
+        let (h, info) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), height_fut),
+            tokio::time::timeout(std::time::Duration::from_secs(10), info_fut),
+        );
+        let height = h.ok().and_then(|r| r.ok());
+        let version = info.ok().and_then(|r| r.ok()).and_then(|v| {
+            v.get("subversion").and_then(|s| s.as_str()).map(|s| s.to_string())
+        });
+        (height, version)
+    };
 
-    let (wallet_ok, wallet_balance) = match &state.app.wallet_rpc {
+    let (wallet_ok, wallet_balance, wallet_version) = match &state.app.wallet_rpc {
         Some(rpc) => {
-            let fut = rpc.call_raw::<serde_json::Value>(
+            let bal_fut = rpc.call_raw::<serde_json::Value>(
                 "z_gettotalbalance",
                 serde_json::json!([0, true]),
             );
-            match tokio::time::timeout(std::time::Duration::from_secs(30), fut).await {
+            let ver_fut = rpc.call_raw::<serde_json::Value>(
+                "getinfo",
+                serde_json::json!([]),
+            );
+            let (bal_res, ver_res) = tokio::join!(
+                tokio::time::timeout(std::time::Duration::from_secs(30), bal_fut),
+                tokio::time::timeout(std::time::Duration::from_secs(10), ver_fut),
+            );
+            let (ok, bal) = match bal_res {
                 Ok(Ok(v)) => {
-                    let bal = v.as_object().map(|obj| WalletBalanceInfo {
+                    let b = v.as_object().map(|obj| WalletBalanceInfo {
                         transparent: obj.get("transparent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
                         private: obj.get("private").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
                         total: obj.get("total").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
                     });
-                    (true, bal)
+                    (true, b)
                 }
                 _ => (false, None),
-            }
+            };
+            let ver = ver_res.ok().and_then(|r| r.ok()).and_then(|v| {
+                v.get("subversion").and_then(|s| s.as_str()).map(|s| s.to_string())
+            });
+            (ok, bal, ver)
         }
-        None => (false, None),
+        None => (false, None, None),
     };
 
     let connected_miners = state.app.db.get_connected_miners_count().await.unwrap_or(0);
@@ -509,10 +534,13 @@ async fn api_health(
     Json(AdminHealth {
         node_ok,
         node_height,
+        node_version,
         last_template_at,
         last_template_age_secs,
         wallet_ok,
+        wallet_version,
         wallet_balance,
+        pool_version: env!("CARGO_PKG_VERSION"),
         uptime_secs: now - state.started_at,
         connected_miners,
         connected_workers,
@@ -1069,13 +1097,14 @@ async function fetchHealth() {
         const d = await fetchJson('/admin/api/health');
         if (!d) return;
         let html = '<table class="kv-table">';
-        html += '<tr><td>Zebrad (Node)</td><td>' + (d.node_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline/Stalled</span>') + '</td></tr>';
+        html += '<tr><td>Zebrad (Node)</td><td>' + (d.node_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline/Stalled</span>') + (d.node_version ? ' <span style="color:#718096;font-size:0.75rem">' + d.node_version + '</span>' : '') + '</td></tr>';
         html += '<tr><td>Node Height</td><td>' + (d.node_height || '?') + '</td></tr>';
         html += '<tr><td>Last Template</td><td>' + (d.last_template_at || 'N/A') + (d.last_template_age_secs != null ? ' (' + d.last_template_age_secs + 's ago)' : '') + '</td></tr>';
-        html += '<tr><td>Zallet (Wallet)</td><td>' + (d.wallet_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline</span>') + '</td></tr>';
+        html += '<tr><td>Zallet (Wallet)</td><td>' + (d.wallet_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline</span>') + (d.wallet_version ? ' <span style="color:#718096;font-size:0.75rem">' + d.wallet_version + '</span>' : '') + '</td></tr>';
         if (d.wallet_balance) {
             html += '<tr><td>Wallet Total</td><td class="gold">' + d.wallet_balance.total + ' ZEC</td></tr>';
         }
+        html += '<tr><td>Pool Version</td><td>' + (d.pool_version || '?') + '</td></tr>';
         html += '<tr><td>Uptime</td><td>' + fmtDuration(d.uptime_secs) + '</td></tr>';
         html += '<tr><td>Connected Miners</td><td>' + d.connected_miners + '</td></tr>';
         html += '<tr><td>Connected Workers</td><td>' + d.connected_workers + '</td></tr>';
