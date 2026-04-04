@@ -402,13 +402,18 @@ async fn main() -> Result<()> {
             let admin_router = pool_api::admin::build_admin_router(admin_state);
             let admin_addr = admin_cfg.listen_addr.clone();
             Some(tokio::spawn(async move {
-                let listener = tokio::net::TcpListener::bind(&admin_addr)
-                    .await
-                    .expect("Failed to bind admin listener");
-                info!(address = %admin_addr, "Admin server listening");
-                axum::serve(listener, admin_router)
-                    .await
-                    .expect("Admin server failed");
+                match tokio::net::TcpListener::bind(&admin_addr).await {
+                    Ok(listener) => {
+                        info!(address = %admin_addr, "Admin server listening");
+                        axum::serve(listener, admin_router)
+                            .await
+                            .expect("Admin server failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(address = %admin_addr, error = %e,
+                            "Admin server skipped (port in use — pool may already serve admin)");
+                    }
+                }
             }))
         } else {
             info!("Admin server disabled");
