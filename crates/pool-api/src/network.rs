@@ -58,6 +58,7 @@ pub struct NetworkBlock {
     pub is_our_pool: bool,
     pub coinbase_text: String,
     pub coinbase_hex: String,
+    pub coinbase_tx_version: i32,
     pub is_zebrad: bool,
 }
 
@@ -70,6 +71,7 @@ pub struct MinerDistribution {
     pub percent: f64,
     pub is_our_pool: bool,
     pub zebrad_count: u64,
+    pub dominant_tx_version: i32,
 }
 
 #[derive(Clone, Serialize)]
@@ -143,8 +145,9 @@ fn is_zebrad_block(coinbase_hex: &str) -> bool {
 
 /// Extract coinbase info from a block JSON (verbosity=2, full tx objects inline).
 /// Returns (miner_address, reward_zec, coinbase_text, coinbase_hex).
-fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, String, String) {
-    let unknown = ("unknown".to_string(), 0.0, String::new(), String::new());
+/// Returns (miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version).
+fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, String, String, i32) {
+    let unknown = ("unknown".to_string(), 0.0, String::new(), String::new(), 0);
 
     let tx_array = match block_data.get("tx").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
@@ -158,6 +161,12 @@ fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, 
     if coinbase_tx.is_string() {
         return unknown;
     }
+
+    // Extract tx version (4 = old zcashd, 5 = v5/Orchard-capable)
+    let coinbase_tx_version = coinbase_tx
+        .get("version")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
 
     // Extract coinbase hex and text from vin[0].coinbase
     let coinbase_hex = coinbase_tx
@@ -173,7 +182,7 @@ fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, 
     // Extract miner address and reward from vout[0]
     let vout = match coinbase_tx.get("vout").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return ("unknown".to_string(), 0.0, coinbase_text, coinbase_hex),
+        _ => return ("unknown".to_string(), 0.0, coinbase_text, coinbase_hex, coinbase_tx_version),
     };
 
     let first_vout = &vout[0];
@@ -201,7 +210,7 @@ fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, 
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    (miner_address, reward_zec, coinbase_text, coinbase_hex)
+    (miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version)
 }
 
 async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMiningStats, String> {
@@ -268,7 +277,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (miner_address, reward_zec, coinbase_text, coinbase_hex) = extract_coinbase_from_block(block_data);
+        let (miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version) = extract_coinbase_from_block(block_data);
 
         let is_our_pool = !our_mining_address.is_empty() && miner_address == our_mining_address;
         let pool_name = if is_our_pool {
@@ -290,25 +299,27 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             is_our_pool,
             coinbase_text,
             coinbase_hex,
+            coinbase_tx_version,
             is_zebrad,
         });
     }
 
     // Build distribution.
-    // Track (block_count, zebrad_count) per address.
-    let mut addr_stats: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    // Track (block_count, zebrad_count, tx_version_counts) per address.
+    let mut addr_stats: std::collections::HashMap<String, (u64, u64, std::collections::HashMap<i32, u64>)> = std::collections::HashMap::new();
     for b in &blocks {
-        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0));
+        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0, std::collections::HashMap::new()));
         entry.0 += 1;
         if b.is_zebrad {
             entry.1 += 1;
         }
+        *entry.2.entry(b.coinbase_tx_version).or_insert(0) += 1;
     }
 
     let total = blocks.len() as f64;
     let mut distribution: Vec<MinerDistribution> = addr_stats
         .into_iter()
-        .map(|(addr, (count, zcount))| {
+        .map(|(addr, (count, zcount, ver_counts))| {
             let is_our_pool = !our_mining_address.is_empty() && addr == our_mining_address;
             let pool_name = if is_our_pool {
                 Some("Our Pool".to_string())
@@ -317,6 +328,10 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
                 blocks.iter().find(|b| b.miner_address == addr).and_then(|b| b.pool_name.clone())
             };
             let label = pool_name.clone().unwrap_or_else(|| truncate_address(&addr));
+            let dominant_tx_version = ver_counts.into_iter()
+                .max_by_key(|&(_, c)| c)
+                .map(|(v, _)| v)
+                .unwrap_or(0);
             MinerDistribution {
                 label,
                 address: addr,
@@ -329,6 +344,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
                 },
                 is_our_pool,
                 zebrad_count: zcount,
+                dominant_tx_version,
             }
         })
         .collect();
@@ -628,6 +644,21 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
         tr:hover td { background: #151515; }
         tr.our-pool td { color: #f4b728; }
 
+        .node-badge {
+            display: inline-block;
+            font-size: 0.55rem;
+            font-weight: 600;
+            padding: 0.1rem 0.35rem;
+            border-radius: 3px;
+            margin-left: 0.4rem;
+            vertical-align: middle;
+            letter-spacing: 0.03em;
+            line-height: 1.3;
+        }
+        .node-badge.zebrad { background: #1a3a1a; color: #48bb78; border: 1px solid #2d5a2d; }
+        .node-badge.v5 { background: #3a3a1a; color: #ecc94b; border: 1px solid #5a5a2d; }
+        .node-badge.v4 { background: #3a1a1a; color: #fc8181; border: 1px solid #5a2d2d; }
+
         .loading { color: #333; font-style: italic; font-family: inherit; }
         .last-updated {
             font-size: 0.6rem;
@@ -768,6 +799,14 @@ function formatTime(ts) {
     return d.toLocaleString();
 }
 
+function nodeBadge(txVersion, isZebrad) {
+    if (isZebrad) return '<span class="node-badge zebrad" title="\u{1F993} Running ZebraD!">v' + txVersion + ' \u{1F993}</span>';
+    if (txVersion === 5) return '<span class="node-badge v5" title="Running zcashd v5+ (Orchard-capable)">v5</span>';
+    if (txVersion === 4) return '<span class="node-badge v4" title="Running old zcashd v4 (not Orchard-compatible)">v4</span>';
+    if (txVersion > 0) return '<span class="node-badge v4" title="Transaction version ' + txVersion + '">v' + txVersion + '</span>';
+    return '';
+}
+
 function setRange(range) {
     if (fetching) return;
     currentRange = range;
@@ -804,9 +843,9 @@ async function fetchData() {
         } else {
             distBody.innerHTML = data.distribution.map(d => {
                 const cls = d.is_our_pool ? ' class="our-pool"' : '';
-                const zebra = d.zebrad_count > 0 ? ' \u{1F993}' : '';
+                const badge = nodeBadge(d.dominant_tx_version, d.zebrad_count > 0);
                 return '<tr' + cls + '>' +
-                    '<td title="' + d.address + '">' + d.label + zebra + '</td>' +
+                    '<td title="' + d.address + '">' + d.label + badge + '</td>' +
                     '<td>' + d.block_count + '</td>' +
                     '<td>' + d.percent.toFixed(1) + '%</td>' +
                     '</tr>';
@@ -871,11 +910,11 @@ async function fetchData() {
                 const cls = b.is_our_pool ? ' class="our-pool"' : '';
                 const hashShort = b.hash.substring(0, 16) + '...';
                 const cbShort = b.coinbase_text.length > 40 ? b.coinbase_text.substring(0, 40) + '...' : b.coinbase_text;
-                const zebra = b.is_zebrad ? ' \u{1F993}' : '';
+                const badge = nodeBadge(b.coinbase_tx_version, b.is_zebrad);
                 return '<tr' + cls + '>' +
                     '<td style="color:#e0e0e0">' + b.height + '</td>' +
                     '<td title="' + b.hash + '">' + hashShort + '</td>' +
-                    '<td title="' + b.miner_address + '">' + b.miner_label + zebra + '</td>' +
+                    '<td title="' + b.miner_address + '">' + b.miner_label + badge + '</td>' +
                     '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                     '<td title="' + b.coinbase_text.replace(/"/g, '&quot;') + '">' + cbShort + '</td>' +
                     '<td>' + formatTime(b.time) + '</td>' +
