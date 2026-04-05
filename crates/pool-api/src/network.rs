@@ -53,18 +53,23 @@ pub struct NetworkBlock {
     pub time: i64,
     pub miner_address: String,
     pub miner_label: String,
+    pub pool_name: Option<String>,
     pub reward_zec: f64,
     pub is_our_pool: bool,
     pub coinbase_text: String,
+    pub coinbase_hex: String,
+    pub is_zebrad: bool,
 }
 
 #[derive(Clone, Serialize)]
 pub struct MinerDistribution {
     pub label: String,
     pub address: String,
+    pub pool_name: Option<String>,
     pub block_count: u64,
     pub percent: f64,
     pub is_our_pool: bool,
+    pub zebrad_count: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -75,6 +80,8 @@ pub struct NetworkMiningStats {
     pub our_pool_blocks: u64,
     pub our_pool_percent: f64,
     pub unique_miners: u64,
+    pub zebrad_blocks: u64,
+    pub zebrad_percent: f64,
 }
 
 fn hex_to_ascii_lossy(hex: &str) -> String {
@@ -93,9 +100,51 @@ fn truncate_address(addr: &str) -> String {
     }
 }
 
+/// Look up pool name by miner address, then fall back to coinbase text detection.
+fn identify_pool(miner_address: &str, coinbase_text: &str) -> Option<String> {
+    // Address-based lookup
+    let name = match miner_address {
+        "t1K79TgQbqu74d6rBmsMu2oFEXEwAmdYiT7" => Some("ViaBTC"),
+        "t1ZVi2YGk98tEGYcNpXYnJFWCoLG2oYwv3J" => Some("ViaBTC"),
+        "t1at7nVNsv6taLRrNRvnQdtfLNRDfsGc3Ak" => Some("ViaBTC-Solo"),
+        "t1PEp2GJLSdhDfCKqc2J211WKDUS1NfoQNy" => Some("F2Pool"),
+        "t1bnxtY7aLCjWx9Ru1YcGwRWch3eEWUFK7u" => Some("2Miners"),
+        "t1LRTUjrLE2RHsS75cjCrxB7xaLTwaVkwao" => Some("2Miners-Solo"),
+        "t1L2b66MXbgpVMXDfUa94GCBFAN4dCxGohM" => Some("AntPool"),
+        "t1e6hceYHkzCbwcwGZzKeMfXXW7x7gr19Cw" => Some("Kryptex"),
+        "t1SqwRAAdSig6dE4EBPLonAait219VmkUjP" => Some("ZEC Pool X"),
+        _ => None,
+    };
+    if let Some(n) = name {
+        return Some(n.to_string());
+    }
+
+    // Coinbase text detection
+    if coinbase_text.contains("2Miners") {
+        return Some("2Miners".to_string());
+    }
+    if coinbase_text.contains("/ZEC Pool X/") {
+        return Some("ZEC Pool X".to_string());
+    }
+    if coinbase_text.contains("Mined by") {
+        return Some("F2Pool".to_string());
+    }
+    if coinbase_text.contains("/NiceHash/") {
+        return Some("NiceHash".to_string());
+    }
+
+    None
+}
+
+/// Detect zebrad by checking for the 🦓 emoji bytes (f09fa693) in coinbase hex.
+fn is_zebrad_block(coinbase_hex: &str) -> bool {
+    coinbase_hex.contains("f09fa693")
+}
+
 /// Extract coinbase info from a block JSON (verbosity=2, full tx objects inline).
-fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, String) {
-    let unknown = ("unknown".to_string(), 0.0, String::new());
+/// Returns (miner_address, reward_zec, coinbase_text, coinbase_hex).
+fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, String, String) {
+    let unknown = ("unknown".to_string(), 0.0, String::new(), String::new());
 
     let tx_array = match block_data.get("tx").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
@@ -110,20 +159,21 @@ fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, 
         return unknown;
     }
 
-    // Extract coinbase text from vin[0].coinbase
-    let coinbase_text = coinbase_tx
+    // Extract coinbase hex and text from vin[0].coinbase
+    let coinbase_hex = coinbase_tx
         .get("vin")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
         .and_then(|vin| vin.get("coinbase"))
         .and_then(|v| v.as_str())
-        .map(hex_to_ascii_lossy)
-        .unwrap_or_default();
+        .unwrap_or("")
+        .to_string();
+    let coinbase_text = hex_to_ascii_lossy(&coinbase_hex);
 
     // Extract miner address and reward from vout[0]
     let vout = match coinbase_tx.get("vout").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return ("unknown".to_string(), 0.0, coinbase_text),
+        _ => return ("unknown".to_string(), 0.0, coinbase_text, coinbase_hex),
     };
 
     let first_vout = &vout[0];
@@ -151,7 +201,7 @@ fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, 
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    (miner_address, reward_zec, coinbase_text)
+    (miner_address, reward_zec, coinbase_text, coinbase_hex)
 }
 
 async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMiningStats, String> {
@@ -218,14 +268,16 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (miner_address, reward_zec, coinbase_text) = extract_coinbase_from_block(block_data);
+        let (miner_address, reward_zec, coinbase_text, coinbase_hex) = extract_coinbase_from_block(block_data);
 
         let is_our_pool = !our_mining_address.is_empty() && miner_address == our_mining_address;
-        let miner_label = if is_our_pool {
-            "Our Pool".to_string()
+        let pool_name = if is_our_pool {
+            Some("Our Pool".to_string())
         } else {
-            truncate_address(&miner_address)
+            identify_pool(&miner_address, &coinbase_text)
         };
+        let miner_label = pool_name.clone().unwrap_or_else(|| truncate_address(&miner_address));
+        let is_zebrad = is_zebrad_block(&coinbase_hex);
 
         blocks.push(NetworkBlock {
             height: *height,
@@ -233,30 +285,42 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             time,
             miner_address,
             miner_label,
+            pool_name,
             reward_zec,
             is_our_pool,
             coinbase_text,
+            coinbase_hex,
+            is_zebrad,
         });
     }
 
     // Build distribution.
-    let mut addr_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // Track (block_count, zebrad_count) per address.
+    let mut addr_stats: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
     for b in &blocks {
-        *addr_counts.entry(b.miner_address.clone()).or_insert(0) += 1;
+        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if b.is_zebrad {
+            entry.1 += 1;
+        }
     }
 
     let total = blocks.len() as f64;
-    let mut distribution: Vec<MinerDistribution> = addr_counts
+    let mut distribution: Vec<MinerDistribution> = addr_stats
         .into_iter()
-        .map(|(addr, count)| {
+        .map(|(addr, (count, zcount))| {
             let is_our_pool = !our_mining_address.is_empty() && addr == our_mining_address;
+            let pool_name = if is_our_pool {
+                Some("Our Pool".to_string())
+            } else {
+                // Use the first block's pool_name for this address
+                blocks.iter().find(|b| b.miner_address == addr).and_then(|b| b.pool_name.clone())
+            };
+            let label = pool_name.clone().unwrap_or_else(|| truncate_address(&addr));
             MinerDistribution {
-                label: if is_our_pool {
-                    "Our Pool".to_string()
-                } else {
-                    truncate_address(&addr)
-                },
+                label,
                 address: addr,
+                pool_name,
                 block_count: count,
                 percent: if total > 0.0 {
                     (count as f64 / total) * 100.0
@@ -264,6 +328,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
                     0.0
                 },
                 is_our_pool,
+                zebrad_count: zcount,
             }
         })
         .collect();
@@ -275,12 +340,20 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     } else {
         0.0
     };
+    let zebrad_blocks = blocks.iter().filter(|b| b.is_zebrad).count() as u64;
+    let zebrad_percent = if total > 0.0 {
+        (zebrad_blocks as f64 / total) * 100.0
+    } else {
+        0.0
+    };
 
     Ok(NetworkMiningStats {
         total_blocks: blocks.len() as u64,
         our_pool_blocks,
         our_pool_percent,
         unique_miners: distribution.len() as u64,
+        zebrad_blocks,
+        zebrad_percent,
         blocks,
         distribution,
     })
@@ -294,6 +367,8 @@ fn empty_stats() -> NetworkMiningStats {
         our_pool_blocks: 0,
         our_pool_percent: 0.0,
         unique_miners: 0,
+        zebrad_blocks: 0,
+        zebrad_percent: 0.0,
     }
 }
 
@@ -463,7 +538,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
 
         .summary-grid {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(5, 1fr);
             gap: 1px;
             background: #222;
             border: 1px solid #222;
@@ -619,6 +694,10 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             <div class="label">Unique Miners</div>
             <div class="value" id="stat-unique">--</div>
         </div>
+        <div class="summary-cell">
+            <div class="label" title="Blocks mined using zebrad (detected by coinbase marker)">Zebrad Blocks</div>
+            <div class="value" id="stat-zebrad">--</div>
+        </div>
     </div>
 
     <div class="content-row">
@@ -716,6 +795,7 @@ async function fetchData() {
         document.getElementById('stat-ours').textContent = data.our_pool_blocks;
         document.getElementById('stat-share').textContent = data.our_pool_percent.toFixed(1) + '%';
         document.getElementById('stat-unique').textContent = data.unique_miners;
+        document.getElementById('stat-zebrad').textContent = data.zebrad_blocks + ' (' + data.zebrad_percent.toFixed(1) + '%)';
 
         // Distribution table
         const distBody = document.querySelector('#dist-table tbody');
@@ -724,8 +804,9 @@ async function fetchData() {
         } else {
             distBody.innerHTML = data.distribution.map(d => {
                 const cls = d.is_our_pool ? ' class="our-pool"' : '';
+                const zebra = d.zebrad_count > 0 ? ' \u{1F993}' : '';
                 return '<tr' + cls + '>' +
-                    '<td title="' + d.address + '">' + d.label + '</td>' +
+                    '<td title="' + d.address + '">' + d.label + zebra + '</td>' +
                     '<td>' + d.block_count + '</td>' +
                     '<td>' + d.percent.toFixed(1) + '%</td>' +
                     '</tr>';
@@ -790,10 +871,11 @@ async function fetchData() {
                 const cls = b.is_our_pool ? ' class="our-pool"' : '';
                 const hashShort = b.hash.substring(0, 16) + '...';
                 const cbShort = b.coinbase_text.length > 40 ? b.coinbase_text.substring(0, 40) + '...' : b.coinbase_text;
+                const zebra = b.is_zebrad ? ' \u{1F993}' : '';
                 return '<tr' + cls + '>' +
                     '<td style="color:#e0e0e0">' + b.height + '</td>' +
                     '<td title="' + b.hash + '">' + hashShort + '</td>' +
-                    '<td title="' + b.miner_address + '">' + b.miner_label + '</td>' +
+                    '<td title="' + b.miner_address + '">' + b.miner_label + zebra + '</td>' +
                     '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                     '<td title="' + b.coinbase_text.replace(/"/g, '&quot;') + '">' + cbShort + '</td>' +
                     '<td>' + formatTime(b.time) + '</td>' +
