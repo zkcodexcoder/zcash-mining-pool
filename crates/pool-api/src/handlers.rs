@@ -394,7 +394,8 @@ pub async fn get_stats_history(
     Json(state.stats_history.get_all().await)
 }
 
-/// NOMP-compatible `/api/stats` endpoint for miningpoolstats.stream scraping.
+/// `/api/stats` endpoint compatible with open-ethereum-pool / 2miners format
+/// for miningpoolstats.stream scraping.
 pub async fn get_pool_stats_nomp(
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
@@ -413,49 +414,72 @@ pub async fn get_pool_stats_nomp(
     };
 
     // Network height
-    let network_height = state.rpc.get_block_count().await.unwrap_or(0) as i64;
+    let network_height = state.rpc.get_block_count().await.unwrap_or(0);
 
     // Workers (individual worker processes, not unique miners)
     let workers = state.db.get_connected_workers_count().await.unwrap_or(0);
 
-    // Last block found timestamp (epoch ms as string, NOMP convention)
-    let last_block_found = match state.db.get_recent_blocks(1).await {
+    // Block maturity counts
+    let immature = state.db.get_immature_blocks_count().await.unwrap_or(0);
+    let matured = state.db.get_pending_payout_blocks_count().await.unwrap_or(0);
+
+    // Last block found timestamp (epoch seconds as integer, 2miners convention)
+    let last_block_found: i64 = match state.db.get_recent_blocks(1).await {
         Ok(blocks) => blocks.first().and_then(|b| {
             chrono::NaiveDateTime::parse_from_str(&b.created_at, "%Y-%m-%d %H:%M:%S")
                 .ok()
-                .map(|dt| {
-                    dt.and_utc().timestamp_millis().to_string()
-                })
-        }),
-        Err(_) => None,
+                .map(|dt| dt.and_utc().timestamp())
+        }).unwrap_or(0),
+        Err(_) => 0,
     };
-    let last_block_str = last_block_found.unwrap_or_default();
+
+    // Current round shares (shares since last block found)
+    let round_shares: i64 = if last_block_found > 0 {
+        let since = chrono::DateTime::from_timestamp(last_block_found, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        state.db.get_shares_count_since(&since).await.unwrap_or(0.0) as i64
+    } else {
+        snap.total_shares
+    };
+
+    // Luck: average luck across recent blocks (lower = luckier).
+    let luck = match state.db.get_recent_blocks(10).await {
+        Ok(blocks) => {
+            let lucks: Vec<f64> = blocks.iter().filter_map(|b| b.luck_percent).collect();
+            if lucks.is_empty() { 0.0 } else { lucks.iter().sum::<f64>() / lucks.len() as f64 }
+        }
+        Err(_) => 0.0,
+    };
+
+    // Min payout in ZEC (not zatoshis)
+    let min_payout_zec = state.min_payout_zatoshis as f64 / 100_000_000.0;
+
+    let now = chrono::Utc::now().timestamp_millis();
 
     Json(serde_json::json!({
-        "config": {
-            "ports": state.stratum_ports.iter().map(|p| serde_json::json!({
-                "port": p.port,
-                "description": p.description,
-                "tls": false,
-            })).collect::<Vec<_>>(),
-            "fee": state.pool_fee,
-            "minPaymentThreshold": state.min_payout_zatoshis,
-            "paymentScheme": "PPLNS"
-        },
-        "network": {
-            "height": network_height,
-            "difficulty": network_difficulty,
-            "hashrate": snap.network_hashrate
-        },
-        "pool": {
-            "hashrate": snap.pool_hashrate,
-            "miners": snap.connected_miners,
-            "workers": workers,
-            "totalBlocks": snap.total_blocks,
-            "lastBlockFound": last_block_str,
-            "stats": {
-                "lastBlockFound": last_block_str
-            }
+        "apiVersion": 200,
+        "now": now,
+        "hashrate": snap.pool_hashrate,
+        "minersTotal": snap.connected_miners,
+        "workersTotal": workers,
+        "candidatesTotal": 0,
+        "immatureTotal": immature,
+        "maturedTotal": matured,
+        "luck": luck,
+        "minPayout": min_payout_zec,
+        "nodes": [{
+            "name": "zcash_pplns",
+            "difficulty": format!("{:.4}", network_difficulty),
+            "height": format!("{}", network_height),
+            "networkhashps": format!("{:.0}", snap.network_hashrate),
+            "lastBeat": format!("{}", chrono::Utc::now().timestamp()),
+            "avgBlockTime": format!("{:.2}", BLOCK_TIME_SECS)
+        }],
+        "stats": {
+            "lastBlockFound": last_block_found,
+            "nShares": snap.total_shares,
+            "roundShares": round_shares
         }
     }))
 }
