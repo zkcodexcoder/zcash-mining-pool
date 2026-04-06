@@ -46,7 +46,7 @@ async fn test_share_recording() {
     let worker = db.get_or_create_worker(miner.id, "gpu0").await.unwrap();
 
     for i in 0..5 {
-        db.record_share(worker.id, &format!("job{i}"), 1.0, false)
+        db.record_share(worker.id, &format!("job{i}"), 1.0, false, "test_session")
             .await
             .unwrap();
     }
@@ -106,11 +106,11 @@ async fn test_pplns_shares_query() {
 
     // Miner A: 3 shares of difficulty 2.0 = 6.0 total
     for _ in 0..3 {
-        db.record_share(worker_a.id, "j1", 2.0, false).await.unwrap();
+        db.record_share(worker_a.id, "j1", 2.0, false, "sess_a").await.unwrap();
     }
     // Miner B: 2 shares of difficulty 3.0 = 6.0 total
     for _ in 0..2 {
-        db.record_share(worker_b.id, "j1", 3.0, false).await.unwrap();
+        db.record_share(worker_b.id, "j1", 3.0, false, "sess_b").await.unwrap();
     }
 
     let pplns = db.get_pplns_shares(100).await.unwrap();

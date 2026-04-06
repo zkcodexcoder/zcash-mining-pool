@@ -24,6 +24,7 @@ pub struct WorkerInfoDiag {
 pub struct ShareEntry {
     pub time: String,
     pub worker: String,
+    pub session_id: Option<String>,
     pub difficulty: f64,
     pub is_block: bool,
 }
@@ -170,6 +171,7 @@ pub async fn get_miner_diagnostics(
         .map(|s| ShareEntry {
             time: s.created_at,
             worker: s.worker_name,
+            session_id: s.session_id,
             difficulty: s.difficulty,
             is_block: s.is_block,
         })
@@ -505,6 +507,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
                     <tr>
                         <th>Time</th>
                         <th>Worker</th>
+                        <th>Session</th>
                         <th>Difficulty</th>
                         <th>Block?</th>
                     </tr>
@@ -668,12 +671,13 @@ function renderSharesTable(shares) {
     const sTbody = document.querySelector('#shares-table tbody');
     const display = shares.slice(0, 200);
     if (display.length === 0) {
-        sTbody.innerHTML = '<tr><td colspan="4" class="empty-msg">No shares found</td></tr>';
+        sTbody.innerHTML = '<tr><td colspan="5" class="empty-msg">No shares found</td></tr>';
     } else {
         sTbody.innerHTML = display.map(s =>
             '<tr class="' + (s.is_block ? 'block-row' : '') + '">' +
             '<td>' + s.time + '</td>' +
             '<td>' + s.worker + '</td>' +
+            '<td>' + (s.session_id ? s.session_id.substring(0, 8) : '--') + '</td>' +
             '<td>' + s.difficulty.toFixed(4) + '</td>' +
             '<td>' + (s.is_block ? 'BLOCK' : '') + '</td>' +
             '</tr>'

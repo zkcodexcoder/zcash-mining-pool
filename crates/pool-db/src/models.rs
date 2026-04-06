@@ -21,6 +21,7 @@ pub struct ShareDetail {
     pub is_block: bool,
     pub created_at: String,
     pub worker_name: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

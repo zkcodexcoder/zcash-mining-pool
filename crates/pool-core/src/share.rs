@@ -638,7 +638,7 @@ impl ShareValidator {
         let worker = self.db.get_or_create_worker(miner.id, wname).await
             .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
 
-        self.db.record_share(worker.id, job_id, difficulty, is_block).await
+        self.db.record_share(worker.id, job_id, difficulty, is_block, session_id).await
             .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
 
         let mut block_height = None;

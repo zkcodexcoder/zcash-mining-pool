@@ -37,6 +37,8 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_004).execute(&self.pool).await;
         let migration_005 = include_str!("../migrations/005_pool_status.sql");
         let _ = sqlx::raw_sql(migration_005).execute(&self.pool).await;
+        let migration_006 = include_str!("../migrations/006_share_session_id.sql");
+        let _ = sqlx::raw_sql(migration_006).execute(&self.pool).await;
         Ok(())
     }
 
@@ -161,15 +163,17 @@ impl PoolDb {
         job_id: &str,
         difficulty: f64,
         is_block: bool,
+        session_id: &str,
     ) -> Result<i64, DbError> {
         let is_block_int: i32 = if is_block { 1 } else { 0 };
         let result = sqlx::query(
-            "INSERT INTO shares (worker_id, job_id, difficulty, is_block) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO shares (worker_id, job_id, difficulty, is_block, session_id) VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(worker_id)
         .bind(job_id)
         .bind(difficulty)
         .bind(is_block_int)
+        .bind(session_id)
         .execute(&self.pool)
         .await?;
 
@@ -604,7 +608,7 @@ impl PoolDb {
         limit: i64,
     ) -> Result<Vec<ShareDetail>, DbError> {
         let rows: Vec<SqliteRow> = sqlx::query(
-            "SELECT s.id, s.difficulty, s.is_block, s.created_at, w.name as worker_name \
+            "SELECT s.id, s.difficulty, s.is_block, s.created_at, w.name as worker_name, s.session_id \
              FROM shares s \
              JOIN workers w ON s.worker_id = w.id \
              WHERE w.miner_id = ?1 \
@@ -624,6 +628,7 @@ impl PoolDb {
                 is_block: row.get("is_block"),
                 created_at: row.get("created_at"),
                 worker_name: row.get("worker_name"),
+                session_id: row.get("session_id"),
             })
             .collect();
 
