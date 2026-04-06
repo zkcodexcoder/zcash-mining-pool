@@ -201,6 +201,8 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
 <script>
 let prevDiffs = {};
 let COIN = 'TAZ';
+const params = new URLSearchParams(window.location.search);
+const filterWorker = params.get('worker');
 
 async function initCoin() {
     try {
@@ -242,7 +244,17 @@ function getMinerAddr(workerName) {
 async function fetchSessions() {
     try {
         const r = await fetch('/api/sessions');
-        const sessions = await r.json();
+        let sessions = await r.json();
+
+        if (filterWorker) {
+            sessions = sessions.filter(s => {
+                // Match full worker_name, or the worker suffix after the dot
+                const parts = s.worker_name.split('.');
+                const suffix = parts.length > 1 ? parts.slice(1).join('.') : s.worker_name;
+                const addr = parts[0];
+                return s.worker_name === filterWorker || suffix === filterWorker || addr === filterWorker;
+            });
+        }
 
         document.getElementById('session-count').textContent = sessions.length;
 
@@ -305,6 +317,14 @@ async function fetchSessions() {
 document.addEventListener('DOMContentLoaded', () => {
     document.body.style.opacity = '1';
     initCoin();
+    if (filterWorker) {
+        const banner = document.createElement('div');
+        banner.style.cssText = 'background:#1a1a1a;border:1px solid #333;padding:0.5rem 1rem;margin-bottom:1rem;font-size:0.75rem;display:flex;align-items:center;gap:0.75rem';
+        banner.innerHTML = '<span style="color:#555">Filtered:</span> <span style="color:#f4b728;font-family:monospace">' +
+            (filterWorker.length > 30 ? filterWorker.substring(0,12) + '...' + filterWorker.slice(-12) : filterWorker) +
+            '</span> <a href="/sessions" style="color:#555;margin-left:auto;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.06em;text-decoration:none">Show All</a>';
+        document.querySelector('.container').insertBefore(banner, document.querySelector('.summary'));
+    }
     fetchSessions();
     setInterval(fetchSessions, 5000);
 });

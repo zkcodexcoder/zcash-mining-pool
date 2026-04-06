@@ -723,7 +723,7 @@ async function fetchDiagnostics() {
                 '<tr>' +
                 '<td><span class="status-dot ' + (w.is_online ? 'dot-online' : 'dot-offline') + '"></span>' +
                 '<span class="' + (w.is_online ? 'status-online' : 'status-offline') + '">' + (w.is_online ? 'Online' : 'Offline') + '</span></td>' +
-                '<td style="color:#e0e0e0">' + w.name + '</td>' +
+                '<td><a href="/sessions?worker=' + encodeURIComponent(w.name) + '" style="color:#e0e0e0;text-decoration:none" title="View live sessions">' + w.name + '</a></td>' +
                 '<td>' + formatHashrate(w.hashrate_1m) + '</td>' +
                 '<td>' + formatHashrate(w.hashrate_10m) + '</td>' +
                 '<td>' + (w.current_difficulty != null ? w.current_difficulty.toFixed(4) : '--') + '</td>' +
