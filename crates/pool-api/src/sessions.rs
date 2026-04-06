@@ -324,16 +324,21 @@ async function fetchSessions() {
                     '<td>' + s.window_elapsed_secs.toFixed(1) + '</td>' +
                     '<td style="color:' + ratioColor + '">' + s.smoothed_ratio.toFixed(2) + '</td>' +
                     '</tr>';
-                if (expanded && s.diff_history && s.diff_history.length > 0) {
-                    html += '<tr class="detail-row"><td colspan="10"><div class="detail-cell">' +
-                        '<canvas id="chart-' + s.session_id + '"></canvas></div></td></tr>';
+                if (expanded) {
+                    if (s.diff_history && s.diff_history.length > 1) {
+                        html += '<tr class="detail-row"><td colspan="10"><div class="detail-cell">' +
+                            '<canvas id="chart-' + s.session_id + '"></canvas></div></td></tr>';
+                    } else {
+                        html += '<tr class="detail-row"><td colspan="10"><div class="detail-cell" style="color:#333;font-size:0.75rem;text-align:center;padding:1rem">' +
+                            'No difficulty adjustments — steady state since connect</div></td></tr>';
+                    }
                 }
             }
             tbody.innerHTML = html;
 
             // Render charts for expanded sessions
             for (const s of sessions) {
-                if (expandedSessions.has(s.session_id) && s.diff_history && s.diff_history.length > 0) {
+                if (expandedSessions.has(s.session_id) && s.diff_history && s.diff_history.length > 1) {
                     renderDiffChart(s.session_id, s.diff_history);
                 }
             }

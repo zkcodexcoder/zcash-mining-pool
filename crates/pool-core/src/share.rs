@@ -322,6 +322,16 @@ impl ShareValidator {
                         });
                     }
                     let difficulty = initial_diff.unwrap_or(self.vardiff_config.initial_difficulty);
+                    // Seed diff_history with initial difficulty
+                    {
+                        let mut sessions = self.session_difficulty.write().await;
+                        if let Some(sd) = sessions.get_mut(&session_id) {
+                            sd.diff_history.push(DiffAdjustment {
+                                secs_since_connect: 0,
+                                difficulty,
+                            });
+                        }
+                    }
                     info!(%session_id, target = %target_hex, difficulty, "Sending initial target");
                     self.stratum
                         .send_to_session(&session_id, ServerMessage::SetDifficulty {
