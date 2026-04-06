@@ -30,10 +30,21 @@ pub struct VardiffConfig {
     pub retarget_interval_secs: f64,
 }
 
-/// Maximum shares per second before the session is rate-limited.
-/// Set high so vardiff handles rate control; this is just a safety net
-/// against broken or malicious clients.
+/// Shares/sec threshold that triggers an immediate vardiff retarget.
+const VARDIFF_TRIGGER_RATE: f64 = 100.0;
+
+/// Shares/sec threshold above which shares are rejected outright.
 const MAX_SHARES_PER_SEC: f64 = 500.0;
+
+/// Result of per-share rate check.
+enum RateStatus {
+    /// Below warning threshold — normal processing.
+    Ok,
+    /// Between VARDIFF_TRIGGER_RATE and MAX_SHARES_PER_SEC — accept but force retarget.
+    Warn,
+    /// Above MAX_SHARES_PER_SEC — reject share.
+    Reject,
+}
 
 /// Per-session state: vardiff tracker + current target + rate limiter.
 struct SessionDifficulty {
@@ -138,20 +149,21 @@ impl ShareValidator {
                     nonce_2,
                     equihash_solution,
                 } => {
-                    // Rate-limit check before expensive validation
-                    if self.check_rate_limit(&session_id).await {
+                    // 3-tier rate check before expensive validation
+                    let rate_status = self.check_rate(&session_id).await;
+                    if matches!(rate_status, RateStatus::Reject) {
                         self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!(worker = %worker_name, "Share rate limit exceeded, rejecting");
+                        warn!(worker = %worker_name, "Share rate >500/s, rejecting");
                         self.stratum
                             .send_to_session(&session_id, ServerMessage::SubmitResult {
                                 id: request_id, accepted: false,
                                 error: Some(StratumError::other("Share rate limit exceeded")),
                             })
                             .await;
-                        // Still trigger retarget so difficulty ramps up
-                        self.maybe_retarget(&session_id).await;
+                        self.force_retarget_session(&session_id).await;
                         continue;
                     }
+                    let force_retarget = matches!(rate_status, RateStatus::Warn);
 
                     let result = self
                         .validate_share(
@@ -180,7 +192,11 @@ impl ShareValidator {
                                 .await;
 
                             // Check vardiff retarget after accepted share
-                            self.maybe_retarget(&session_id).await;
+                            if force_retarget {
+                                self.force_retarget_session(&session_id).await;
+                            } else {
+                                self.maybe_retarget(&session_id).await;
+                            }
                         }
                         Err(e) => {
                             self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -266,9 +282,9 @@ impl ShareValidator {
         }
     }
 
-    /// Returns true if the session is submitting shares too fast.
+    /// Check the session's share submission rate.
     /// Resets the counter every second.
-    async fn check_rate_limit(&self, session_id: &str) -> bool {
+    async fn check_rate(&self, session_id: &str) -> RateStatus {
         let mut sessions = self.session_difficulty.write().await;
         if let Some(sd) = sessions.get_mut(session_id) {
             let elapsed = sd.rate_window_start.elapsed().as_secs_f64();
@@ -276,14 +292,20 @@ impl ShareValidator {
                 // Reset window
                 sd.rate_window_start = Instant::now();
                 sd.rate_window_shares = 1;
-                false
+                RateStatus::Ok
             } else {
                 sd.rate_window_shares += 1;
                 let rate = sd.rate_window_shares as f64 / elapsed.max(0.01);
-                rate > MAX_SHARES_PER_SEC
+                if rate > MAX_SHARES_PER_SEC {
+                    RateStatus::Reject
+                } else if rate > VARDIFF_TRIGGER_RATE {
+                    RateStatus::Warn
+                } else {
+                    RateStatus::Ok
+                }
             }
         } else {
-            false
+            RateStatus::Ok
         }
     }
 
@@ -297,6 +319,24 @@ impl ShareValidator {
                 None
             }
         };
+        self.apply_retarget(session_id, new_diff).await;
+    }
+
+    /// Force an immediate retarget, bypassing the vardiff interval gate.
+    async fn force_retarget_session(&self, session_id: &str) {
+        let new_diff = {
+            let mut sessions = self.session_difficulty.write().await;
+            if let Some(sd) = sessions.get_mut(session_id) {
+                sd.vardiff.force_retarget()
+            } else {
+                None
+            }
+        };
+        self.apply_retarget(session_id, new_diff).await;
+    }
+
+    /// Apply a retarget if a new difficulty was computed.
+    async fn apply_retarget(&self, session_id: &str, new_diff: Option<f64>) {
         if let Some(diff) = new_diff {
             let target_hex = difficulty_to_target_hex(diff);
             let new_target = parse_target(&target_hex).unwrap_or(self.default_target);

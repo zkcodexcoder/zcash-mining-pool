@@ -50,20 +50,33 @@ impl VardiffTracker {
         let expected_in_elapsed =
             self.target_shares_per_minute * elapsed / 60.0;
         let early_trigger = self.shares_in_window as f64 > expected_in_elapsed * 4.0
-            && elapsed >= 5.0;
+            && elapsed >= 1.0;
 
         if !early_trigger && elapsed < self.retarget_interval_secs {
             return None;
         }
 
-        let shares_per_minute = (self.shares_in_window as f64 / elapsed) * 60.0;
+        self.compute_retarget()
+    }
+
+    /// Force an immediate retarget, bypassing the interval and early-trigger gates.
+    /// Called when the rate limiter detects a miner submitting too fast.
+    pub fn force_retarget(&mut self) -> Option<f64> {
+        self.shares_in_window += 1;
+        self.compute_retarget()
+    }
+
+    /// Shared retarget calculation used by both `record_share` and `force_retarget`.
+    fn compute_retarget(&mut self) -> Option<f64> {
+        let elapsed = self.window_start.elapsed().as_secs_f64();
+        let shares_per_minute = (self.shares_in_window as f64 / elapsed.max(0.01)) * 60.0;
         let ratio = shares_per_minute / self.target_shares_per_minute;
 
         let new_difficulty = if ratio > 4.0 || ratio < 0.25 {
-            // RAMP-UP: way off target, aggressive jump to converge fast.
-            let adjustment = ratio.clamp(0.25, 16.0);
+            // RAMP-UP: way off target, jump directly to the right difficulty.
+            // No artificial cap — if we see 360x, set 360x immediately.
             self.smoothed_ratio = 1.0; // reset EMA after big jump
-            (self.current_difficulty * adjustment)
+            (self.current_difficulty * ratio)
                 .clamp(self.min_difficulty, self.max_difficulty)
         } else {
             // STEADY-STATE: use EMA to smooth out variance.
