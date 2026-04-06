@@ -88,9 +88,8 @@ pub struct SessionSnapshot {
     pub difficulty: f64,
     pub hashrate: f64,
     pub connected_secs: u64,
-    pub shares_in_window: u32,
+    pub shares_per_min: f64,
     pub smoothed_ratio: f64,
-    pub window_elapsed_secs: f64,
     pub diff_history: Vec<DiffAdjustment>,
 }
 
@@ -474,9 +473,8 @@ impl ShareValidator {
                 difficulty: sd.vardiff.current_difficulty(),
                 hashrate,
                 connected_secs: sd.connected_at.elapsed().as_secs(),
-                shares_in_window: sd.vardiff.shares_in_window(),
+                shares_per_min: (sd.vardiff.shares_in_window() as f64 / elapsed) * 60.0,
                 smoothed_ratio: sd.vardiff.smoothed_ratio(),
-                window_elapsed_secs: elapsed,
                 diff_history: sd.diff_history.clone(),
             }
         }).collect()
