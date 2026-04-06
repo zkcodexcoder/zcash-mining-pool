@@ -106,6 +106,19 @@ impl ApiState {
             .unwrap_or(0);
         (db_accepted, db_rejected)
     }
+
+    /// Get rate limit counters from pool_status DB.
+    pub async fn get_rate_counters(&self) -> (u64, u64) {
+        let warn = self.db.get_pool_status("rate_warn_count").await
+            .ok().flatten()
+            .and_then(|(v, _)| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let reject = self.db.get_pool_status("rate_reject_count").await
+            .ok().flatten()
+            .and_then(|(v, _)| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        (warn, reject)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

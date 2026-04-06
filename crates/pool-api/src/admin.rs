@@ -452,6 +452,8 @@ struct AdminHealth {
     shares_accepted: u64,
     shares_rejected: u64,
     shares_rejection_rate: f64,
+    rate_warn_count: u64,
+    rate_reject_count: u64,
     system: Option<SystemStats>,
 }
 
@@ -529,6 +531,7 @@ async fn api_health(
     let (accepted, rejected) = state.app.get_shares_counters().await;
     let total = accepted + rejected;
     let rejection_rate = if total > 0 { (rejected as f64 / total as f64) * 100.0 } else { 0.0 };
+    let (rate_warn, rate_reject) = state.app.get_rate_counters().await;
 
     let system = read_system_stats();
 
@@ -552,6 +555,8 @@ async fn api_health(
         shares_accepted: accepted,
         shares_rejected: rejected,
         shares_rejection_rate: rejection_rate,
+        rate_warn_count: rate_warn,
+        rate_reject_count: rate_reject,
         system,
     })
 }
@@ -1118,6 +1123,10 @@ async function fetchHealth() {
         html += '<tr><td>Shares Rejected</td><td>' + d.shares_rejected.toLocaleString() + '</td></tr>';
         const rateColor = d.shares_rejection_rate > 5 ? '#fc8181' : d.shares_rejection_rate > 1 ? '#f4b728' : '#68d391';
         html += '<tr><td>Rejection Rate</td><td style="color:' + rateColor + '">' + d.shares_rejection_rate.toFixed(2) + '%</td></tr>';
+        const warnColor = d.rate_warn_count > 0 ? '#f4b728' : '#68d391';
+        html += '<tr><td>Rate Warnings (100-500/s)</td><td style="color:' + warnColor + '">' + d.rate_warn_count.toLocaleString() + '</td></tr>';
+        const rateRejectColor = d.rate_reject_count > 0 ? '#fc8181' : '#68d391';
+        html += '<tr><td>Rate Rejections (&gt;500/s)</td><td style="color:' + rateRejectColor + '">' + d.rate_reject_count.toLocaleString() + '</td></tr>';
         html += '</table>';
 
         // System stats (Linux only)

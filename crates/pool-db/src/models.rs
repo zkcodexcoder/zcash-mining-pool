@@ -9,6 +9,7 @@ pub struct WorkerDiagnostics {
     pub current_difficulty: Option<f64>,
     pub diff_sum_1m: f64,
     pub diff_sum_10m: f64,
+    pub shares_1m: i64,
     pub shares_10m: i64,
     pub total_shares: i64,
 }

@@ -381,6 +381,8 @@ async fn main() -> Result<()> {
     // Shared counters for accepted/rejected shares (used by both validator and API).
     let shares_accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let shares_rejected = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rate_warn_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rate_reject_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let share_validator = ShareValidator::new(
         db.clone(),
@@ -396,6 +398,8 @@ async fn main() -> Result<()> {
         difficulty_multiplier,
         Arc::clone(&shares_accepted),
         Arc::clone(&shares_rejected),
+        Arc::clone(&rate_warn_count),
+        Arc::clone(&rate_reject_count),
     );
 
     // Write pool_started_at once, then update live stats every 5s into pool_status
@@ -404,6 +408,8 @@ async fn main() -> Result<()> {
     let status_template = Arc::clone(&last_template_at_ms);
     let status_accepted = Arc::clone(&shares_accepted);
     let status_rejected = Arc::clone(&shares_rejected);
+    let status_rate_warn = Arc::clone(&rate_warn_count);
+    let status_rate_reject = Arc::clone(&rate_reject_count);
     let status_handle = tokio::spawn(async move {
         let _ = status_db.set_pool_status(
             "pool_started_at",
@@ -417,6 +423,10 @@ async fn main() -> Result<()> {
             let _ = status_db.set_pool_status("shares_accepted", &acc.to_string()).await;
             let rej = status_rejected.load(std::sync::atomic::Ordering::Relaxed);
             let _ = status_db.set_pool_status("shares_rejected", &rej.to_string()).await;
+            let rw = status_rate_warn.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("rate_warn_count", &rw.to_string()).await;
+            let rr = status_rate_reject.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("rate_reject_count", &rr.to_string()).await;
         }
     });
 

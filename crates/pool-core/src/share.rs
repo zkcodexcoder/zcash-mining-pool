@@ -76,6 +76,10 @@ pub struct ShareValidator {
     shares_accepted: Arc<std::sync::atomic::AtomicU64>,
     /// Rejected share counter (shared with API for stats).
     shares_rejected: Arc<std::sync::atomic::AtomicU64>,
+    /// Rate warn counter (100-500 shares/sec events).
+    rate_warn_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Rate reject counter (>500 shares/sec events).
+    rate_reject_count: Arc<std::sync::atomic::AtomicU64>,
     /// Maps session_id -> worker_id for persisting difficulty on retarget.
     session_worker_id: RwLock<HashMap<String, i64>>,
 }
@@ -95,6 +99,8 @@ impl ShareValidator {
         difficulty_multiplier: f64,
         shares_accepted: Arc<std::sync::atomic::AtomicU64>,
         shares_rejected: Arc<std::sync::atomic::AtomicU64>,
+        rate_warn_count: Arc<std::sync::atomic::AtomicU64>,
+        rate_reject_count: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             db,
@@ -111,6 +117,8 @@ impl ShareValidator {
             latest_notify,
             shares_accepted,
             shares_rejected,
+            rate_warn_count,
+            rate_reject_count,
             session_worker_id: RwLock::new(HashMap::new()),
         }
     }
@@ -153,6 +161,7 @@ impl ShareValidator {
                     let rate_status = self.check_rate(&session_id).await;
                     if matches!(rate_status, RateStatus::Reject) {
                         self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.rate_reject_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(worker = %worker_name, "Share rate >500/s, rejecting");
                         self.stratum
                             .send_to_session(&session_id, ServerMessage::SubmitResult {
@@ -164,6 +173,9 @@ impl ShareValidator {
                         continue;
                     }
                     let force_retarget = matches!(rate_status, RateStatus::Warn);
+                    if force_retarget {
+                        self.rate_warn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
 
                     let result = self
                         .validate_share(

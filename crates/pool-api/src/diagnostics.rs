@@ -13,6 +13,7 @@ pub struct WorkerInfoDiag {
     pub hashrate_1m: f64,
     pub hashrate_10m: f64,
     pub current_difficulty: Option<f64>,
+    pub shares_1m: i64,
     pub shares_10m: i64,
     pub total_shares: i64,
     pub last_seen: String,
@@ -155,6 +156,7 @@ pub async fn get_miner_diagnostics(
                 hashrate_1m: hr_1m,
                 hashrate_10m: hr_10m,
                 current_difficulty: w.current_difficulty,
+                shares_1m: w.shares_1m,
                 shares_10m: w.shares_10m,
                 total_shares: w.total_shares,
                 is_online: w.last_seen >= online_threshold,
@@ -476,6 +478,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
                         <th>Hashrate (1m)</th>
                         <th>Hashrate (10m)</th>
                         <th>Current Difficulty</th>
+                        <th>Shares (1m)</th>
                         <th>Shares (10m)</th>
                         <th>Total Shares</th>
                         <th>Last Seen</th>
@@ -714,7 +717,7 @@ async function fetchDiagnostics() {
         // Workers table
         const wTbody = document.querySelector('#workers-table tbody');
         if (d.workers.length === 0) {
-            wTbody.innerHTML = '<tr><td colspan="8" class="empty-msg">No workers found</td></tr>';
+            wTbody.innerHTML = '<tr><td colspan="9" class="empty-msg">No workers found</td></tr>';
         } else {
             wTbody.innerHTML = d.workers.map(w =>
                 '<tr>' +
@@ -724,6 +727,7 @@ async function fetchDiagnostics() {
                 '<td>' + formatHashrate(w.hashrate_1m) + '</td>' +
                 '<td>' + formatHashrate(w.hashrate_10m) + '</td>' +
                 '<td>' + (w.current_difficulty != null ? w.current_difficulty.toFixed(4) : '--') + '</td>' +
+                '<td>' + w.shares_1m.toLocaleString() + '</td>' +
                 '<td>' + w.shares_10m.toLocaleString() + '</td>' +
                 '<td>' + w.total_shares.toLocaleString() + '</td>' +
                 '<td>' + w.last_seen + '</td>' +
