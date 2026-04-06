@@ -5,6 +5,12 @@ use serde::Deserialize;
 use crate::handlers::AppState;
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct DiffAdjustment {
+    pub secs_since_connect: u64,
+    pub difficulty: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct SessionSnapshot {
     pub session_id: String,
     pub worker_name: String,
@@ -16,6 +22,8 @@ pub struct SessionSnapshot {
     pub shares_in_window: u32,
     pub smoothed_ratio: f64,
     pub window_elapsed_secs: f64,
+    #[serde(default)]
+    pub diff_history: Vec<DiffAdjustment>,
 }
 
 pub async fn get_sessions(State(state): State<AppState>) -> Json<Vec<SessionSnapshot>> {
@@ -37,6 +45,7 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Live Sessions - Zcash Mining Pool</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -147,6 +156,11 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
         .diff-down { color: #fc8181; }
         .worker-link { color: #f4b728; text-decoration: none; }
         .worker-link:hover { text-decoration: underline; }
+        .expandable { cursor: pointer; }
+        .expandable:hover td:first-child { color: #f4b728; }
+        .detail-row td { padding: 0; border-bottom: 1px solid #222; }
+        .detail-cell { padding: 0.75rem 1rem; background: #0a0a0a; }
+        .detail-cell canvas { height: 120px !important; width: 100% !important; }
         @media (max-width: 900px) {
             .summary { flex-direction: column; }
         }
@@ -201,6 +215,8 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
 <script>
 let prevDiffs = {};
 let COIN = 'TAZ';
+let sessionCharts = {};
+let expandedSessions = new Set();
 const params = new URLSearchParams(window.location.search);
 const filterWorker = params.get('worker');
 
@@ -270,7 +286,8 @@ async function fetchSessions() {
         } else {
             // Sort by difficulty descending
             sessions.sort((a, b) => b.difficulty - a.difficulty);
-            tbody.innerHTML = sessions.map(s => {
+            let html = '';
+            for (const s of sessions) {
                 const prev = prevDiffs[s.session_id];
                 let diffClass = '';
                 if (prev != null) {
@@ -287,9 +304,11 @@ async function fetchSessions() {
                     : s.smoothed_ratio > 1.2 ? '#f4b728'
                     : s.smoothed_ratio < 0.8 ? '#f4b728'
                     : '#48bb78';
-                return '<tr>' +
-                    '<td>' + s.session_id.substring(0, 8) + '</td>' +
-                    '<td><a class="worker-link" href="/miner/' + encodeURIComponent(addr) + '" title="' + s.worker_name + '">' + shortWorker + '</a></td>' +
+                const expanded = expandedSessions.has(s.session_id);
+                const arrow = expanded ? '&#9660;' : '&#9654;';
+                html += '<tr class="expandable" onclick="toggleSession(\'' + s.session_id + '\')">' +
+                    '<td>' + arrow + ' ' + s.session_id.substring(0, 8) + '</td>' +
+                    '<td><a class="worker-link" href="/miner/' + encodeURIComponent(addr) + '" title="' + s.worker_name + '" onclick="event.stopPropagation()">' + shortWorker + '</a></td>' +
                     '<td>' + s.peer_addr.split(':')[0] + '</td>' +
                     '<td>' + s.local_port + '</td>' +
                     '<td class="' + diffClass + '">' + formatDifficulty(s.difficulty) + '</td>' +
@@ -299,7 +318,19 @@ async function fetchSessions() {
                     '<td>' + s.window_elapsed_secs.toFixed(1) + '</td>' +
                     '<td style="color:' + ratioColor + '">' + s.smoothed_ratio.toFixed(2) + '</td>' +
                     '</tr>';
-            }).join('');
+                if (expanded && s.diff_history && s.diff_history.length > 0) {
+                    html += '<tr class="detail-row"><td colspan="10"><div class="detail-cell">' +
+                        '<canvas id="chart-' + s.session_id + '"></canvas></div></td></tr>';
+                }
+            }
+            tbody.innerHTML = html;
+
+            // Render charts for expanded sessions
+            for (const s of sessions) {
+                if (expandedSessions.has(s.session_id) && s.diff_history && s.diff_history.length > 0) {
+                    renderDiffChart(s.session_id, s.diff_history);
+                }
+            }
         }
 
         // Clean stale diffs
@@ -312,6 +343,70 @@ async function fetchSessions() {
     } catch(e) {
         console.error('Failed to fetch sessions:', e);
     }
+}
+
+function toggleSession(sid) {
+    if (expandedSessions.has(sid)) {
+        expandedSessions.delete(sid);
+        if (sessionCharts[sid]) { sessionCharts[sid].destroy(); delete sessionCharts[sid]; }
+    } else {
+        expandedSessions.add(sid);
+    }
+    fetchSessions();
+}
+
+function renderDiffChart(sid, history) {
+    const el = document.getElementById('chart-' + sid);
+    if (!el) return;
+    if (sessionCharts[sid]) { sessionCharts[sid].destroy(); }
+    sessionCharts[sid] = new Chart(el, {
+        type: 'line',
+        data: {
+            labels: history.map(h => formatDuration(h.secs_since_connect)),
+            datasets: [{
+                label: 'Difficulty',
+                data: history.map(h => h.difficulty),
+                borderColor: '#f4b728',
+                borderWidth: 1.5,
+                fill: false,
+                pointRadius: 2,
+                pointBackgroundColor: '#f4b728',
+                tension: 0.2,
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    backgroundColor: '#1a1a1a',
+                    titleColor: '#888',
+                    bodyColor: '#ccc',
+                    borderColor: '#333',
+                    borderWidth: 1,
+                    callbacks: {
+                        label: (ctx) => 'Diff: ' + formatDifficulty(ctx.parsed.y)
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    display: true,
+                    grid: { color: '#1a1a1a' },
+                    ticks: { color: '#333', font: { size: 9 }, maxTicksLimit: 10 }
+                },
+                y: {
+                    display: true,
+                    grid: { color: '#1a1a1a' },
+                    ticks: { color: '#333', font: { size: 9 },
+                        callback: (v) => formatDifficulty(v)
+                    }
+                }
+            },
+            animation: { duration: 0 }
+        }
+    });
 }
 
 document.addEventListener('DOMContentLoaded', () => {

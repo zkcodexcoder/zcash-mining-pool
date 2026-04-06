@@ -52,6 +52,9 @@ enum RateStatus {
     Reject,
 }
 
+/// Max difficulty adjustments to keep per session.
+const MAX_DIFF_HISTORY: usize = 50;
+
 /// Per-session state: vardiff tracker + current target + rate limiter.
 struct SessionDifficulty {
     vardiff: VardiffTracker,
@@ -64,6 +67,15 @@ struct SessionDifficulty {
     peer_addr: String,
     connected_at: Instant,
     local_port: u16,
+    /// Recent difficulty adjustments (newest last).
+    diff_history: Vec<DiffAdjustment>,
+}
+
+/// A single difficulty adjustment event.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffAdjustment {
+    pub secs_since_connect: u64,
+    pub difficulty: f64,
 }
 
 /// Snapshot of a live session for the debugging page.
@@ -79,6 +91,7 @@ pub struct SessionSnapshot {
     pub shares_in_window: u32,
     pub smoothed_ratio: f64,
     pub window_elapsed_secs: f64,
+    pub diff_history: Vec<DiffAdjustment>,
 }
 
 pub struct ShareValidator {
@@ -305,6 +318,7 @@ impl ShareValidator {
                             peer_addr: addr.to_string(),
                             connected_at: Instant::now(),
                             local_port,
+                            diff_history: Vec::new(),
                         });
                     }
                     let difficulty = initial_diff.unwrap_or(self.vardiff_config.initial_difficulty);
@@ -402,6 +416,14 @@ impl ShareValidator {
                 let mut sessions = self.session_difficulty.write().await;
                 if let Some(sd) = sessions.get_mut(session_id) {
                     sd.target = new_target;
+                    let entry = DiffAdjustment {
+                        secs_since_connect: sd.connected_at.elapsed().as_secs(),
+                        difficulty: diff,
+                    };
+                    sd.diff_history.push(entry);
+                    if sd.diff_history.len() > MAX_DIFF_HISTORY {
+                        sd.diff_history.remove(0);
+                    }
                 }
             }
             info!(%session_id, difficulty = diff, target = %target_hex, "Vardiff retarget");
@@ -442,6 +464,7 @@ impl ShareValidator {
                 shares_in_window: sd.vardiff.shares_in_window(),
                 smoothed_ratio: sd.vardiff.smoothed_ratio(),
                 window_elapsed_secs: elapsed,
+                diff_history: sd.diff_history.clone(),
             }
         }).collect()
     }
