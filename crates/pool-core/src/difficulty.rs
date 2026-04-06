@@ -80,19 +80,22 @@ impl VardiffTracker {
                 .clamp(self.min_difficulty, self.max_difficulty)
         } else {
             // STEADY-STATE: use EMA to smooth out variance.
-            // Alpha = 0.3 means ~30% weight on new sample, 70% on history.
-            let alpha = 0.3;
+            // Alpha = 0.15 means ~15% weight on new sample, 85% on history.
+            // Low alpha prevents high-hashrate miners from oscillating due to
+            // natural variance in share timing.
+            let alpha = 0.15;
             self.smoothed_ratio = alpha * ratio + (1.0 - alpha) * self.smoothed_ratio;
 
-            // Dead zone: if smoothed ratio is between 0.8 and 1.2, don't change.
-            if self.smoothed_ratio > 0.8 && self.smoothed_ratio < 1.2 {
+            // Dead zone: if smoothed ratio is between 0.6 and 1.5, don't change.
+            // Wide zone lets difficulty settle rather than chasing noise.
+            if self.smoothed_ratio > 0.6 && self.smoothed_ratio < 1.5 {
                 self.shares_in_window = 0;
                 self.window_start = Instant::now();
                 return None;
             }
 
-            // Gentle clamp: max 1.5x up, 0.67x down per interval.
-            let adjustment = self.smoothed_ratio.clamp(0.67, 1.5);
+            // Gentle clamp: max 1.25x up, 0.8x down per interval.
+            let adjustment = self.smoothed_ratio.clamp(0.8, 1.25);
             (self.current_difficulty * adjustment)
                 .clamp(self.min_difficulty, self.max_difficulty)
         };
