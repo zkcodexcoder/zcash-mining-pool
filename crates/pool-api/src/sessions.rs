@@ -286,6 +286,12 @@ async function fetchSessions() {
         } else {
             // Sort by difficulty descending
             sessions.sort((a, b) => b.difficulty - a.difficulty);
+            // Destroy all existing charts before rebuilding DOM
+            for (const sid of Object.keys(sessionCharts)) {
+                try { sessionCharts[sid].destroy(); } catch(e) {}
+                delete sessionCharts[sid];
+            }
+
             let html = '';
             for (const s of sessions) {
                 const prev = prevDiffs[s.session_id];
@@ -358,7 +364,6 @@ function toggleSession(sid) {
 function renderDiffChart(sid, history) {
     const el = document.getElementById('chart-' + sid);
     if (!el) return;
-    if (sessionCharts[sid]) { sessionCharts[sid].destroy(); }
     sessionCharts[sid] = new Chart(el, {
         type: 'line',
         data: {
