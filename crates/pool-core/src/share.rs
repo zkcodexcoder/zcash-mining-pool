@@ -451,8 +451,11 @@ impl ShareValidator {
         let sessions = self.session_difficulty.read().await;
         sessions.iter().map(|(sid, sd)| {
             let elapsed = sd.vardiff.window_elapsed_secs().max(0.01);
-            let spm = (sd.vardiff.shares_in_window() as f64 / elapsed) * 60.0;
-            let hashrate = (spm / 60.0) * sd.vardiff.current_difficulty() * self.difficulty_multiplier;
+            // Estimate hashrate from difficulty and target share rate.
+            // At the correct difficulty, miner produces target_spm shares/min.
+            let hashrate = sd.vardiff.current_difficulty()
+                * (self.vardiff_config.target_shares_per_minute / 60.0)
+                * self.difficulty_multiplier;
             SessionSnapshot {
                 session_id: sid.clone(),
                 worker_name: sd.worker_name.clone(),
