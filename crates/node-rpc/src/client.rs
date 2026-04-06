@@ -66,7 +66,7 @@ impl ZcashRpcClient {
     ) -> Result<T, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = JsonRpcRequest {
-            jsonrpc: "1.0",
+            jsonrpc: "2.0",
             id,
             method,
             params,
