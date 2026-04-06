@@ -23,6 +23,9 @@ pub struct SessionSnapshot {
     pub shares_per_min: f64,
     pub smoothed_ratio: f64,
     #[serde(default)]
+    pub retargets: usize,
+    pub last_retarget_secs: Option<u64>,
+    #[serde(default)]
     pub diff_history: Vec<DiffAdjustment>,
 }
 
@@ -203,6 +206,8 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
                     <th>Hashrate</th>
                     <th>Connected</th>
                     <th>Shares/Min</th>
+                    <th>Retargets</th>
+                    <th>Last Retarget</th>
                     <th>Ratio</th>
                 </tr>
             </thead>
@@ -281,7 +286,7 @@ async function fetchSessions() {
 
         const tbody = document.getElementById('session-body');
         if (sessions.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#333;padding:2rem">No active sessions</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#333;padding:2rem">No active sessions</td></tr>';
         } else {
             // Sort by difficulty descending
             sessions.sort((a, b) => b.difficulty - a.difficulty);
@@ -320,14 +325,16 @@ async function fetchSessions() {
                     '<td>' + formatHashrate(s.hashrate) + '</td>' +
                     '<td>' + formatDuration(s.connected_secs) + '</td>' +
                     '<td>' + s.shares_per_min.toFixed(1) + '</td>' +
+                    '<td>' + s.retargets + '</td>' +
+                    '<td>' + (s.last_retarget_secs != null ? formatDuration(s.last_retarget_secs) + ' ago' : '<span style="color:#333">--</span>') + '</td>' +
                     '<td style="color:' + ratioColor + '">' + s.smoothed_ratio.toFixed(2) + '</td>' +
                     '</tr>';
                 if (expanded) {
                     if (s.diff_history && s.diff_history.length > 1) {
-                        html += '<tr class="detail-row"><td colspan="9"><div class="detail-cell">' +
+                        html += '<tr class="detail-row"><td colspan="11"><div class="detail-cell">' +
                             '<canvas id="chart-' + s.session_id + '"></canvas></div></td></tr>';
                     } else {
-                        html += '<tr class="detail-row"><td colspan="9"><div class="detail-cell" style="color:#333;font-size:0.75rem;text-align:center;padding:1rem">' +
+                        html += '<tr class="detail-row"><td colspan="11"><div class="detail-cell" style="color:#333;font-size:0.75rem;text-align:center;padding:1rem">' +
                             'No difficulty adjustments — steady state since connect</div></td></tr>';
                     }
                 }

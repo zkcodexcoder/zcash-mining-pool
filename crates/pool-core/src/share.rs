@@ -90,6 +90,8 @@ pub struct SessionSnapshot {
     pub connected_secs: u64,
     pub shares_per_min: f64,
     pub smoothed_ratio: f64,
+    pub retargets: usize,
+    pub last_retarget_secs: Option<u64>,
     pub diff_history: Vec<DiffAdjustment>,
 }
 
@@ -475,6 +477,13 @@ impl ShareValidator {
                 connected_secs: sd.connected_at.elapsed().as_secs(),
                 shares_per_min: (sd.vardiff.shares_in_window() as f64 / elapsed) * 60.0,
                 smoothed_ratio: sd.vardiff.smoothed_ratio(),
+                retargets: sd.diff_history.len().saturating_sub(1), // exclude initial
+                last_retarget_secs: if sd.diff_history.len() > 1 {
+                    let last = sd.diff_history.last().unwrap();
+                    Some(sd.connected_at.elapsed().as_secs() - last.secs_since_connect)
+                } else {
+                    None
+                },
                 diff_history: sd.diff_history.clone(),
             }
         }).collect()
