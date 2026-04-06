@@ -31,9 +31,6 @@ pub struct VardiffConfig {
     pub retarget_interval_secs: f64,
 }
 
-/// Shares/sec above which vardiff is frozen (miner is close enough, avoid oscillation).
-const STABLE_RATE_MIN: f64 = 20.0;
-
 /// Shares/sec threshold that triggers an immediate vardiff retarget.
 const VARDIFF_TRIGGER_RATE: f64 = 100.0;
 
@@ -42,10 +39,8 @@ const MAX_SHARES_PER_SEC: f64 = 500.0;
 
 /// Result of per-share rate check.
 enum RateStatus {
-    /// Below STABLE_RATE_MIN — normal vardiff processing.
+    /// Below VARDIFF_TRIGGER_RATE — normal processing.
     Ok,
-    /// Between STABLE_RATE_MIN and VARDIFF_TRIGGER_RATE — accept, skip all vardiff.
-    Stable,
     /// Between VARDIFF_TRIGGER_RATE and MAX_SHARES_PER_SEC — accept but force retarget.
     Warn,
     /// Above MAX_SHARES_PER_SEC — reject share.
@@ -225,7 +220,6 @@ impl ShareValidator {
                         self.force_retarget_session(&session_id).await;
                         continue;
                     }
-                    let skip_vardiff = matches!(rate_status, RateStatus::Stable);
                     let force_retarget = matches!(rate_status, RateStatus::Warn);
                     if force_retarget {
                         self.rate_warn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -260,7 +254,7 @@ impl ShareValidator {
                             // Check vardiff retarget after accepted share
                             if force_retarget {
                                 self.force_retarget_session(&session_id).await;
-                            } else if !skip_vardiff {
+                            } else {
                                 self.maybe_retarget(&session_id).await;
                             }
                         }
@@ -381,8 +375,6 @@ impl ShareValidator {
                     RateStatus::Reject
                 } else if rate > VARDIFF_TRIGGER_RATE {
                     RateStatus::Warn
-                } else if rate > STABLE_RATE_MIN {
-                    RateStatus::Stable
                 } else {
                     RateStatus::Ok
                 }

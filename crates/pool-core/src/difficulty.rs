@@ -70,6 +70,15 @@ impl VardiffTracker {
     fn compute_retarget(&mut self) -> Option<f64> {
         let elapsed = self.window_start.elapsed().as_secs_f64();
         let shares_per_minute = (self.shares_in_window as f64 / elapsed.max(0.01)) * 60.0;
+
+        // Stable zone: if miner is producing 20-100 shares/min, don't adjust.
+        // This prevents oscillation once difficulty is in the right ballpark.
+        if shares_per_minute >= 20.0 && shares_per_minute <= 100.0 {
+            self.shares_in_window = 0;
+            self.window_start = Instant::now();
+            return None;
+        }
+
         let ratio = shares_per_minute / self.target_shares_per_minute;
 
         let new_difficulty = if ratio > 4.0 || ratio < 0.25 {
