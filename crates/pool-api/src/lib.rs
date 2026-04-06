@@ -4,6 +4,7 @@ pub mod handlers;
 pub mod network;
 pub mod previews;
 pub mod routes;
+pub mod sessions;
 
 pub use admin::AdminState;
 pub use handlers::{ApiState, AppState, StatsHistory, StratumPortInfo, compute_stats_snapshot};

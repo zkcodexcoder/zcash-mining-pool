@@ -8,6 +8,7 @@ use crate::diagnostics;
 use crate::handlers::*;
 use crate::network;
 use crate::previews;
+use crate::sessions;
 
 /// Build the full API router.
 pub fn build_router(state: AppState) -> Router {
@@ -25,13 +26,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/network/blocks", get(network::get_network_blocks))
         .route("/health", get(get_health))
         .route("/api/miner/{address}/diagnostics", get(diagnostics::get_miner_diagnostics))
-        .route("/api/pool/info", get(get_pool_info));
+        .route("/api/pool/info", get(get_pool_info))
+        .route("/api/sessions", get(sessions::get_sessions));
 
     Router::new()
         .merge(api)
         .route("/", get(dashboard))
         .route("/miner/{address}", get(diagnostics::miner_page))
         .route("/network", get(network::network_page))
+        .route("/sessions", get(sessions::sessions_page))
         .route("/zallet", get(zallet_dashboard))
         .route("/preview1", get(previews::preview1))
         .route("/preview2", get(previews::preview2))

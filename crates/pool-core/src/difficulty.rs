@@ -110,6 +110,18 @@ impl VardiffTracker {
     pub fn current_difficulty(&self) -> f64 {
         self.current_difficulty
     }
+
+    pub fn shares_in_window(&self) -> u32 {
+        self.shares_in_window
+    }
+
+    pub fn smoothed_ratio(&self) -> f64 {
+        self.smoothed_ratio
+    }
+
+    pub fn window_elapsed_secs(&self) -> f64 {
+        self.window_start.elapsed().as_secs_f64()
+    }
 }
 
 /// Convert a difficulty value to a 256-bit target (big-endian hex string).

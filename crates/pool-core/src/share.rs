@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use pool_db::PoolDb;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use stratum::messages::StratumError;
 use stratum::server::{StratumEvent, StratumServer};
@@ -58,6 +59,26 @@ struct SessionDifficulty {
     /// Tracks share submissions for rate limiting.
     rate_window_start: Instant,
     rate_window_shares: u32,
+    /// Metadata for live debugging.
+    worker_name: String,
+    peer_addr: String,
+    connected_at: Instant,
+    local_port: u16,
+}
+
+/// Snapshot of a live session for the debugging page.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    pub worker_name: String,
+    pub peer_addr: String,
+    pub local_port: u16,
+    pub difficulty: f64,
+    pub hashrate: f64,
+    pub connected_secs: u64,
+    pub shares_in_window: u32,
+    pub smoothed_ratio: f64,
+    pub window_elapsed_secs: f64,
 }
 
 pub struct ShareValidator {
@@ -150,7 +171,20 @@ impl ShareValidator {
             self.vardiff_config.retarget_interval_secs,
         );
 
-        while let Some(event) = event_rx.recv().await {
+        let mut snapshot_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        snapshot_interval.tick().await; // consume the immediate first tick
+
+        loop {
+            let event = tokio::select! {
+                ev = event_rx.recv() => match ev {
+                    Some(e) => e,
+                    None => break,
+                },
+                _ = snapshot_interval.tick() => {
+                    self.write_session_snapshots().await;
+                    continue;
+                }
+            };
             match event {
                 StratumEvent::ShareSubmitted {
                     session_id,
@@ -267,6 +301,10 @@ impl ShareValidator {
                             target,
                             rate_window_start: Instant::now(),
                             rate_window_shares: 0,
+                            worker_name: worker_name.clone(),
+                            peer_addr: addr.to_string(),
+                            connected_at: Instant::now(),
+                            local_port,
                         });
                     }
                     let difficulty = initial_diff.unwrap_or(self.vardiff_config.initial_difficulty);
@@ -383,6 +421,41 @@ impl ShareValidator {
                     target: target_hex,
                 })
                 .await;
+        }
+    }
+
+    /// Build snapshots of all active sessions for the live debugging page.
+    async fn build_session_snapshots(&self) -> Vec<SessionSnapshot> {
+        let sessions = self.session_difficulty.read().await;
+        sessions.iter().map(|(sid, sd)| {
+            let elapsed = sd.vardiff.window_elapsed_secs().max(0.01);
+            let spm = (sd.vardiff.shares_in_window() as f64 / elapsed) * 60.0;
+            let hashrate = (spm / 60.0) * sd.vardiff.current_difficulty() * self.difficulty_multiplier;
+            SessionSnapshot {
+                session_id: sid.clone(),
+                worker_name: sd.worker_name.clone(),
+                peer_addr: sd.peer_addr.clone(),
+                local_port: sd.local_port,
+                difficulty: sd.vardiff.current_difficulty(),
+                hashrate,
+                connected_secs: sd.connected_at.elapsed().as_secs(),
+                shares_in_window: sd.vardiff.shares_in_window(),
+                smoothed_ratio: sd.vardiff.smoothed_ratio(),
+                window_elapsed_secs: elapsed,
+            }
+        }).collect()
+    }
+
+    /// Write session snapshots to pool_status for the dashboard to read.
+    async fn write_session_snapshots(&self) {
+        let snapshots = self.build_session_snapshots().await;
+        match serde_json::to_string(&snapshots) {
+            Ok(json) => {
+                let _ = self.db.set_pool_status("sessions_snapshot", &json).await;
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to serialize session snapshots");
+            }
         }
     }
 
