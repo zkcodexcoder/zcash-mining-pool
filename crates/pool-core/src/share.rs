@@ -360,12 +360,19 @@ impl ShareValidator {
                         }
                     };
 
+                    // Cap restored difficulty to something reasonable — broken sessions
+                    // can leave absurdly high values in the DB (e.g. 10 billion).
+                    let port_base = self.port_difficulty.get(&local_port).copied()
+                        .unwrap_or(self.vardiff_config.initial_difficulty);
+                    let max_restored = port_base * 1_000_000.0;
+                    let db_difficulty = db_difficulty.map(|d| d.min(max_restored));
+
                     // Priority: password-requested > rapid-reconnect > DB last_difficulty > per-port > default
                     let requested_diff = parse_difficulty_from_password(&password);
                     let initial_diff = requested_diff
                         .or(reconnect_diff)
                         .or(db_difficulty)
-                        .or_else(|| self.port_difficulty.get(&local_port).copied());
+                        .or_else(|| Some(port_base));
                     let (target, tracker) = if let Some(diff) = initial_diff {
                         let source = if requested_diff.is_some() { "password" }
                             else if reconnect_diff.is_some() { "reconnect-escalation" }
