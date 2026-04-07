@@ -302,25 +302,36 @@ impl StratumServer {
 
         match request {
             ClientRequest::Subscribe { id, user_agent, .. } => {
-                info!(%peer_addr, %user_agent, "Miner subscribing");
-                session.subscribed = true;
-                responses.push(ServerMessage::SubscribeResult {
-                    id,
-                    session_id: session.session_id.clone(),
-                    nonce_1: session.nonce_1.clone(),
-                    nonce2_size: self.nonce_allocator.nonce2_size(),
-                });
-                // Send difficulty in both formats so all miners understand it.
-                // Pool-core will send the actual target after authorize.
-                responses.push(ServerMessage::SetDifficulty {
-                    difficulty: 8192.0,
-                });
-                responses.push(ServerMessage::SetTarget {
-                    target: "000042e340f98608c00000000000000000000000000000000000000000000000".to_string(),
-                });
-                let latest = self.latest_notify.read().await;
-                if let Some(ref notify) = *latest {
-                    responses.push(notify.clone());
+                if session.subscribed {
+                    // Duplicate subscribe — reply with same session info but don't reset state.
+                    debug!(%peer_addr, %user_agent, "Duplicate subscribe, replying with existing session");
+                    responses.push(ServerMessage::SubscribeResult {
+                        id,
+                        session_id: session.session_id.clone(),
+                        nonce_1: session.nonce_1.clone(),
+                        nonce2_size: self.nonce_allocator.nonce2_size(),
+                    });
+                } else {
+                    info!(%peer_addr, %user_agent, "Miner subscribing");
+                    session.subscribed = true;
+                    responses.push(ServerMessage::SubscribeResult {
+                        id,
+                        session_id: session.session_id.clone(),
+                        nonce_1: session.nonce_1.clone(),
+                        nonce2_size: self.nonce_allocator.nonce2_size(),
+                    });
+                    // Send difficulty in both formats so all miners understand it.
+                    // Pool-core will send the actual target after authorize.
+                    responses.push(ServerMessage::SetDifficulty {
+                        difficulty: 8192.0,
+                    });
+                    responses.push(ServerMessage::SetTarget {
+                        target: "000042e340f98608c00000000000000000000000000000000000000000000000".to_string(),
+                    });
+                    let latest = self.latest_notify.read().await;
+                    if let Some(ref notify) = *latest {
+                        responses.push(notify.clone());
+                    }
                 }
             }
 

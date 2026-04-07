@@ -138,7 +138,8 @@ impl ClientRequest {
 
         match method {
             "mining.subscribe" => {
-                let arr = arr?;
+                let empty = vec![];
+                let arr = arr.unwrap_or(&empty);
                 Some(ClientRequest::Subscribe {
                     id,
                     user_agent: arr.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),

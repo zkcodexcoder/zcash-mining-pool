@@ -117,6 +117,9 @@ pub struct ShareValidator {
     rate_reject_count: Arc<std::sync::atomic::AtomicU64>,
     /// Maps session_id -> worker_id for persisting difficulty on retarget.
     session_worker_id: RwLock<HashMap<String, i64>>,
+    /// Tracks recent disconnects for rapid-reconnect difficulty escalation.
+    /// Key: worker_name, Value: (disconnect_time, last_difficulty).
+    recent_disconnects: RwLock<HashMap<String, (Instant, f64)>>,
 }
 
 impl ShareValidator {
@@ -155,6 +158,7 @@ impl ShareValidator {
             rate_warn_count,
             rate_reject_count,
             session_worker_id: RwLock::new(HashMap::new()),
+            recent_disconnects: RwLock::new(HashMap::new()),
         }
     }
 
@@ -287,13 +291,33 @@ impl ShareValidator {
                         }
                     };
 
-                    // Priority: password-requested > DB last_difficulty > per-port > default
+                    // Check for rapid reconnect — if this worker disconnected recently
+                    // with a short session, escalate difficulty to prevent connect/disconnect loops.
+                    let reconnect_diff = {
+                        let mut disconnects = self.recent_disconnects.write().await;
+                        if let Some((dc_time, last_diff)) = disconnects.remove(&worker_name) {
+                            if dc_time.elapsed().as_secs() < 120 {
+                                // Double the last difficulty (minimum 1000) to escalate
+                                let escalated = (last_diff * 2.0).max(1000.0);
+                                info!(%worker_name, last_diff, escalated, "Rapid reconnect detected, escalating difficulty");
+                                Some(escalated)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    // Priority: password-requested > rapid-reconnect > DB last_difficulty > per-port > default
                     let requested_diff = parse_difficulty_from_password(&password);
                     let initial_diff = requested_diff
+                        .or(reconnect_diff)
                         .or(db_difficulty)
                         .or_else(|| self.port_difficulty.get(&local_port).copied());
                     let (target, tracker) = if let Some(diff) = initial_diff {
                         let source = if requested_diff.is_some() { "password" }
+                            else if reconnect_diff.is_some() { "reconnect-escalation" }
                             else if db_difficulty.is_some() { "restored" }
                             else { "port" };
                         info!(%session_id, difficulty = diff, port = local_port, source, "Using initial difficulty");
@@ -347,6 +371,16 @@ impl ShareValidator {
                 }
                 StratumEvent::SessionDisconnected { session_id } => {
                     debug!(%session_id, "Session disconnected");
+                    // Record disconnect for rapid-reconnect detection
+                    if let Some(sd) = self.session_difficulty.read().await.get(&session_id) {
+                        let diff = sd.vardiff.current_difficulty();
+                        let connected_secs = sd.connected_at.elapsed().as_secs();
+                        let worker = sd.worker_name.clone();
+                        // Only track if session was short (< 30s) — likely a failed start
+                        if connected_secs < 30 {
+                            self.recent_disconnects.write().await.insert(worker, (Instant::now(), diff));
+                        }
+                    }
                     self.session_difficulty.write().await.remove(&session_id);
                     self.session_worker_id.write().await.remove(&session_id);
                 }
