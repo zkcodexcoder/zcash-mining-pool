@@ -360,12 +360,13 @@ impl ShareValidator {
                         }
                     };
 
-                    // Cap restored difficulty — broken sessions can leave absurdly
-                    // high values in the DB. Let vardiff ramp up from a sane start.
+                    // Don't restore difficulty from DB — always start at the port's
+                    // base difficulty and let vardiff ramp up. Restored values caused
+                    // loops where broken sessions saved high difficulty, and miners
+                    // that don't honor set_difficulty get permanently stuck.
                     let port_base = self.port_difficulty.get(&local_port).copied()
                         .unwrap_or(self.vardiff_config.initial_difficulty);
-                    let max_restored = port_base * 100.0;
-                    let db_difficulty = db_difficulty.map(|d| d.min(max_restored));
+                    let db_difficulty: Option<f64> = None;
 
                     // Priority: password-requested > rapid-reconnect > DB last_difficulty > per-port > default
                     let requested_diff = parse_difficulty_from_password(&password);
