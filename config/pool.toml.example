@@ -37,7 +37,7 @@ rpc_url = "http://127.0.0.1:18232"
 [difficulty]
 initial_target = "0800000000000000000000000000000000000000000000000000000000000000"
 # Target shares per minute from each miner (vardiff adjusts difficulty to maintain this rate)
-target_shares_per_minute = 20.0
+target_shares_per_minute = 40.0
 retarget_interval_secs = 30
 
 # PPLNS settings require a pool restart.
