@@ -270,6 +270,10 @@ impl ShareValidator {
                                     id: request_id, accepted: false, error: Some(e),
                                 })
                                 .await;
+                            // Retarget on rejected shares too — if difficulty is too
+                            // high, all shares get rejected and without this, vardiff
+                            // never gets called to bring it back down.
+                            self.maybe_retarget(&session_id).await;
                         }
                     }
                 }
@@ -297,8 +301,8 @@ impl ShareValidator {
                         let mut disconnects = self.recent_disconnects.write().await;
                         if let Some((dc_time, last_diff)) = disconnects.remove(&worker_name) {
                             if dc_time.elapsed().as_secs() < 120 {
-                                // Double the last difficulty (minimum 1000) to escalate
-                                let escalated = (last_diff * 2.0).max(1000.0);
+                                // Double the last difficulty to discourage connect/disconnect loops
+                                let escalated = last_diff * 2.0;
                                 info!(%worker_name, last_diff, escalated, "Rapid reconnect detected, escalating difficulty");
                                 Some(escalated)
                             } else {
