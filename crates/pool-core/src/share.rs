@@ -57,6 +57,8 @@ struct SessionDifficulty {
     /// Tracks share submissions for rate limiting.
     rate_window_start: Instant,
     rate_window_shares: u32,
+    /// Consecutive low-difficulty rejection count for this session.
+    low_diff_streak: u32,
     /// Metadata for live debugging.
     worker_name: String,
     peer_addr: String,
@@ -249,6 +251,13 @@ impl ShareValidator {
                                 debug!(worker = %worker_name, job = %job_id, "Share accepted");
                             }
                             self.shares_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // Reset low-diff streak on accepted share
+                            {
+                                let mut sessions = self.session_difficulty.write().await;
+                                if let Some(sd) = sessions.get_mut(&session_id) {
+                                    sd.low_diff_streak = 0;
+                                }
+                            }
                             self.stratum
                                 .send_to_session(&session_id, ServerMessage::SubmitResult {
                                     id: request_id, accepted: true, error: None,
@@ -264,16 +273,54 @@ impl ShareValidator {
                         }
                         Err(e) => {
                             self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let is_low_diff = e.is_low_difficulty();
                             warn!(worker = %worker_name, error = %e, "Share rejected");
                             self.stratum
                                 .send_to_session(&session_id, ServerMessage::SubmitResult {
                                     id: request_id, accepted: false, error: Some(e),
                                 })
                                 .await;
-                            // Retarget on rejected shares too — if difficulty is too
-                            // high, all shares get rejected and without this, vardiff
-                            // never gets called to bring it back down.
-                            self.maybe_retarget(&session_id).await;
+                            // If difficulty is too high, miner can only submit
+                            // low-difficulty shares. Reset to minimum so vardiff
+                            // can ramp up from scratch.
+                            if is_low_diff {
+                                let mut sessions = self.session_difficulty.write().await;
+                                if let Some(sd) = sessions.get_mut(&session_id) {
+                                    sd.low_diff_streak += 1;
+                                    if sd.low_diff_streak >= 10 {
+                                        let new_diff = self.vardiff_config.initial_difficulty;
+                                        info!(%session_id, old_diff = sd.vardiff.current_difficulty(),
+                                            new_diff, streak = sd.low_diff_streak,
+                                            "Resetting difficulty after low-diff rejection streak");
+                                        sd.low_diff_streak = 0;
+                                        drop(sessions);
+                                        let (target, tracker) = self.make_target_for_difficulty(new_diff);
+                                        let target_hex = hex::encode(target);
+                                        {
+                                            let mut sessions = self.session_difficulty.write().await;
+                                            if let Some(sd) = sessions.get_mut(&session_id) {
+                                                sd.vardiff = tracker;
+                                                sd.target = target;
+                                                sd.diff_history.push(DiffAdjustment {
+                                                    secs_since_connect: sd.connected_at.elapsed().as_secs(),
+                                                    difficulty: new_diff,
+                                                });
+                                                if sd.diff_history.len() > MAX_DIFF_HISTORY {
+                                                    sd.diff_history.remove(0);
+                                                }
+                                            }
+                                        }
+                                        self.stratum
+                                            .send_to_session(&session_id, ServerMessage::SetDifficulty {
+                                                difficulty: new_diff,
+                                            }).await;
+                                        self.stratum
+                                            .send_to_session(&session_id, ServerMessage::SetTarget {
+                                                target: target_hex,
+                                            }).await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -337,6 +384,7 @@ impl ShareValidator {
                             target,
                             rate_window_start: Instant::now(),
                             rate_window_shares: 0,
+                            low_diff_streak: 0,
                             worker_name: worker_name.clone(),
                             peer_addr: addr.to_string(),
                             connected_at: Instant::now(),

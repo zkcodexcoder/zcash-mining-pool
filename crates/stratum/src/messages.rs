@@ -120,6 +120,9 @@ impl StratumError {
     pub fn low_difficulty() -> Self {
         Self { code: 23, message: "Low difficulty share".to_string(), traceback: None }
     }
+    pub fn is_low_difficulty(&self) -> bool {
+        self.code == 23
+    }
     pub fn unauthorized() -> Self {
         Self { code: 24, message: "Unauthorized worker".to_string(), traceback: None }
     }
