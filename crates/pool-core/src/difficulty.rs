@@ -18,6 +18,9 @@ pub struct VardiffTracker {
     max_difficulty: f64,
     /// Smoothed ratio (EMA) for steady-state dampening.
     smoothed_ratio: f64,
+    /// Track last retarget direction to detect oscillation.
+    /// true = last retarget went up, false = went down, None = no retarget yet.
+    last_went_up: Option<bool>,
 }
 
 impl VardiffTracker {
@@ -36,11 +39,12 @@ impl VardiffTracker {
             // 10 billion — enough for miners up to ~1 TH/s
             max_difficulty: 10_000_000_000.0,
             smoothed_ratio: 1.0,
+            last_went_up: None,
         }
     }
 
-    /// Record a share submission. Returns Some(new_difficulty) if a retarget is needed.
-    pub fn record_share(&mut self) -> Option<f64> {
+    /// Record a share submission. Returns Some((new_difficulty, reason)) if a retarget is needed.
+    pub fn record_share(&mut self) -> Option<(f64, String)> {
         self.shares_in_window += 1;
 
         let elapsed = self.window_start.elapsed().as_secs_f64();
@@ -56,18 +60,18 @@ impl VardiffTracker {
             return None;
         }
 
-        self.compute_retarget()
+        self.compute_retarget(if early_trigger { "early-trigger" } else { "interval" })
     }
 
     /// Force an immediate retarget, bypassing the interval and early-trigger gates.
     /// Called when the rate limiter detects a miner submitting too fast.
-    pub fn force_retarget(&mut self) -> Option<f64> {
+    pub fn force_retarget(&mut self) -> Option<(f64, String)> {
         self.shares_in_window += 1;
-        self.compute_retarget()
+        self.compute_retarget("rate-limit")
     }
 
     /// Shared retarget calculation used by both `record_share` and `force_retarget`.
-    fn compute_retarget(&mut self) -> Option<f64> {
+    fn compute_retarget(&mut self, trigger: &str) -> Option<(f64, String)> {
         let elapsed = self.window_start.elapsed().as_secs_f64();
         let shares_per_minute = (self.shares_in_window as f64 / elapsed.max(0.01)) * 60.0;
 
@@ -82,12 +86,18 @@ impl VardiffTracker {
 
         let ratio = shares_per_minute / self.target_shares_per_minute;
 
-        let new_difficulty = if ratio > 4.0 || ratio < 0.25 {
-            // RAMP-UP: way off target, jump directly to the right difficulty.
-            // No artificial cap — if we see 360x, set 360x immediately.
+        // Clamp the ratio to max 2x up / 0.5x down per retarget to prevent
+        // overshoot oscillation. Converges in a few steps instead of jumping
+        // the full ratio and swinging back.
+        let clamped_ratio = ratio.clamp(0.5, 2.0);
+
+        let (new_difficulty, phase) = if ratio > 4.0 || ratio < 0.25 {
+            // RAMP-UP: far off target, use clamped ratio to step toward
+            // the right difficulty without overshooting.
             self.smoothed_ratio = 1.0; // reset EMA after big jump
-            (self.current_difficulty * ratio)
-                .clamp(self.min_difficulty, self.max_difficulty)
+            let d = (self.current_difficulty * clamped_ratio)
+                .clamp(self.min_difficulty, self.max_difficulty);
+            (d, "ramp")
         } else {
             // STEADY-STATE: use EMA to smooth out variance.
             // Alpha = 0.15 means ~15% weight on new sample, 85% on history.
@@ -106,15 +116,35 @@ impl VardiffTracker {
 
             // Gentle clamp: max 1.25x up, 0.8x down per interval.
             let adjustment = self.smoothed_ratio.clamp(0.8, 1.25);
-            (self.current_difficulty * adjustment)
-                .clamp(self.min_difficulty, self.max_difficulty)
+            let d = (self.current_difficulty * adjustment)
+                .clamp(self.min_difficulty, self.max_difficulty);
+            (d, "ema")
         };
 
-        self.current_difficulty = new_difficulty;
+        let going_up = new_difficulty > self.current_difficulty;
+
+        // Oscillation detection: if we're reversing direction, take the
+        // midpoint instead of overshooting past the sweet spot again.
+        let (final_difficulty, phase) = if let Some(last_up) = self.last_went_up {
+            if last_up != going_up {
+                let mid = (self.current_difficulty + new_difficulty) / 2.0;
+                (mid, format!("{phase}→mid"))
+            } else {
+                (new_difficulty, phase.to_string())
+            }
+        } else {
+            (new_difficulty, phase.to_string())
+        };
+
+        let direction = if final_difficulty > self.current_difficulty { "up" } else { "down" };
+        let reason = format!("{} {} ({:.1} spm, ratio {:.2})", trigger, phase, shares_per_minute, ratio);
+
+        self.last_went_up = Some(final_difficulty > self.current_difficulty);
+        self.current_difficulty = final_difficulty;
         self.shares_in_window = 0;
         self.window_start = Instant::now();
 
-        Some(new_difficulty)
+        Some((final_difficulty, format!("{direction}: {reason}")))
     }
 
     pub fn current_difficulty(&self) -> f64 {

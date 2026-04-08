@@ -8,6 +8,8 @@ use crate::handlers::AppState;
 pub struct DiffAdjustment {
     pub secs_since_connect: u64,
     pub difficulty: f64,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -331,8 +333,26 @@ async function fetchSessions() {
                     '</tr>';
                 if (expanded) {
                     if (s.diff_history && s.diff_history.length > 1) {
-                        html += '<tr class="detail-row"><td colspan="11"><div class="detail-cell">' +
-                            '<canvas id="chart-' + s.session_id + '"></canvas></div></td></tr>';
+                        html += '<tr class="detail-row"><td colspan="11"><div class="detail-cell" style="display:flex;gap:1rem;align-items:flex-start">' +
+                            '<div style="flex:1;min-width:0"><canvas id="chart-' + s.session_id + '"></canvas></div>' +
+                            '<div style="flex:1;max-height:200px;overflow-y:auto">' +
+                            '<table style="width:100%;font-size:0.7rem;border-collapse:collapse">' +
+                            '<thead><tr style="color:#555;border-bottom:1px solid #222">' +
+                            '<th style="text-align:left;padding:2px 6px">Time</th>' +
+                            '<th style="text-align:right;padding:2px 6px">Difficulty</th>' +
+                            '<th style="text-align:left;padding:2px 6px">Reason</th></tr></thead><tbody>';
+                        for (let i = s.diff_history.length - 1; i >= 0; i--) {
+                            const h = s.diff_history[i];
+                            const reasonColor = (h.reason || '').startsWith('up') ? '#48bb78'
+                                : (h.reason || '').startsWith('down') ? '#fc8181'
+                                : (h.reason || '').startsWith('reset') ? '#f4b728'
+                                : '#888';
+                            html += '<tr style="border-bottom:1px solid #1a1a1a">' +
+                                '<td style="padding:2px 6px;color:#555">' + formatDuration(h.secs_since_connect) + '</td>' +
+                                '<td style="padding:2px 6px;text-align:right;color:#ccc">' + formatDifficulty(h.difficulty) + '</td>' +
+                                '<td style="padding:2px 6px;color:' + reasonColor + '">' + (h.reason || '--') + '</td></tr>';
+                        }
+                        html += '</tbody></table></div></div></td></tr>';
                     } else {
                         html += '<tr class="detail-row"><td colspan="11"><div class="detail-cell" style="color:#333;font-size:0.75rem;text-align:center;padding:1rem">' +
                             'No difficulty adjustments — steady state since connect</div></td></tr>';

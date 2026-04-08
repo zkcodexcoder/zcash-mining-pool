@@ -73,6 +73,8 @@ struct SessionDifficulty {
 pub struct DiffAdjustment {
     pub secs_since_connect: u64,
     pub difficulty: f64,
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// Snapshot of a live session for the debugging page.
@@ -289,8 +291,9 @@ impl ShareValidator {
                                     sd.low_diff_streak += 1;
                                     if sd.low_diff_streak >= 10 {
                                         let new_diff = self.vardiff_config.initial_difficulty;
+                                        let streak = sd.low_diff_streak;
                                         info!(%session_id, old_diff = sd.vardiff.current_difficulty(),
-                                            new_diff, streak = sd.low_diff_streak,
+                                            new_diff, streak,
                                             "Resetting difficulty after low-diff rejection streak");
                                         sd.low_diff_streak = 0;
                                         drop(sessions);
@@ -304,6 +307,7 @@ impl ShareValidator {
                                                 sd.diff_history.push(DiffAdjustment {
                                                     secs_since_connect: sd.connected_at.elapsed().as_secs(),
                                                     difficulty: new_diff,
+                                                    reason: format!("reset: {streak} consecutive low-diff rejects"),
                                                 });
                                                 if sd.diff_history.len() > MAX_DIFF_HISTORY {
                                                     sd.diff_history.remove(0);
@@ -342,47 +346,26 @@ impl ShareValidator {
                         }
                     };
 
-                    // Check for rapid reconnect — if this worker disconnected recently
-                    // with a short session, escalate difficulty to prevent connect/disconnect loops.
-                    let reconnect_diff = {
-                        let mut disconnects = self.recent_disconnects.write().await;
-                        if let Some((dc_time, last_diff)) = disconnects.remove(&worker_name) {
-                            if dc_time.elapsed().as_secs() < 120 {
-                                // Double the last difficulty to discourage connect/disconnect loops
-                                let escalated = last_diff * 2.0;
-                                info!(%worker_name, last_diff, escalated, "Rapid reconnect detected, escalating difficulty");
-                                Some(escalated)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    };
-
                     // Don't restore difficulty from DB — always start at the port's
                     // base difficulty and let vardiff ramp up. Restored values caused
                     // loops where broken sessions saved high difficulty, and miners
                     // that don't honor set_difficulty get permanently stuck.
                     let port_base = self.port_difficulty.get(&local_port).copied()
                         .unwrap_or(self.vardiff_config.initial_difficulty);
-                    let db_difficulty: Option<f64> = None;
 
-                    // Priority: password-requested > rapid-reconnect > DB last_difficulty > per-port > default
+                    // Priority: password-requested > per-port > default
                     let requested_diff = parse_difficulty_from_password(&password);
                     let initial_diff = requested_diff
-                        .or(reconnect_diff)
-                        .or(db_difficulty)
                         .or_else(|| Some(port_base));
-                    let (target, tracker) = if let Some(diff) = initial_diff {
+                    let (target, tracker, init_source) = if let Some(diff) = initial_diff {
                         let source = if requested_diff.is_some() { "password" }
-                            else if reconnect_diff.is_some() { "reconnect-escalation" }
-                            else if db_difficulty.is_some() { "restored" }
                             else { "port" };
                         info!(%session_id, difficulty = diff, port = local_port, source, "Using initial difficulty");
-                        self.make_target_for_difficulty(diff)
+                        let (t, tr) = self.make_target_for_difficulty(diff);
+                        (t, tr, format!("initial: {source}"))
                     } else {
-                        self.make_initial_target()
+                        let (t, tr) = self.make_initial_target();
+                        (t, tr, "initial: default".to_string())
                     };
                     let target_hex = hex::encode(target);
                     {
@@ -408,6 +391,7 @@ impl ShareValidator {
                             sd.diff_history.push(DiffAdjustment {
                                 secs_since_connect: 0,
                                 difficulty,
+                                reason: init_source,
                             });
                         }
                     }
@@ -431,16 +415,6 @@ impl ShareValidator {
                 }
                 StratumEvent::SessionDisconnected { session_id } => {
                     debug!(%session_id, "Session disconnected");
-                    // Record disconnect for rapid-reconnect detection
-                    if let Some(sd) = self.session_difficulty.read().await.get(&session_id) {
-                        let diff = sd.vardiff.current_difficulty();
-                        let connected_secs = sd.connected_at.elapsed().as_secs();
-                        let worker = sd.worker_name.clone();
-                        // Only track if session was short (< 30s) — likely a failed start
-                        if connected_secs < 30 {
-                            self.recent_disconnects.write().await.insert(worker, (Instant::now(), diff));
-                        }
-                    }
                     self.session_difficulty.write().await.remove(&session_id);
                     self.session_worker_id.write().await.remove(&session_id);
                 }
@@ -480,7 +454,7 @@ impl ShareValidator {
 
     /// Check if a session needs retargeting after an accepted share.
     async fn maybe_retarget(&self, session_id: &str) {
-        let new_diff = {
+        let result = {
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
                 sd.vardiff.record_share()
@@ -488,12 +462,14 @@ impl ShareValidator {
                 None
             }
         };
-        self.apply_retarget(session_id, new_diff).await;
+        if let Some((diff, reason)) = result {
+            self.apply_retarget(session_id, diff, &reason).await;
+        }
     }
 
     /// Force an immediate retarget, bypassing the vardiff interval gate.
     async fn force_retarget_session(&self, session_id: &str) {
-        let new_diff = {
+        let result = {
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
                 sd.vardiff.force_retarget()
@@ -501,46 +477,47 @@ impl ShareValidator {
                 None
             }
         };
-        self.apply_retarget(session_id, new_diff).await;
+        if let Some((diff, reason)) = result {
+            self.apply_retarget(session_id, diff, &reason).await;
+        }
     }
 
-    /// Apply a retarget if a new difficulty was computed.
-    async fn apply_retarget(&self, session_id: &str, new_diff: Option<f64>) {
-        if let Some(diff) = new_diff {
-            let target_hex = difficulty_to_target_hex(diff);
-            let new_target = parse_target(&target_hex).unwrap_or(self.default_target);
-            {
-                let mut sessions = self.session_difficulty.write().await;
-                if let Some(sd) = sessions.get_mut(session_id) {
-                    sd.target = new_target;
-                    let entry = DiffAdjustment {
-                        secs_since_connect: sd.connected_at.elapsed().as_secs(),
-                        difficulty: diff,
-                    };
-                    sd.diff_history.push(entry);
-                    if sd.diff_history.len() > MAX_DIFF_HISTORY {
-                        sd.diff_history.remove(0);
-                    }
-                }
-            }
-            info!(%session_id, difficulty = diff, target = %target_hex, "Vardiff retarget");
-            // Persist difficulty to DB for restoration on reconnect
-            if let Some(&worker_id) = self.session_worker_id.read().await.get(session_id) {
-                if let Err(e) = self.db.update_worker_difficulty(worker_id, diff).await {
-                    warn!(error = %e, "Failed to persist worker difficulty");
-                }
-            }
-            self.stratum
-                .send_to_session(session_id, ServerMessage::SetDifficulty {
+    /// Apply a retarget with a reason string for logging/display.
+    async fn apply_retarget(&self, session_id: &str, diff: f64, reason: &str) {
+        let target_hex = difficulty_to_target_hex(diff);
+        let new_target = parse_target(&target_hex).unwrap_or(self.default_target);
+        {
+            let mut sessions = self.session_difficulty.write().await;
+            if let Some(sd) = sessions.get_mut(session_id) {
+                sd.target = new_target;
+                let entry = DiffAdjustment {
+                    secs_since_connect: sd.connected_at.elapsed().as_secs(),
                     difficulty: diff,
-                })
-                .await;
-            self.stratum
-                .send_to_session(session_id, ServerMessage::SetTarget {
-                    target: target_hex,
-                })
-                .await;
+                    reason: reason.to_string(),
+                };
+                sd.diff_history.push(entry);
+                if sd.diff_history.len() > MAX_DIFF_HISTORY {
+                    sd.diff_history.remove(0);
+                }
+            }
         }
+        info!(%session_id, difficulty = diff, target = %target_hex, reason, "Vardiff retarget");
+        // Persist difficulty to DB for restoration on reconnect
+        if let Some(&worker_id) = self.session_worker_id.read().await.get(session_id) {
+            if let Err(e) = self.db.update_worker_difficulty(worker_id, diff).await {
+                warn!(error = %e, "Failed to persist worker difficulty");
+            }
+        }
+        self.stratum
+            .send_to_session(session_id, ServerMessage::SetDifficulty {
+                difficulty: diff,
+            })
+            .await;
+        self.stratum
+            .send_to_session(session_id, ServerMessage::SetTarget {
+                target: target_hex,
+            })
+            .await;
     }
 
     /// Build snapshots of all active sessions for the live debugging page.
