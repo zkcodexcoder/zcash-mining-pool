@@ -940,6 +940,20 @@ async fn process_payouts(
                             continue;
                         }
                     }
+                    // If the error is about a bad address or amount, try removing
+                    // the problematic entries and retry once more.
+                    if retries < 2 && (msg.contains("unknown address") || msg.contains("Invalid amount") || msg.contains("Invalid parameter")) {
+                        warn!(error = %msg, "z_sendmany failed, removing problematic entries and retrying");
+                        // Can't easily identify which address is bad, so halve the batch
+                        // and retry — eventually the bad one gets isolated.
+                        let half = current_list.len() / 2;
+                        if half == 0 {
+                            return Err(anyhow::anyhow!("z_sendmany failed on single entry: {e}"));
+                        }
+                        current_list.truncate(half);
+                        retries += 1;
+                        continue;
+                    }
                     return Err(anyhow::anyhow!("z_sendmany failed: {e}"));
                 }
             }
