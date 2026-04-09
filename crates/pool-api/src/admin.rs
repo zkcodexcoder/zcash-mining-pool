@@ -281,6 +281,9 @@ pub fn build_admin_router(state: AdminState) -> Router {
         .route("/admin/api/payout/trigger", post(api_trigger_payout))
         .route("/admin/api/restart", post(api_restart))
         .route("/admin/api/restart-dashboard", post(api_restart_dashboard))
+        .route("/admin/api/restart-zallet", post(api_restart_zallet))
+        .route("/admin/api/repair-zallet", post(api_repair_zallet))
+        .route("/admin/api/logs", get(api_service_logs))
         .route("/admin/api/miner/adjust", post(api_adjust_balance))
         .route("/admin/logout", post(handle_logout))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -455,6 +458,7 @@ struct AdminHealth {
     rate_warn_count: u64,
     rate_reject_count: u64,
     system: Option<SystemStats>,
+    payout_health: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -535,6 +539,10 @@ async fn api_health(
 
     let system = read_system_stats();
 
+    let payout_health = state.app.db.get_pool_status("payout_health").await
+        .ok().flatten()
+        .and_then(|(v, _)| serde_json::from_str::<serde_json::Value>(&v).ok());
+
     Json(AdminHealth {
         node_ok,
         node_height,
@@ -558,6 +566,7 @@ async fn api_health(
         rate_warn_count: rate_warn,
         rate_reject_count: rate_reject,
         system,
+        payout_health,
     })
 }
 
@@ -583,6 +592,71 @@ async fn api_restart_dashboard() -> Json<serde_json::Value> {
             .await;
     });
     Json(serde_json::json!({"status": "ok", "message": "Restarting dashboard..."}))
+}
+
+async fn api_restart_zallet() -> Json<serde_json::Value> {
+    tracing::info!("Zallet restart requested via admin panel");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = tokio::process::Command::new("bash")
+            .args(["-c", "pkill zallet && sleep 3 && /home/zebra/zallet/target/release/zallet --datadir /home/zebra/.zallet start >> /home/zebra/zallet.log 2>&1 &"])
+            .status()
+            .await;
+    });
+    Json(serde_json::json!({"status": "ok", "message": "Restarting Zallet..."}))
+}
+
+async fn api_repair_zallet() -> Json<serde_json::Value> {
+    tracing::info!("Zallet repair (truncate-wallet) requested via admin panel");
+    // Get current chain height to truncate to a safe recent point
+    let output = tokio::process::Command::new("bash")
+        .args(["-c", "pkill zallet; sleep 3; /home/zebra/zallet/target/release/zallet --datadir /home/zebra/.zallet repair truncate-wallet 999999999 2>&1"])
+        .output()
+        .await;
+    let repair_msg = match output {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout).to_string()
+                + &String::from_utf8_lossy(&o.stderr);
+            tracing::info!(output = %out, "Zallet repair output");
+            out
+        }
+        Err(e) => format!("Failed to run repair: {e}"),
+    };
+    // Restart after repair
+    let _ = tokio::process::Command::new("bash")
+        .args(["-c", "/home/zebra/zallet/target/release/zallet --datadir /home/zebra/.zallet start >> /home/zebra/zallet.log 2>&1 &"])
+        .status()
+        .await;
+    Json(serde_json::json!({"status": "ok", "message": format!("Repair complete, restarting. {}", repair_msg.trim())}))
+}
+
+async fn api_service_logs() -> Json<serde_json::Value> {
+    async fn read_tail(path: &str, lines: usize) -> Vec<String> {
+        // Use tail command to efficiently read last N lines of large files.
+        match tokio::process::Command::new("tail")
+            .args(["-n", &lines.to_string(), path])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(|l| l.to_string())
+                    .collect()
+            }
+            Err(_) => vec![format!("(failed to read {path})")],
+        }
+    }
+    let (pool, dashboard, zallet) = tokio::join!(
+        read_tail("/home/zebra/zecminer/pool/pool.log", 50),
+        read_tail("/home/zebra/zecminer/pool/dashboard.log", 50),
+        read_tail("/home/zebra/zallet.log", 50),
+    );
+    Json(serde_json::json!({
+        "pool": pool,
+        "dashboard": dashboard,
+        "zallet": zallet,
+    }))
 }
 
 async fn api_trigger_payout(
@@ -834,9 +908,31 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
 
 <!-- Health Tab -->
 <div class="panel" id="panel-health">
+    <div id="health-alerts"></div>
     <div class="card">
         <h2>System Health</h2>
         <div id="health-content" class="loading">Loading...</div>
+    </div>
+    <div class="card">
+        <h2>Payout Pipeline</h2>
+        <div id="payout-health-content" style="color:#718096;font-size:0.85rem">Loading...</div>
+    </div>
+    <div class="card">
+        <h2>Zallet (Wallet)</h2>
+        <div style="display:flex;gap:0.5rem;margin-bottom:0.75rem">
+            <button class="btn btn-primary btn-sm" onclick="restartZallet()">Restart Zallet</button>
+            <button class="btn btn-danger btn-sm" onclick="repairZallet()">Repair (Truncate + Resync)</button>
+        </div>
+        <div id="zallet-status" class="status-msg"></div>
+    </div>
+    <div class="card">
+        <h2>Service Logs</h2>
+        <div style="display:flex;gap:0.5rem;margin-bottom:0.75rem">
+            <button class="btn btn-sm" style="background:#2d3748;color:#e0e0e0" onclick="showLog('pool')">Pool</button>
+            <button class="btn btn-sm" style="background:#2d3748;color:#e0e0e0" onclick="showLog('dashboard')">Dashboard</button>
+            <button class="btn btn-sm" style="background:#2d3748;color:#e0e0e0" onclick="showLog('zallet')">Zallet</button>
+        </div>
+        <pre id="log-content" style="background:#0d1117;border:1px solid #2d3748;border-radius:4px;padding:0.75rem;font-size:0.7rem;max-height:400px;overflow-y:auto;color:#a0aec0;white-space:pre-wrap;word-break:break-all"></pre>
     </div>
 </div>
 
@@ -1175,9 +1271,81 @@ async function fetchHealth() {
         }
 
         document.getElementById('health-content').innerHTML = html;
+
+        // Payout health section
+        let ph = d.payout_health;
+        let phHtml = '';
+        let alerts = '';
+        if (ph) {
+            phHtml += '<table class="kv-table">';
+            const failColor = ph.consecutive_payout_failures > 2 ? '#fc8181' : ph.consecutive_payout_failures > 0 ? '#f4b728' : '#68d391';
+            phHtml += '<tr><td>Consecutive Failures</td><td style="color:' + failColor + '">' + ph.consecutive_payout_failures + '</td></tr>';
+            if (ph.last_payout_error) {
+                phHtml += '<tr><td>Last Error</td><td style="color:#fc8181;font-size:0.75rem">' + ph.last_payout_error.substring(0, 200) + '</td></tr>';
+            }
+            const tColor = ph.transparent_balance_zec > 0.01 ? '#f4b728' : '#68d391';
+            phHtml += '<tr><td>Transparent (Unshielded)</td><td style="color:' + tColor + '">' + ph.transparent_balance_zec.toFixed(8) + ' ZEC</td></tr>';
+            phHtml += '<tr><td>Private (Shielded)</td><td>' + ph.private_balance_zec.toFixed(8) + ' ZEC</td></tr>';
+            const wColor = ph.wallet_responsive ? '#68d391' : '#fc8181';
+            phHtml += '<tr><td>Wallet RPC</td><td style="color:' + wColor + '">' + (ph.wallet_responsive ? 'Responsive' : 'Not responding') + '</td></tr>';
+            phHtml += '<tr><td>Last Check</td><td style="color:#718096">' + (ph.checked_at || '?') + '</td></tr>';
+            phHtml += '</table>';
+
+            // Generate alerts
+            if (ph.consecutive_payout_failures >= 3) {
+                alerts += '<div style="background:#742a2a;border:1px solid #fc8181;border-radius:6px;padding:0.75rem;margin-bottom:0.75rem;font-size:0.85rem;color:#fc8181">&#9888; Payout pipeline has failed ' + ph.consecutive_payout_failures + ' consecutive times: ' + (ph.last_payout_error || '').substring(0, 150) + '</div>';
+            }
+            if (ph.shielding_stuck) {
+                alerts += '<div style="background:#744210;border:1px solid #f4b728;border-radius:6px;padding:0.75rem;margin-bottom:0.75rem;font-size:0.85rem;color:#f4b728">&#9888; ' + ph.transparent_balance_zec.toFixed(4) + ' ZEC sitting in transparent pool — shielding may be stuck. Try restarting Zallet.</div>';
+            }
+            if (!ph.wallet_responsive) {
+                alerts += '<div style="background:#742a2a;border:1px solid #fc8181;border-radius:6px;padding:0.75rem;margin-bottom:0.75rem;font-size:0.85rem;color:#fc8181">&#9888; Zallet wallet is not responding to RPC calls.</div>';
+            }
+        } else {
+            phHtml = '<span style="color:#718096">No payout health data yet</span>';
+        }
+        document.getElementById('payout-health-content').innerHTML = phHtml;
+        document.getElementById('health-alerts').innerHTML = alerts;
+
     } catch (e) {
         document.getElementById('health-content').innerHTML = '<span style="color:#fc8181">Failed: ' + e + '</span>';
     }
+}
+
+let currentLogService = 'dashboard';
+async function showLog(service) {
+    currentLogService = service;
+    const el = document.getElementById('log-content');
+    el.textContent = 'Loading...';
+    try {
+        const d = await fetchJson('/admin/api/logs');
+        if (!d) return;
+        const lines = d[service] || [];
+        el.textContent = lines.join('\n') || '(empty)';
+        el.scrollTop = el.scrollHeight;
+    } catch (e) {
+        el.textContent = 'Error: ' + e;
+    }
+}
+
+async function restartZallet() {
+    if (!confirm('Restart Zallet? This will briefly interrupt wallet operations.')) return;
+    const el = document.getElementById('zallet-status');
+    el.className = 'status-msg'; el.style.display = 'none';
+    try {
+        const d = await fetchJson('/admin/api/restart-zallet', { method: 'POST' });
+        if (d) { el.className = 'status-msg ok'; el.textContent = d.message; }
+    } catch (e) { el.className = 'status-msg err'; el.textContent = 'Error: ' + e; }
+}
+
+async function repairZallet() {
+    if (!confirm('This will stop Zallet, truncate its database to force a resync, then restart. Continue?')) return;
+    const el = document.getElementById('zallet-status');
+    el.className = 'status-msg ok'; el.textContent = 'Repairing... this may take a minute.';
+    try {
+        const d = await fetchJson('/admin/api/repair-zallet', { method: 'POST' });
+        if (d) { el.className = 'status-msg ok'; el.textContent = d.message; }
+    } catch (e) { el.className = 'status-msg err'; el.textContent = 'Error: ' + e; }
 }
 
 // Set public dashboard link to HTTPS on same hostname

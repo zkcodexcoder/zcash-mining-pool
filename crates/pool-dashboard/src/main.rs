@@ -537,6 +537,10 @@ async fn run_payout_loop(
     info!("Payout loop started");
     // Short initial delay to let dashboard fully start before doing RPC work.
     tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let mut consecutive_payout_failures: u32 = 0;
+    let mut last_payout_error = String::new();
+
     loop {
         // Phase 1: Check block maturity
         if let Err(e) = check_block_maturity(&db, &node_rpc, maturity_confirmations).await {
@@ -554,15 +558,69 @@ async fn run_payout_loop(
             Ok(count) => {
                 if count > 0 {
                     info!(payouts = count, "Payout round completed");
+                    consecutive_payout_failures = 0;
+                    last_payout_error.clear();
                 }
             }
             Err(e) => {
                 error!(error = %e, "Payout round failed");
+                consecutive_payout_failures += 1;
+                last_payout_error = format!("{e}");
             }
         }
 
+        // Write payout health status for the admin health page to read.
+        let _ = write_payout_health(
+            &db, &wallet_rpc, mining_address,
+            consecutive_payout_failures, &last_payout_error,
+        ).await;
+
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Collect and persist payout pipeline health metrics.
+async fn write_payout_health(
+    db: &PoolDb,
+    wallet_rpc: &ZcashRpcClient,
+    mining_address: &str,
+    consecutive_failures: u32,
+    last_error: &str,
+) -> anyhow::Result<()> {
+    // Check transparent balance (unshielded funds)
+    let (transparent_zec, private_zec) = match wallet_rpc.call_raw::<serde_json::Value>(
+        "z_gettotalbalance", serde_json::json!([1, true])
+    ).await {
+        Ok(bal) => {
+            let t = bal.get("transparent").and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let p = bal.get("private").and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            (t, p)
+        }
+        Err(_) => (0.0, 0.0),
+    };
+
+    // Check if there are confirmed (mature) blocks whose coinbase hasn't been shielded.
+    // If transparent balance > 0 and we have mature blocks, shielding might be stuck.
+    let shielding_stuck = transparent_zec > 0.01;
+
+    // Check for Zallet sync issues by attempting a simple RPC
+    let wallet_responsive = wallet_rpc.call_raw::<serde_json::Value>(
+        "z_gettotalbalance", serde_json::json!([0, true])
+    ).await.is_ok();
+
+    let health = serde_json::json!({
+        "consecutive_payout_failures": consecutive_failures,
+        "last_payout_error": last_error,
+        "transparent_balance_zec": transparent_zec,
+        "private_balance_zec": private_zec,
+        "shielding_stuck": shielding_stuck,
+        "wallet_responsive": wallet_responsive,
+        "checked_at": chrono::Utc::now().to_rfc3339(),
+    });
+    db.set_pool_status("payout_health", &health.to_string()).await?;
+    Ok(())
 }
 
 fn reverse_hex_bytes(hex_str: &str) -> String {
