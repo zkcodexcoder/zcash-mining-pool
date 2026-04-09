@@ -610,7 +610,7 @@ async fn api_repair_zallet() -> Json<serde_json::Value> {
     tracing::info!("Zallet repair (truncate-wallet) requested via admin panel");
     // Get current chain height to truncate to a safe recent point
     let output = tokio::process::Command::new("bash")
-        .args(["-c", "pkill zallet; sleep 3; /home/zebra/zallet/target/release/zallet --datadir /home/zebra/.zallet repair truncate-wallet 999999999 2>&1"])
+        .args(["-c", "pkill zallet; sleep 3; /home/zec/zallet/target/release/zallet --datadir /home/zec/.zallet repair truncate-wallet 999999999 2>&1"])
         .output()
         .await;
     let repair_msg = match output {
@@ -624,7 +624,7 @@ async fn api_repair_zallet() -> Json<serde_json::Value> {
     };
     // Restart after repair
     let _ = tokio::process::Command::new("bash")
-        .args(["-c", "/home/zebra/zallet/target/release/zallet --datadir /home/zebra/.zallet start >> /home/zebra/zallet.log 2>&1 &"])
+        .args(["-c", "sudo systemctl restart zallet"])
         .status()
         .await;
     Json(serde_json::json!({"status": "ok", "message": format!("Repair complete, restarting. {}", repair_msg.trim())}))
