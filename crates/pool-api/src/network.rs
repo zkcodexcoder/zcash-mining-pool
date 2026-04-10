@@ -772,11 +772,13 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
 
 <script>
 let COIN = 'TAZ';
+let EXPLORER = 'https://testnet.cipherscan.app';
 async function initCoin() {
     try {
         const r = await fetch('/api/pool/info');
         const d = await r.json();
         COIN = d.coin || 'TAZ';
+        EXPLORER = d.network === 'mainnet' ? 'https://cipherscan.app' : 'https://testnet.cipherscan.app';
         const badge = document.getElementById('network-badge');
         if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
     } catch(e) {}
@@ -912,7 +914,7 @@ async function fetchData() {
                 const cbShort = b.coinbase_text.length > 40 ? b.coinbase_text.substring(0, 40) + '...' : b.coinbase_text;
                 const badge = nodeBadge(b.coinbase_tx_version, b.is_zebrad);
                 return '<tr' + cls + '>' +
-                    '<td style="color:#e0e0e0">' + b.height + '</td>' +
+                    '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#e0e0e0;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
                     '<td title="' + b.hash + '">' + hashShort + '</td>' +
                     '<td title="' + b.miner_address + '">' + b.miner_label + badge + '</td>' +
                     '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
