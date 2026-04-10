@@ -45,6 +45,10 @@ struct AdminConfig {
     dashboard_log: Option<String>,
     #[serde(default)]
     zallet_log: Option<String>,
+    #[serde(default)]
+    zallet_datadir: Option<String>,
+    #[serde(default)]
+    zallet_binary: Option<String>,
 }
 
 fn default_admin_addr() -> String {
@@ -405,12 +409,26 @@ async fn main() -> Result<()> {
                 dashboard: admin_cfg.dashboard_log.clone(),
                 zallet: admin_cfg.zallet_log.clone(),
             };
+            let zallet_paths = {
+                let mut zp = pool_api::ZalletPaths::default();
+                if let Some(ref b) = admin_cfg.zallet_binary {
+                    zp.binary = b.clone();
+                }
+                if let Some(ref d) = admin_cfg.zallet_datadir {
+                    zp.datadir = d.clone();
+                }
+                if let Some(ref l) = admin_cfg.zallet_log {
+                    zp.log = l.clone();
+                }
+                zp
+            };
             let admin_state = pool_api::AdminState::with_log_paths(
                 Arc::clone(&api_state),
                 &admin_cfg.password,
                 config_view,
                 config_path.clone(),
                 log_paths,
+                zallet_paths,
             );
             let admin_router = pool_api::admin::build_admin_router(admin_state);
             let admin_addr = admin_cfg.listen_addr.clone();

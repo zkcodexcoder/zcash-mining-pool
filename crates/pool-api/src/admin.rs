@@ -158,6 +158,7 @@ pub struct AdminState {
     pub config_path: String,
     pub started_at: i64,
     pub log_paths: LogPaths,
+    pub zallet_paths: ZalletPaths,
 }
 
 /// Configurable log file paths for the admin Service Logs tab.
@@ -168,6 +169,26 @@ pub struct LogPaths {
     pub zallet: Option<String>,
 }
 
+/// Configurable Zallet paths for restart/repair operations.
+#[derive(Clone)]
+pub struct ZalletPaths {
+    pub binary: String,
+    pub datadir: String,
+    pub log: String,
+}
+
+impl Default for ZalletPaths {
+    fn default() -> Self {
+        // Detect home directory for sensible defaults.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/zebra".to_string());
+        Self {
+            binary: format!("{home}/zallet/target/release/zallet"),
+            datadir: format!("{home}/.zallet"),
+            log: format!("{home}/zallet.log"),
+        }
+    }
+}
+
 impl AdminState {
     pub fn new(
         app: AppState,
@@ -175,7 +196,7 @@ impl AdminState {
         config_view: PoolConfigView,
         config_path: String,
     ) -> Self {
-        Self::with_log_paths(app, password, config_view, config_path, LogPaths::default())
+        Self::with_log_paths(app, password, config_view, config_path, LogPaths::default(), ZalletPaths::default())
     }
 
     pub fn with_log_paths(
@@ -184,6 +205,7 @@ impl AdminState {
         config_view: PoolConfigView,
         config_path: String,
         log_paths: LogPaths,
+        zallet_paths: ZalletPaths,
     ) -> Self {
         let signing_key = derive_signing_key(password);
         let started_at = chrono::Utc::now().timestamp();
@@ -194,6 +216,7 @@ impl AdminState {
             config_path,
             started_at,
             log_paths,
+            zallet_paths,
         }
     }
 }
@@ -614,23 +637,34 @@ async fn api_restart_dashboard() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok", "message": "Restarting dashboard..."}))
 }
 
-async fn api_restart_zallet() -> Json<serde_json::Value> {
+async fn api_restart_zallet(
+    State(state): State<AdminState>,
+) -> Json<serde_json::Value> {
     tracing::info!("Zallet restart requested via admin panel");
-    tokio::spawn(async {
+    let binary = state.zallet_paths.binary.clone();
+    let datadir = state.zallet_paths.datadir.clone();
+    let log = state.zallet_paths.log.clone();
+    tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let cmd = format!("pkill zallet && sleep 3 && {binary} --datadir {datadir} start >> {log} 2>&1 &");
         let _ = tokio::process::Command::new("bash")
-            .args(["-c", "pkill zallet && sleep 3 && /home/zebra/zallet/target/release/zallet --datadir /home/zebra/.zallet start >> /home/zebra/zallet.log 2>&1 &"])
+            .args(["-c", &cmd])
             .status()
             .await;
     });
     Json(serde_json::json!({"status": "ok", "message": "Restarting Zallet..."}))
 }
 
-async fn api_repair_zallet() -> Json<serde_json::Value> {
+async fn api_repair_zallet(
+    State(state): State<AdminState>,
+) -> Json<serde_json::Value> {
     tracing::info!("Zallet repair (truncate-wallet) requested via admin panel");
-    // Get current chain height to truncate to a safe recent point
+    let binary = &state.zallet_paths.binary;
+    let datadir = &state.zallet_paths.datadir;
+    let log = &state.zallet_paths.log;
+    let repair_cmd = format!("pkill zallet; sleep 3; {binary} --datadir {datadir} repair truncate-wallet 999999999 2>&1");
     let output = tokio::process::Command::new("bash")
-        .args(["-c", "pkill zallet; sleep 3; /home/zec/zallet/target/release/zallet --datadir /home/zec/.zallet repair truncate-wallet 999999999 2>&1"])
+        .args(["-c", &repair_cmd])
         .output()
         .await;
     let repair_msg = match output {
@@ -643,8 +677,9 @@ async fn api_repair_zallet() -> Json<serde_json::Value> {
         Err(e) => format!("Failed to run repair: {e}"),
     };
     // Restart after repair
+    let restart_cmd = format!("{binary} --datadir {datadir} start >> {log} 2>&1 &");
     let _ = tokio::process::Command::new("bash")
-        .args(["-c", "sudo systemctl restart zallet"])
+        .args(["-c", &restart_cmd])
         .status()
         .await;
     Json(serde_json::json!({"status": "ok", "message": format!("Repair complete, restarting. {}", repair_msg.trim())}))
