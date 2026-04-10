@@ -39,6 +39,12 @@ struct AdminConfig {
     #[serde(default = "default_admin_addr")]
     listen_addr: String,
     password: String,
+    #[serde(default)]
+    pool_log: Option<String>,
+    #[serde(default)]
+    dashboard_log: Option<String>,
+    #[serde(default)]
+    zallet_log: Option<String>,
 }
 
 fn default_admin_addr() -> String {
@@ -394,11 +400,17 @@ async fn main() -> Result<()> {
                 coinbase_tag: config.pool.coinbase_tag.clone(),
                 payout_interval_secs: config.payout.interval_secs,
             };
-            let admin_state = pool_api::AdminState::new(
+            let log_paths = pool_api::LogPaths {
+                pool: admin_cfg.pool_log.clone(),
+                dashboard: admin_cfg.dashboard_log.clone(),
+                zallet: admin_cfg.zallet_log.clone(),
+            };
+            let admin_state = pool_api::AdminState::with_log_paths(
                 Arc::clone(&api_state),
                 &admin_cfg.password,
                 config_view,
                 config_path.clone(),
+                log_paths,
             );
             let admin_router = pool_api::admin::build_admin_router(admin_state);
             let admin_addr = admin_cfg.listen_addr.clone();
@@ -681,8 +693,12 @@ async fn shield_coinbase(
         return Ok(());
     }
 
-    let mut total_shielded_utxos: u64 = 0;
-    let mut total_shielded_value: f64 = 0.0;
+    // Fire multiple z_shieldcoinbase calls concurrently. Each returns an opid
+    // immediately while the proof runs in the background inside Zallet.
+    // This lets us have multiple proofs running in parallel.
+    const CONCURRENT_BATCHES: u32 = 5;
+
+    let mut opids: Vec<(u32, String, u64, f64)> = Vec::new();
 
     for batch in 1..=MAX_SHIELD_BATCHES_PER_CYCLE {
         let result = match wallet_rpc.z_shield_coinbase(mining_address, pool_address, Some(50)).await {
@@ -693,15 +709,7 @@ async fn shield_coinbase(
                     || msg.contains("Insufficient")
                     || msg.contains("No funds")
                 {
-                    if total_shielded_utxos > 0 {
-                        info!(
-                            total_utxos = total_shielded_utxos,
-                            total_value = total_shielded_value,
-                            batches = batch - 1,
-                            "Shielding complete, no more UTXOs"
-                        );
-                    }
-                    return Ok(());
+                    break;
                 }
                 return Err(anyhow::anyhow!("z_shieldcoinbase failed: {e}"));
             }
@@ -725,18 +733,27 @@ async fn shield_coinbase(
             "Shielding coinbase batch"
         );
 
-        match wait_for_operation(wallet_rpc, &opid).await? {
-            OpResult::Success(txid) => {
-                total_shielded_utxos += shielding_utxos;
-                total_shielded_value += shielding_value;
-                info!(batch, txid = %txid, "Shielding batch complete");
-            }
-            OpResult::Failed(msg) => {
-                if msg.contains("Insufficient") || msg.contains("No funds") {
-                    warn!(batch, error = %msg, "Shielding batch skipped (insufficient for fee)");
-                    break;
+        opids.push((batch, opid, shielding_utxos, shielding_value));
+
+        // Once we have CONCURRENT_BATCHES queued, wait for them all before
+        // queuing more. This prevents overwhelming Zallet with too many proofs.
+        if opids.len() as u32 >= CONCURRENT_BATCHES || remaining_utxos == 0 {
+            let mut total_ok = 0u64;
+            let mut total_val = 0.0f64;
+            for (b, op, utxos, val) in opids.drain(..) {
+                match wait_for_operation(wallet_rpc, &op).await? {
+                    OpResult::Success(txid) => {
+                        total_ok += utxos;
+                        total_val += val;
+                        info!(batch = b, txid = %txid, "Shielding batch complete");
+                    }
+                    OpResult::Failed(msg) => {
+                        warn!(batch = b, error = %msg, "Shielding batch failed");
+                    }
                 }
-                return Err(anyhow::anyhow!("Shielding batch {batch} failed: {msg}"));
+            }
+            if total_ok > 0 {
+                info!(utxos = total_ok, value_zec = total_val, "Concurrent batch group done");
             }
         }
 
@@ -745,29 +762,16 @@ async fn shield_coinbase(
         }
     }
 
-    if total_shielded_utxos > 0 {
-        info!(
-            total_utxos = total_shielded_utxos,
-            total_value_zec = total_shielded_value,
-            "Shielding round complete, waiting for confirmations"
-        );
-
-        for _ in 0..60 {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if let Ok(bal) = wallet_rpc.call_raw::<serde_json::Value>(
-                "z_gettotalbalance", serde_json::json!([1, true])
-            ).await {
-                let private = bal.get("private")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                if private > 0.0 {
-                    info!(private_balance = private, "Shielded funds confirmed (1+ conf)");
-                    return Ok(());
-                }
+    // Wait for any remaining queued operations.
+    for (b, op, _utxos, _val) in opids.drain(..) {
+        match wait_for_operation(wallet_rpc, &op).await? {
+            OpResult::Success(txid) => {
+                info!(batch = b, txid = %txid, "Shielding batch complete");
+            }
+            OpResult::Failed(msg) => {
+                warn!(batch = b, error = %msg, "Shielding batch failed");
             }
         }
-        warn!("Timed out waiting for shielded fund confirmations");
     }
 
     Ok(())
@@ -998,16 +1002,78 @@ fn parse_have_balance(msg: &str) -> Option<i64> {
     rest[..end].parse::<i64>().ok()
 }
 
+/// Validates a Zcash address for the given network using proper encoding checks.
+///
+/// Transparent addresses (t1/t3/tm/t2) use base58check encoding with specific
+/// version bytes. Sapling (zs/ztestsapling) and unified (u1/utest) addresses
+/// use bech32/bech32m encoding with specific HRP and length constraints.
 fn is_valid_zcash_address(addr: &str, network: &str) -> bool {
-    if network == "mainnet" {
-        addr.starts_with("t1")
-            || addr.starts_with("t3")
-            || addr.starts_with("zs")
-            || (addr.starts_with('u') && !addr.starts_with("utest"))
-    } else {
-        addr.starts_with("tm")
-            || addr.starts_with("t2")
-            || addr.starts_with("ztestsapling")
-            || addr.starts_with("utest")
+    let is_mainnet = network == "mainnet";
+
+    // Transparent addresses: base58check with 2-byte version prefix.
+    // Mainnet: t1 (P2PKH, version 0x1CB8), t3 (P2SH, version 0x1CBD)
+    // Testnet: tm (P2PKH, version 0x1D25), t2 (P2SH, version 0x1CBA)
+    if addr.starts_with('t') {
+        // Quick prefix check for the right network
+        let valid_prefix = if is_mainnet {
+            addr.starts_with("t1") || addr.starts_with("t3")
+        } else {
+            addr.starts_with("tm") || addr.starts_with("t2")
+        };
+        if !valid_prefix {
+            return false;
+        }
+        // Base58check decode: should produce exactly 22 bytes (2 version + 20 hash)
+        return match bs58::decode(addr).with_check(None).into_vec() {
+            Ok(bytes) => bytes.len() == 22,
+            Err(_) => false,
+        };
     }
+
+    // Sapling addresses: bech32 encoding
+    // Mainnet: "zs1" HRP, 78 chars total (43 byte payload)
+    // Testnet: "ztestsapling1" HRP, 88 chars total
+    if addr.starts_with('z') {
+        let valid_prefix = if is_mainnet {
+            addr.starts_with("zs1")
+        } else {
+            addr.starts_with("ztestsapling1")
+        };
+        if !valid_prefix {
+            return false;
+        }
+        // bech32 charset: lowercase alphanumeric excluding 1, b, i, o
+        let hrp_end = addr.rfind('1').unwrap_or(0);
+        let data_part = &addr[hrp_end + 1..];
+        let valid_charset = data_part
+            .chars()
+            .all(|c| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".contains(c));
+        let expected_len = if is_mainnet { 78 } else { 88 };
+        return valid_charset && addr.len() == expected_len;
+    }
+
+    // Unified addresses: bech32m encoding
+    // Mainnet: "u1" HRP
+    // Testnet: "utest1" HRP
+    if addr.starts_with('u') {
+        let valid_prefix = if is_mainnet {
+            addr.starts_with("u1") && !addr.starts_with("utest")
+        } else {
+            addr.starts_with("utest1")
+        };
+        if !valid_prefix {
+            return false;
+        }
+        // Unified addresses vary in length depending on which receivers are
+        // included (transparent, sapling, orchard). Minimum is ~62 chars for
+        // a single-receiver UA, maximum ~320 for all three receivers.
+        let hrp_end = addr.find('1').unwrap_or(0);
+        let data_part = &addr[hrp_end + 1..];
+        let valid_charset = data_part
+            .chars()
+            .all(|c| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".contains(c));
+        return valid_charset && data_part.len() >= 50 && addr.len() <= 320;
+    }
+
+    false
 }

@@ -157,6 +157,15 @@ pub struct AdminState {
     pub config_view: PoolConfigView,
     pub config_path: String,
     pub started_at: i64,
+    pub log_paths: LogPaths,
+}
+
+/// Configurable log file paths for the admin Service Logs tab.
+#[derive(Clone, Default)]
+pub struct LogPaths {
+    pub pool: Option<String>,
+    pub dashboard: Option<String>,
+    pub zallet: Option<String>,
 }
 
 impl AdminState {
@@ -166,6 +175,16 @@ impl AdminState {
         config_view: PoolConfigView,
         config_path: String,
     ) -> Self {
+        Self::with_log_paths(app, password, config_view, config_path, LogPaths::default())
+    }
+
+    pub fn with_log_paths(
+        app: AppState,
+        password: &str,
+        config_view: PoolConfigView,
+        config_path: String,
+        log_paths: LogPaths,
+    ) -> Self {
         let signing_key = derive_signing_key(password);
         let started_at = chrono::Utc::now().timestamp();
         Self {
@@ -174,6 +193,7 @@ impl AdminState {
             config_view,
             config_path,
             started_at,
+            log_paths,
         }
     }
 }
@@ -630,9 +650,13 @@ async fn api_repair_zallet() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok", "message": format!("Repair complete, restarting. {}", repair_msg.trim())}))
 }
 
-async fn api_service_logs() -> Json<serde_json::Value> {
-    async fn read_tail(path: &str, lines: usize) -> Vec<String> {
-        // Use tail command to efficiently read last N lines of large files.
+async fn api_service_logs(
+    State(state): State<AdminState>,
+) -> Json<serde_json::Value> {
+    async fn read_tail(path: Option<&str>, lines: usize) -> Vec<String> {
+        let Some(path) = path else {
+            return vec!["(log path not configured)".to_string()];
+        };
         match tokio::process::Command::new("tail")
             .args(["-n", &lines.to_string(), path])
             .output()
@@ -648,9 +672,9 @@ async fn api_service_logs() -> Json<serde_json::Value> {
         }
     }
     let (pool, dashboard, zallet) = tokio::join!(
-        read_tail("/home/zebra/zecminer/pool/pool.log", 50),
-        read_tail("/home/zebra/zecminer/pool/dashboard.log", 50),
-        read_tail("/home/zebra/zallet.log", 50),
+        read_tail(state.log_paths.pool.as_deref(), 50),
+        read_tail(state.log_paths.dashboard.as_deref(), 50),
+        read_tail(state.log_paths.zallet.as_deref(), 50),
     );
     Json(serde_json::json!({
         "pool": pool,
@@ -953,6 +977,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 let allMiners = [];
+let coinUnit = 'ZEC'; // updated from config: ZEC for mainnet, TAZ for testnet
 
 // Safe JSON fetch: returns null on non-JSON responses (502, redirects, etc.)
 async function fetchJson(url, opts) {
@@ -974,6 +999,7 @@ async function fetchConfig() {
     try {
         const d = await fetchJson('/admin/api/config');
         if (!d) return;
+        coinUnit = (d.network && d.network !== 'mainnet') ? 'TAZ' : 'ZEC';
         let html = '<table class="kv-table">';
         const rows = [
             ['Pool Name', d.pool_name],
@@ -981,7 +1007,7 @@ async function fetchConfig() {
             ['Fee', d.pool_fee + '%'],
             ['Stratum Ports', d.stratum_ports.join(', ')],
             ['Difficulty Multiplier', d.difficulty_multiplier.toFixed(2)],
-            ['Min Payout', d.min_payout_zec + ' ZEC'],
+            ['Min Payout', d.min_payout_zec + ' ' + coinUnit],
             ['Maturity Confirmations', d.maturity_confirmations],
             ['Payout Interval', d.payout_interval_secs + 's'],
             ['Pool Address', d.pool_address || 'N/A'],
@@ -1156,20 +1182,21 @@ function renderMiners(miners) {
             '<td>' + m.share_count + '</td>' +
             '<td>' + m.worker_count + '</td>' +
             '<td>' + ls + '</td>' +
-            '<td><input class="adjust-input" type="number" id="adj-' + m.id + '" placeholder="zatoshis">' +
+            '<td><input class="adjust-input" type="number" step="0.0001" id="adj-' + m.id + '" placeholder="' + coinUnit + '">' +
             ' <button class="btn btn-sm btn-primary" onclick="adjustBalance(\'' + m.address + '\',' + m.id + ')">Set</button></td>' +
             '</tr>';
     }
     html += '</tbody></table>';
-    html += '<p style="font-size:0.7rem;color:#718096;margin-top:0.5rem">Adjust: enter positive to add, negative to subtract zatoshis from pending balance.</p>';
+    html += '<p style="font-size:0.7rem;color:#718096;margin-top:0.5rem">Adjust: enter amount in ' + coinUnit + ' (positive to add, negative to subtract from pending balance).</p>';
     document.getElementById('miners-content').innerHTML = html;
 }
 
 async function adjustBalance(address, minerId) {
     const input = document.getElementById('adj-' + minerId);
-    const val = parseInt(input.value, 10);
-    if (isNaN(val) || val === 0) { alert('Enter a non-zero amount'); return; }
-    if (!confirm('Adjust ' + address.slice(0, 12) + '... by ' + val + ' zatoshis?')) return;
+    const zecVal = parseFloat(input.value);
+    if (isNaN(zecVal) || zecVal === 0) { alert('Enter a non-zero amount'); return; }
+    const val = Math.round(zecVal * 100000000);
+    if (!confirm('Adjust ' + address.slice(0, 12) + '... by ' + zecVal + ' ' + coinUnit + '?')) return;
     try {
         const d = await fetchJson('/admin/api/miner/adjust', {
             method: 'POST',
