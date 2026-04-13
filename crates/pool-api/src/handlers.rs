@@ -119,6 +119,26 @@ impl ApiState {
             .unwrap_or(0);
         (warn, reject)
     }
+
+    /// Get rejection breakdown from pool_status DB: (low_diff, job_not_found, duplicate, other).
+    pub async fn get_rejection_breakdown(&self) -> (u64, u64, u64, u64) {
+        let read = |key: &'static str| {
+            let db = self.db.clone();
+            async move {
+                db.get_pool_status(key).await
+                    .ok().flatten()
+                    .and_then(|(v, _)| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+            }
+        };
+        let (ld, jnf, dup, oth) = tokio::join!(
+            read("rejects_low_diff"),
+            read("rejects_job_not_found"),
+            read("rejects_duplicate"),
+            read("rejects_other"),
+        );
+        (ld, jnf, dup, oth)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

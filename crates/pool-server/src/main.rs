@@ -383,6 +383,11 @@ async fn main() -> Result<()> {
     let shares_rejected = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rate_warn_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rate_reject_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Rejection breakdown counters (by error code).
+    let rejects_low_diff = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rejects_job_not_found = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rejects_duplicate = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rejects_other = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let share_validator = ShareValidator::new(
         db.clone(),
@@ -400,6 +405,10 @@ async fn main() -> Result<()> {
         Arc::clone(&shares_rejected),
         Arc::clone(&rate_warn_count),
         Arc::clone(&rate_reject_count),
+        Arc::clone(&rejects_low_diff),
+        Arc::clone(&rejects_job_not_found),
+        Arc::clone(&rejects_duplicate),
+        Arc::clone(&rejects_other),
     );
 
     // Write pool_started_at once, then update live stats every 5s into pool_status
@@ -410,6 +419,10 @@ async fn main() -> Result<()> {
     let status_rejected = Arc::clone(&shares_rejected);
     let status_rate_warn = Arc::clone(&rate_warn_count);
     let status_rate_reject = Arc::clone(&rate_reject_count);
+    let status_rejects_low_diff = Arc::clone(&rejects_low_diff);
+    let status_rejects_job_not_found = Arc::clone(&rejects_job_not_found);
+    let status_rejects_duplicate = Arc::clone(&rejects_duplicate);
+    let status_rejects_other = Arc::clone(&rejects_other);
     let status_handle = tokio::spawn(async move {
         let _ = status_db.set_pool_status(
             "pool_started_at",
@@ -427,6 +440,14 @@ async fn main() -> Result<()> {
             let _ = status_db.set_pool_status("rate_warn_count", &rw.to_string()).await;
             let rr = status_rate_reject.load(std::sync::atomic::Ordering::Relaxed);
             let _ = status_db.set_pool_status("rate_reject_count", &rr.to_string()).await;
+            let rld = status_rejects_low_diff.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("rejects_low_diff", &rld.to_string()).await;
+            let rjn = status_rejects_job_not_found.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("rejects_job_not_found", &rjn.to_string()).await;
+            let rdu = status_rejects_duplicate.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("rejects_duplicate", &rdu.to_string()).await;
+            let rot = status_rejects_other.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("rejects_other", &rot.to_string()).await;
         }
     });
 

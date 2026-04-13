@@ -500,6 +500,10 @@ struct AdminHealth {
     shares_rejection_rate: f64,
     rate_warn_count: u64,
     rate_reject_count: u64,
+    rejects_low_diff: u64,
+    rejects_job_not_found: u64,
+    rejects_duplicate: u64,
+    rejects_other: u64,
     system: Option<SystemStats>,
     payout_health: Option<serde_json::Value>,
 }
@@ -579,6 +583,8 @@ async fn api_health(
     let total = accepted + rejected;
     let rejection_rate = if total > 0 { (rejected as f64 / total as f64) * 100.0 } else { 0.0 };
     let (rate_warn, rate_reject) = state.app.get_rate_counters().await;
+    let (rej_low_diff, rej_job_not_found, rej_duplicate, rej_other) =
+        state.app.get_rejection_breakdown().await;
 
     let system = read_system_stats();
 
@@ -608,6 +614,10 @@ async fn api_health(
         shares_rejection_rate: rejection_rate,
         rate_warn_count: rate_warn,
         rate_reject_count: rate_reject,
+        rejects_low_diff: rej_low_diff,
+        rejects_job_not_found: rej_job_not_found,
+        rejects_duplicate: rej_duplicate,
+        rejects_other: rej_other,
         system,
         payout_health,
     })
@@ -1285,6 +1295,18 @@ async function fetchHealth() {
         html += '<tr><td>Rate Warnings (100-500/s)</td><td style="color:' + warnColor + '">' + d.rate_warn_count.toLocaleString() + '</td></tr>';
         const rateRejectColor = d.rate_reject_count > 0 ? '#fc8181' : '#68d391';
         html += '<tr><td>Rate Rejections (&gt;500/s)</td><td style="color:' + rateRejectColor + '">' + d.rate_reject_count.toLocaleString() + '</td></tr>';
+
+        // Rejection breakdown — thresholds are % of accepted shares
+        const acc = d.shares_accepted || 1;
+        const pctColor = (count, warn, bad) => {
+            const pct = (count / acc) * 100;
+            return pct > bad ? '#fc8181' : pct > warn ? '#f4b728' : '#68d391';
+        };
+        html += '<tr><td style="padding-top:0.75rem;color:#718096;font-size:0.75rem">Rejection Breakdown</td><td></td></tr>';
+        html += '<tr><td style="padding-left:1rem">&bull; Low Difficulty (code 23)</td><td style="color:' + pctColor(d.rejects_low_diff, 0.5, 2) + '">' + d.rejects_low_diff.toLocaleString() + '</td></tr>';
+        html += '<tr><td style="padding-left:1rem">&bull; Job Not Found (code 21)</td><td style="color:' + pctColor(d.rejects_job_not_found, 0.2, 1) + '">' + d.rejects_job_not_found.toLocaleString() + '</td></tr>';
+        html += '<tr><td style="padding-left:1rem">&bull; Duplicate (code 22)</td><td style="color:' + pctColor(d.rejects_duplicate, 0.1, 0.5) + '">' + d.rejects_duplicate.toLocaleString() + '</td></tr>';
+        html += '<tr><td style="padding-left:1rem">&bull; Other (invalid, rate, etc)</td><td style="color:' + pctColor(d.rejects_other, 0.1, 0.5) + '">' + d.rejects_other.toLocaleString() + '</td></tr>';
         html += '</table>';
 
         // System stats (Linux only)

@@ -119,6 +119,14 @@ pub struct ShareValidator {
     rate_warn_count: Arc<std::sync::atomic::AtomicU64>,
     /// Rate reject counter (>500 shares/sec events).
     rate_reject_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Rejections broken down by reason (code 23).
+    rejects_low_diff: Arc<std::sync::atomic::AtomicU64>,
+    /// Rejections broken down by reason (code 21).
+    rejects_job_not_found: Arc<std::sync::atomic::AtomicU64>,
+    /// Rejections broken down by reason (code 22).
+    rejects_duplicate: Arc<std::sync::atomic::AtomicU64>,
+    /// Rejections broken down by reason (code 20 / other — bad solution, nonce, etc).
+    rejects_other: Arc<std::sync::atomic::AtomicU64>,
     /// Maps session_id -> worker_id for persisting difficulty on retarget.
     session_worker_id: RwLock<HashMap<String, i64>>,
     /// Tracks recent disconnects for rapid-reconnect difficulty escalation.
@@ -143,6 +151,10 @@ impl ShareValidator {
         shares_rejected: Arc<std::sync::atomic::AtomicU64>,
         rate_warn_count: Arc<std::sync::atomic::AtomicU64>,
         rate_reject_count: Arc<std::sync::atomic::AtomicU64>,
+        rejects_low_diff: Arc<std::sync::atomic::AtomicU64>,
+        rejects_job_not_found: Arc<std::sync::atomic::AtomicU64>,
+        rejects_duplicate: Arc<std::sync::atomic::AtomicU64>,
+        rejects_other: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             db,
@@ -161,6 +173,10 @@ impl ShareValidator {
             shares_rejected,
             rate_warn_count,
             rate_reject_count,
+            rejects_low_diff,
+            rejects_job_not_found,
+            rejects_duplicate,
+            rejects_other,
             session_worker_id: RwLock::new(HashMap::new()),
             recent_disconnects: RwLock::new(HashMap::new()),
         }
@@ -218,6 +234,7 @@ impl ShareValidator {
                     if matches!(rate_status, RateStatus::Reject) {
                         self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.rate_reject_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.rejects_other.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(worker = %worker_name, "Share rate >500/s, rejecting");
                         self.stratum
                             .send_to_session(&session_id, ServerMessage::SubmitResult {
@@ -275,6 +292,12 @@ impl ShareValidator {
                         }
                         Err(e) => {
                             self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match e.code {
+                                21 => { self.rejects_job_not_found.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                                22 => { self.rejects_duplicate.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                                23 => { self.rejects_low_diff.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                                _ => { self.rejects_other.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                            }
                             let is_low_diff = e.is_low_difficulty();
                             warn!(worker = %worker_name, error = %e, "Share rejected");
                             self.stratum
