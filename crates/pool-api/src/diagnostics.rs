@@ -553,6 +553,7 @@ const WORKER_COLORS = ['#f4b728','#4a9eff','#48bb78','#fc8181','#a78bfa','#f687b
 let diffChart = null;
 let refreshTimer = null;
 let COIN = 'TAZ';
+let EXPLORER = 'https://testnet.cipherscan.app';
 let allShares = [];
 let allWorkerNames = [];
 async function initCoin() {
@@ -560,6 +561,7 @@ async function initCoin() {
         const r = await fetch('/api/pool/info');
         const d = await r.json();
         COIN = d.coin || 'TAZ';
+        EXPLORER = d.network === 'mainnet' ? 'https://cipherscan.app' : 'https://testnet.cipherscan.app';
         const badge = document.getElementById('network-badge');
         if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
     } catch(e) {}
@@ -758,7 +760,7 @@ async function fetchDiagnostics() {
         } else {
             bTbody.innerHTML = d.blocks_found.map(b =>
                 '<tr>' +
-                '<td style="color:#e0e0e0">' + b.height + '</td>' +
+                '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#e0e0e0;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
                 '<td title="' + b.hash + '">' + b.hash.substring(0, 16) + '...</td>' +
                 '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                 '<td class="status-' + b.status + '">' + b.status + '</td>' +

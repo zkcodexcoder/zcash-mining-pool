@@ -727,6 +727,7 @@ const REFRESH_STATS = 10000;
 const REFRESH_MINERS = 10000;
 const REFRESH_BLOCKS = 30000;
 let COIN = 'TAZ'; // updated from /api/pool/info
+let EXPLORER = 'https://testnet.cipherscan.app'; // updated from /api/pool/info
 
 const history = {
     hashrate: [],
@@ -903,6 +904,7 @@ async function fetchStats() {
 
         document.getElementById('pool-name').textContent = d.name.toUpperCase();
         COIN = d.network === 'mainnet' ? 'ZEC' : 'TAZ';
+        EXPLORER = d.network === 'mainnet' ? 'https://cipherscan.app' : 'https://testnet.cipherscan.app';
         const badge = document.getElementById('network-badge');
         if (badge) badge.textContent = d.network === 'mainnet' ? 'Mainnet' : 'Testnet';
         const mineLink = document.getElementById('mine-link');
@@ -1037,7 +1039,7 @@ async function fetchBlocks() {
                 luckColor = b.luck_percent <= 100 ? '#48bb78' : b.luck_percent <= 150 ? '#ecc94b' : '#fc8181';
             }
             return '<tr>' +
-                '<td style="color:#e0e0e0">' + b.height + '</td>' +
+                '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#e0e0e0;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
                 '<td title="' + b.hash + '">' + b.hash.substring(0, 16) + '...</td>' +
                 '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                 '<td style="color:' + luckColor + '">' + luckStr + '</td>' +
