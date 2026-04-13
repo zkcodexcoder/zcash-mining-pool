@@ -455,8 +455,9 @@ pub async fn warm_cache(state: &AppState, ranges: &[&str]) {
     }
 }
 
-pub async fn network_page() -> Html<String> {
-    Html(NETWORK_HTML.to_string())
+pub async fn network_page(State(state): State<AppState>) -> Html<String> {
+    let explorer = crate::routes::explorer_for(&state.network);
+    Html(NETWORK_HTML.replace("__INITIAL_EXPLORER__", explorer))
 }
 
 const NETWORK_HTML: &str = r##"<!DOCTYPE html>
@@ -772,7 +773,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
 
 <script>
 let COIN = 'TAZ';
-let EXPLORER = 'https://testnet.cipherscan.app';
+let EXPLORER = '__INITIAL_EXPLORER__';
 async function initCoin() {
     try {
         const r = await fetch('/api/pool/info');

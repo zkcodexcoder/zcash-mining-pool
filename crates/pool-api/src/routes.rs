@@ -84,9 +84,23 @@ async fn get_pool_info(
 
 async fn dashboard(State(state): State<AppState>) -> Html<String> {
     let coin = if state.network == "mainnet" { "ZEC" } else { "TAZ" };
-    // Substitute the initial currency label so the page renders correctly
-    // before the first /api/pool/stats response arrives.
-    Html(DASHBOARD_HTML.replace("__INITIAL_COIN__", coin))
+    let explorer = explorer_for(&state.network);
+    // Substitute server-side so the page renders correctly before the first
+    // /api/pool/stats response arrives.
+    Html(
+        DASHBOARD_HTML
+            .replace("__INITIAL_COIN__", coin)
+            .replace("__INITIAL_EXPLORER__", explorer),
+    )
+}
+
+/// Returns the block-explorer base URL for the configured network.
+pub fn explorer_for(network: &str) -> &'static str {
+    if network == "mainnet" {
+        "https://cipherscan.app"
+    } else {
+        "https://testnet.cipherscan.app"
+    }
 }
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -730,7 +744,7 @@ const REFRESH_STATS = 10000;
 const REFRESH_MINERS = 10000;
 const REFRESH_BLOCKS = 30000;
 let COIN = '__INITIAL_COIN__'; // seeded server-side, updated from /api/pool/stats
-let EXPLORER = 'https://testnet.cipherscan.app'; // updated from /api/pool/info
+let EXPLORER = '__INITIAL_EXPLORER__'; // seeded server-side, updated from /api/pool/stats
 
 const history = {
     hashrate: [],

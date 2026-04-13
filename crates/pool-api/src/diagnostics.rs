@@ -210,8 +210,9 @@ pub async fn get_miner_diagnostics(
     }))
 }
 
-pub async fn miner_page() -> Html<String> {
-    Html(MINER_DIAGNOSTICS_HTML.to_string())
+pub async fn miner_page(State(state): State<AppState>) -> Html<String> {
+    let explorer = crate::routes::explorer_for(&state.network);
+    Html(MINER_DIAGNOSTICS_HTML.replace("__INITIAL_EXPLORER__", explorer))
 }
 
 const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
@@ -553,7 +554,7 @@ const WORKER_COLORS = ['#f4b728','#4a9eff','#48bb78','#fc8181','#a78bfa','#f687b
 let diffChart = null;
 let refreshTimer = null;
 let COIN = 'TAZ';
-let EXPLORER = 'https://testnet.cipherscan.app';
+let EXPLORER = '__INITIAL_EXPLORER__';
 let allShares = [];
 let allWorkerNames = [];
 async function initCoin() {
