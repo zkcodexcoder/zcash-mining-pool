@@ -39,6 +39,11 @@ initial_target = "08000000000000000000000000000000000000000000000000000000000000
 # Target shares per minute from each miner (vardiff adjusts difficulty to maintain this rate)
 target_shares_per_minute = 40.0
 retarget_interval_secs = 30
+# Enable BIP22 long-polling so the node pushes new templates instantly
+# instead of relying on the 500ms polling loop. Falls back to regular
+# polling on errors. Default: false (use regular polling).
+# use_longpoll = true
+# longpoll_timeout_secs = 60
 
 # PPLNS settings require a pool restart.
 [pplns]

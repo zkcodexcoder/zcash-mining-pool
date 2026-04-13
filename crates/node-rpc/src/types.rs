@@ -50,6 +50,12 @@ pub struct BlockTemplate {
     pub sigoplimit: Option<u64>,
     #[serde(default)]
     pub sizelimit: Option<u64>,
+    /// BIP22 long-polling identifier. Opaque string returned by the node
+    /// that identifies this template version. Clients can pass it back to
+    /// request a long-polled `getblocktemplate` that blocks until the
+    /// template changes.
+    #[serde(default)]
+    pub longpollid: Option<String>,
 }
 
 /// Default root hashes returned by getblocktemplate.

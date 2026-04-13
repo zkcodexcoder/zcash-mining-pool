@@ -91,6 +91,19 @@ impl MiningJob {
 /// How often to send non-clean job updates to miners (seconds).
 const NON_CLEAN_JOB_INTERVAL_SECS: u64 = 5;
 
+/// Configuration for BIP22 long-polling of block templates.
+#[derive(Clone, Debug)]
+pub struct LongpollConfig {
+    pub enabled: bool,
+    pub timeout: Duration,
+}
+
+impl Default for LongpollConfig {
+    fn default() -> Self {
+        Self { enabled: false, timeout: Duration::from_secs(60) }
+    }
+}
+
 /// Manages mining jobs by polling the node for new block templates.
 pub struct JobManager {
     rpc: Arc<ZcashRpcClient>,
@@ -105,6 +118,13 @@ pub struct JobManager {
     latest_notify: Arc<RwLock<Option<ServerMessage>>>,
     /// Optional tag to inject into coinbase scriptSig (e.g. "Legends").
     coinbase_tag: Option<Vec<u8>>,
+    /// Long-poll configuration.
+    longpoll: LongpollConfig,
+    /// Last `longpollid` returned by the node. Passed back on the next
+    /// longpoll request so the node knows which template we already have.
+    last_longpollid: Arc<RwLock<Option<String>>>,
+    /// Counter of successful longpoll wake-ups (new template returned).
+    longpoll_wake_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl JobManager {
@@ -138,12 +158,25 @@ impl JobManager {
             last_template_at_ms,
             latest_notify,
             coinbase_tag: None,
+            longpoll: LongpollConfig::default(),
+            last_longpollid: Arc::new(RwLock::new(None)),
+            longpoll_wake_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// Set the coinbase tag to inject into each coinbase scriptSig.
     pub fn set_coinbase_tag(&mut self, tag: Vec<u8>) {
         self.coinbase_tag = Some(tag);
+    }
+
+    /// Enable or disable BIP22 long-polling.
+    pub fn set_longpoll_config(&mut self, cfg: LongpollConfig) {
+        self.longpoll = cfg;
+    }
+
+    /// Accessor for the longpoll wake counter (for dashboards).
+    pub fn longpoll_wake_count(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.longpoll_wake_count)
     }
 
     pub fn jobs(&self) -> Arc<RwLock<HashMap<String, MiningJob>>> {
@@ -155,11 +188,32 @@ impl JobManager {
     }
 
     /// Start polling for new block templates. Runs indefinitely.
+    /// If longpoll is enabled, uses BIP22 long-polling to detect template
+    /// changes instantly, falling back to `poll_interval` regular polling
+    /// on errors or before we have a `longpollid`.
     pub async fn run(&self, poll_interval: Duration) {
-        info!("Job manager started, polling every {:?}", poll_interval);
+        if self.longpoll.enabled {
+            info!(timeout_secs = self.longpoll.timeout.as_secs(),
+                  fallback_interval = ?poll_interval,
+                  "Job manager started with longpoll enabled");
+        } else {
+            info!("Job manager started, polling every {:?}", poll_interval);
+        }
 
         loop {
-            match self.poll_template().await {
+            // Decide: longpoll if enabled and we have a longpollid, else regular poll.
+            let lpid = if self.longpoll.enabled {
+                self.last_longpollid.read().await.clone()
+            } else {
+                None
+            };
+
+            let result = match lpid {
+                Some(id) => self.poll_template_with_longpoll(&id).await,
+                None => self.poll_template().await,
+            };
+
+            match result {
                 Ok(new_block) => {
                     if new_block {
                         debug!("New block detected, jobs cleaned");
@@ -167,9 +221,37 @@ impl JobManager {
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to poll block template");
+                    // Sleep briefly after errors to avoid a tight retry loop.
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
                 }
             }
-            tokio::time::sleep(poll_interval).await;
+
+            // When longpoll is active and succeeded, zebrad already blocked
+            // until the template changed, so we can loop immediately. When
+            // using regular polling, sleep between cycles.
+            if !self.longpoll.enabled || self.last_longpollid.read().await.is_none() {
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+
+    /// Long-poll variant: passes `longpollid` back to the node. Returns
+    /// when the template changes, or falls back to a regular poll on
+    /// error so the loop never stalls.
+    async fn poll_template_with_longpoll(&self, longpollid: &str) -> Result<bool, node_rpc::RpcError> {
+        match self.rpc.get_block_template_longpoll(longpollid, self.longpoll.timeout).await {
+            Ok(template) => {
+                self.longpoll_wake_count.fetch_add(1, Ordering::Relaxed);
+                self.process_template(template).await
+            }
+            Err(e) => {
+                // Longpoll failed (timeout, HTTP error, etc.) — fall back
+                // to a normal poll so we always have a fresh template and
+                // longpollid for the next iteration.
+                warn!(error = %e, "Longpoll failed, falling back to regular poll");
+                self.poll_template().await
+            }
         }
     }
 
@@ -177,7 +259,18 @@ impl JobManager {
     /// immediately on new blocks. Non-clean job updates are throttled
     /// to avoid spamming miners that ignore them.
     async fn poll_template(&self) -> Result<bool, node_rpc::RpcError> {
-        let mut template = self.rpc.get_block_template().await?;
+        let template = self.rpc.get_block_template().await?;
+        self.process_template(template).await
+    }
+
+    /// Process a fetched template: detect new-block, inject coinbase tag,
+    /// create job, broadcast notify. Shared by regular and longpoll paths.
+    async fn process_template(&self, mut template: BlockTemplate) -> Result<bool, node_rpc::RpcError> {
+        // Capture the longpollid for the next request (if present).
+        {
+            let mut lpid = self.last_longpollid.write().await;
+            *lpid = template.longpollid.clone();
+        }
         let new_prev_hash = template.previousblockhash.clone();
 
         let is_new_block = {

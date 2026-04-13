@@ -140,6 +140,14 @@ struct DifficultyConfig {
     initial_target: String,
     target_shares_per_minute: f64,
     retarget_interval_secs: u64,
+    #[serde(default)]
+    use_longpoll: bool,
+    #[serde(default = "default_longpoll_timeout_secs")]
+    longpoll_timeout_secs: u64,
+}
+
+fn default_longpoll_timeout_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,6 +341,10 @@ async fn main() -> Result<()> {
         info!(coinbase_tag = %tag, "Coinbase tag injection enabled");
         job_manager.set_coinbase_tag(tag.as_bytes().to_vec());
     }
+    job_manager.set_longpoll_config(pool_core::job::LongpollConfig {
+        enabled: config.difficulty.use_longpoll,
+        timeout: Duration::from_secs(config.difficulty.longpoll_timeout_secs),
+    });
     let jobs = job_manager.jobs();
 
     // Initialize Block Assembler

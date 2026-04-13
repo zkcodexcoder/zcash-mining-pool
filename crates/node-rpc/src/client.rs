@@ -93,10 +93,58 @@ impl ZcashRpcClient {
     /// Fetch a block template for mining.
     pub async fn get_block_template(&self) -> Result<BlockTemplate, RpcError> {
         let params = serde_json::json!([{
-            "capabilities": ["coinbasetxn", "workid"],
+            "capabilities": ["coinbasetxn", "workid", "longpoll"],
             "mode": "template"
         }]);
         self.call("getblocktemplate", params).await
+    }
+
+    /// Long-polling variant of `get_block_template`. The node blocks until
+    /// the template identified by `longpollid` is no longer current (new
+    /// block, mempool change, etc.) and then returns the new template.
+    /// Uses `timeout` as a hard cap on the HTTP request so the pool can
+    /// fall back to regular polling if the node hangs.
+    pub async fn get_block_template_longpoll(
+        &self,
+        longpollid: &str,
+        timeout: Duration,
+    ) -> Result<BlockTemplate, RpcError> {
+        let params = serde_json::json!([{
+            "capabilities": ["coinbasetxn", "workid", "longpoll"],
+            "mode": "template",
+            "longpollid": longpollid,
+        }]);
+        self.call_with_timeout("getblocktemplate", params, timeout).await
+    }
+
+    /// Same as `call` but overrides the per-request HTTP timeout. Used for
+    /// long-polling requests that are expected to take longer than
+    /// `RPC_TIMEOUT`.
+    async fn call_with_timeout<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<T, RpcError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
+        let mut req = self.http.post(&self.url).json(&request).timeout(timeout);
+        if let Some((ref user, ref pass)) = self.auth {
+            req = req.basic_auth(user, Some(pass));
+        }
+        let http_resp = req.send().await?;
+        let body = http_resp.text().await?;
+        let resp: JsonRpcResponse<T> =
+            serde_json::from_str(&body).map_err(|_| RpcError::NullResult)?;
+        if let Some(err) = resp.error {
+            return Err(RpcError::JsonRpc(err));
+        }
+        resp.result.ok_or(RpcError::NullResult)
     }
 
     /// Submit a solved block to the network.
