@@ -51,10 +51,16 @@ impl VardiffTracker {
 
         // Early retarget: if we've already received 4x the expected shares
         // before the retarget interval, retarget immediately to avoid flooding.
+        //
+        // Require at least 3s of elapsed time so the shares/min calculation
+        // has a stable sample. With a 1s minimum, a single share submitted
+        // quickly after a prior retarget produced wildly inflated spm
+        // readings (e.g., 600+ spm from 2 shares in 200ms) and triggered
+        // ramp-path jumps that then immediately overcorrected downward.
         let expected_in_elapsed =
             self.target_shares_per_minute * elapsed / 60.0;
         let early_trigger = self.shares_in_window as f64 > expected_in_elapsed * 4.0
-            && elapsed >= 1.0;
+            && elapsed >= 3.0;
 
         if !early_trigger && elapsed < self.retarget_interval_secs {
             return None;
