@@ -82,8 +82,11 @@ async fn get_pool_info(
     Json(info)
 }
 
-async fn dashboard() -> Html<String> {
-    Html(DASHBOARD_HTML.to_string())
+async fn dashboard(State(state): State<AppState>) -> Html<String> {
+    let coin = if state.network == "mainnet" { "ZEC" } else { "TAZ" };
+    // Substitute the initial currency label so the page renders correctly
+    // before the first /api/pool/stats response arrives.
+    Html(DASHBOARD_HTML.replace("__INITIAL_COIN__", coin))
 }
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -598,7 +601,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="config-item">
                 <span class="config-label">Min Payout</span>
                 <span class="config-value" id="config-min-payout">0.01</span>
-                <span class="config-coin" id="config-coin">TAZ</span>
+                <span class="config-coin" id="config-coin">__INITIAL_COIN__</span>
             </div>
         </div>
     </div>
@@ -726,7 +729,7 @@ const MAX_HISTORY = 360;
 const REFRESH_STATS = 10000;
 const REFRESH_MINERS = 10000;
 const REFRESH_BLOCKS = 30000;
-let COIN = 'TAZ'; // updated from /api/pool/info
+let COIN = '__INITIAL_COIN__'; // seeded server-side, updated from /api/pool/stats
 let EXPLORER = 'https://testnet.cipherscan.app'; // updated from /api/pool/info
 
 const history = {
