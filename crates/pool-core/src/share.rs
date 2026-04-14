@@ -66,6 +66,11 @@ struct SessionDifficulty {
     local_port: u16,
     /// Recent difficulty adjustments (newest last).
     diff_history: Vec<DiffAdjustment>,
+    /// Per-session share counters for live visibility.
+    shares_accepted: u64,
+    shares_rejected_low_diff: u64,
+    shares_rejected_job_not_found: u64,
+    shares_rejected_other: u64,
 }
 
 /// A single difficulty adjustment event.
@@ -92,6 +97,15 @@ pub struct SessionSnapshot {
     pub retargets: usize,
     pub last_retarget_secs: Option<u64>,
     pub diff_history: Vec<DiffAdjustment>,
+    /// Per-session share counts since this session connected.
+    #[serde(default)]
+    pub shares_accepted: u64,
+    #[serde(default)]
+    pub shares_rejected_low_diff: u64,
+    #[serde(default)]
+    pub shares_rejected_job_not_found: u64,
+    #[serde(default)]
+    pub shares_rejected_other: u64,
 }
 
 pub struct ShareValidator {
@@ -235,6 +249,12 @@ impl ShareValidator {
                         self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.rate_reject_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.rejects_other.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        {
+                            let mut sessions = self.session_difficulty.write().await;
+                            if let Some(sd) = sessions.get_mut(&session_id) {
+                                sd.shares_rejected_other = sd.shares_rejected_other.saturating_add(1);
+                            }
+                        }
                         warn!(worker = %worker_name, "Share rate >500/s, rejecting");
                         self.stratum
                             .send_to_session(&session_id, ServerMessage::SubmitResult {
@@ -270,11 +290,12 @@ impl ShareValidator {
                                 debug!(worker = %worker_name, job = %job_id, "Share accepted");
                             }
                             self.shares_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            // Reset low-diff streak on accepted share
+                            // Reset low-diff streak and bump per-session accepted count
                             {
                                 let mut sessions = self.session_difficulty.write().await;
                                 if let Some(sd) = sessions.get_mut(&session_id) {
                                     sd.low_diff_streak = 0;
+                                    sd.shares_accepted = sd.shares_accepted.saturating_add(1);
                                 }
                             }
                             self.stratum
@@ -292,11 +313,23 @@ impl ShareValidator {
                         }
                         Err(e) => {
                             self.shares_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            match e.code {
+                            let code = e.code;
+                            match code {
                                 21 => { self.rejects_job_not_found.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                                 22 => { self.rejects_duplicate.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                                 23 => { self.rejects_low_diff.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                                 _ => { self.rejects_other.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                            }
+                            // Bump per-session counters for live visibility
+                            {
+                                let mut sessions = self.session_difficulty.write().await;
+                                if let Some(sd) = sessions.get_mut(&session_id) {
+                                    match code {
+                                        21 => sd.shares_rejected_job_not_found = sd.shares_rejected_job_not_found.saturating_add(1),
+                                        23 => sd.shares_rejected_low_diff = sd.shares_rejected_low_diff.saturating_add(1),
+                                        _ => sd.shares_rejected_other = sd.shares_rejected_other.saturating_add(1),
+                                    }
+                                }
                             }
                             let is_low_diff = e.is_low_difficulty();
                             warn!(worker = %worker_name, error = %e, "Share rejected");
@@ -404,6 +437,10 @@ impl ShareValidator {
                             connected_at: Instant::now(),
                             local_port,
                             diff_history: Vec::new(),
+                            shares_accepted: 0,
+                            shares_rejected_low_diff: 0,
+                            shares_rejected_job_not_found: 0,
+                            shares_rejected_other: 0,
                         });
                     }
                     let difficulty = initial_diff.unwrap_or(self.vardiff_config.initial_difficulty);
@@ -571,6 +608,10 @@ impl ShareValidator {
                     None
                 },
                 diff_history: sd.diff_history.clone(),
+                shares_accepted: sd.shares_accepted,
+                shares_rejected_low_diff: sd.shares_rejected_low_diff,
+                shares_rejected_job_not_found: sd.shares_rejected_job_not_found,
+                shares_rejected_other: sd.shares_rejected_other,
             }
         }).collect()
     }

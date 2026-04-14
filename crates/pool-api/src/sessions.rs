@@ -29,6 +29,14 @@ pub struct SessionSnapshot {
     pub last_retarget_secs: Option<u64>,
     #[serde(default)]
     pub diff_history: Vec<DiffAdjustment>,
+    #[serde(default)]
+    pub shares_accepted: u64,
+    #[serde(default)]
+    pub shares_rejected_low_diff: u64,
+    #[serde(default)]
+    pub shares_rejected_job_not_found: u64,
+    #[serde(default)]
+    pub shares_rejected_other: u64,
 }
 
 pub async fn get_sessions(State(state): State<AppState>) -> Json<Vec<SessionSnapshot>> {
@@ -208,6 +216,8 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
                     <th>Hashrate</th>
                     <th>Connected</th>
                     <th>Shares/Min</th>
+                    <th>Accepted</th>
+                    <th title="Rejections / (Accepted + Rejections)">Reject %</th>
                     <th>Retargets</th>
                     <th>Last Retarget</th>
                     <th>Ratio</th>
@@ -288,7 +298,7 @@ async function fetchSessions() {
 
         const tbody = document.getElementById('session-body');
         if (sessions.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#333;padding:2rem">No active sessions</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:#333;padding:2rem">No active sessions</td></tr>';
         } else {
             // Sort by difficulty descending
             sessions.sort((a, b) => b.difficulty - a.difficulty);
@@ -318,6 +328,15 @@ async function fetchSessions() {
                     : '#48bb78';
                 const expanded = expandedSessions.has(s.session_id);
                 const arrow = expanded ? '&#9660;' : '&#9654;';
+                const acc = s.shares_accepted || 0;
+                const rLD = s.shares_rejected_low_diff || 0;
+                const rJN = s.shares_rejected_job_not_found || 0;
+                const rOT = s.shares_rejected_other || 0;
+                const totalRej = rLD + rJN + rOT;
+                const totalSub = acc + totalRej;
+                const rejPct = totalSub > 0 ? (totalRej / totalSub) * 100 : 0;
+                const rejColor = rejPct > 10 ? '#fc8181' : rejPct > 2 ? '#f4b728' : '#48bb78';
+                const rejTitle = 'low_diff=' + rLD + ' job_not_found=' + rJN + ' other=' + rOT;
                 html += '<tr class="expandable" onclick="toggleSession(\'' + s.session_id + '\')">' +
                     '<td>' + arrow + ' ' + s.session_id.substring(0, 8) + '</td>' +
                     '<td><a class="worker-link" href="/miner/' + encodeURIComponent(addr) + '" title="' + s.worker_name + '" onclick="event.stopPropagation()">' + shortWorker + '</a></td>' +
@@ -327,13 +346,15 @@ async function fetchSessions() {
                     '<td>' + formatHashrate(s.hashrate) + '</td>' +
                     '<td>' + formatDuration(s.connected_secs) + '</td>' +
                     '<td>' + s.shares_per_min.toFixed(1) + '</td>' +
+                    '<td>' + acc.toLocaleString() + '</td>' +
+                    '<td style="color:' + rejColor + '" title="' + rejTitle + '">' + (totalSub > 0 ? rejPct.toFixed(1) + '%' : '--') + '</td>' +
                     '<td>' + s.retargets + '</td>' +
                     '<td>' + (s.last_retarget_secs != null ? formatDuration(s.last_retarget_secs) + ' ago' : '<span style="color:#333">--</span>') + '</td>' +
                     '<td style="color:' + ratioColor + '">' + s.smoothed_ratio.toFixed(2) + '</td>' +
                     '</tr>';
                 if (expanded) {
                     if (s.diff_history && s.diff_history.length > 1) {
-                        html += '<tr class="detail-row"><td colspan="11"><div class="detail-cell" style="display:flex;gap:1rem;align-items:flex-start">' +
+                        html += '<tr class="detail-row"><td colspan="13"><div class="detail-cell" style="display:flex;gap:1rem;align-items:flex-start">' +
                             '<div style="flex:1;min-width:0"><canvas id="chart-' + s.session_id + '"></canvas></div>' +
                             '<div style="flex:1;max-height:200px;overflow-y:auto">' +
                             '<table style="width:100%;font-size:0.7rem;border-collapse:collapse">' +
@@ -354,7 +375,7 @@ async function fetchSessions() {
                         }
                         html += '</tbody></table></div></div></td></tr>';
                     } else {
-                        html += '<tr class="detail-row"><td colspan="11"><div class="detail-cell" style="color:#333;font-size:0.75rem;text-align:center;padding:1rem">' +
+                        html += '<tr class="detail-row"><td colspan="13"><div class="detail-cell" style="color:#333;font-size:0.75rem;text-align:center;padding:1rem">' +
                             'No difficulty adjustments — steady state since connect</div></td></tr>';
                     }
                 }
