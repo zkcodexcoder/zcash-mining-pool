@@ -574,7 +574,8 @@ impl PoolDb {
                     COALESCE((SELECT SUM(s.difficulty) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?2), 0.0) as diff_sum_10m, \
                     COALESCE((SELECT COUNT(*) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?1), 0) as shares_1m, \
                     COALESCE((SELECT COUNT(*) FROM shares s WHERE s.worker_id = w.id AND s.created_at >= ?2), 0) as shares_10m, \
-                    (SELECT COUNT(*) FROM shares s WHERE s.worker_id = w.id) as total_shares \
+                    (SELECT COUNT(*) FROM shares s WHERE s.worker_id = w.id) as total_shares, \
+                    (SELECT s.created_at FROM shares s WHERE s.worker_id = w.id ORDER BY s.id ASC LIMIT 1) as first_share_at \
              FROM workers w WHERE w.miner_id = ?3",
         )
         .bind(since_1m)
@@ -595,6 +596,7 @@ impl PoolDb {
                 shares_1m: row.get("shares_1m"),
                 shares_10m: row.get("shares_10m"),
                 total_shares: row.get("total_shares"),
+                first_share_at: row.get("first_share_at"),
             })
             .collect();
 

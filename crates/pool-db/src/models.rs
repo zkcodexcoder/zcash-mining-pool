@@ -12,6 +12,9 @@ pub struct WorkerDiagnostics {
     pub shares_1m: i64,
     pub shares_10m: i64,
     pub total_shares: i64,
+    /// Timestamp of the first share this worker ever submitted. None if
+    /// the worker has never submitted a share.
+    pub first_share_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

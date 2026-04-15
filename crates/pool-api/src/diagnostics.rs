@@ -18,6 +18,12 @@ pub struct WorkerInfoDiag {
     pub total_shares: i64,
     pub last_seen: String,
     pub is_online: bool,
+    /// Seconds since this worker's first share. None if the worker has
+    /// never submitted. Used by the UI to suppress hashrate averages
+    /// when the worker hasn't been active long enough (e.g., don't
+    /// show a 10-minute average until 10 minutes have elapsed).
+    #[serde(default)]
+    pub first_share_age_secs: Option<i64>,
     /// Live rejection stats for this worker's currently-active sessions.
     /// Counts are 0 if the worker has no active session right now.
     #[serde(default)]
@@ -64,6 +70,11 @@ pub struct MinerDiagnostics {
     pub paid_zec: f64,
     pub total_hashrate_1m: f64,
     pub total_hashrate_10m: f64,
+    /// Age (in seconds) of the oldest worker's first share across all
+    /// this miner's workers. Used by the UI to suppress hashrate
+    /// averages when no worker has enough history yet.
+    #[serde(default)]
+    pub max_worker_age_secs: Option<i64>,
     pub workers: Vec<WorkerInfoDiag>,
     pub recent_shares: Vec<ShareEntry>,
     pub blocks_found: Vec<BlockEntry>,
@@ -173,6 +184,7 @@ pub async fn get_miner_diagnostics(
     // rejection aggregates.
     let session_snapshots = read_session_snapshots(&state).await;
 
+    let now_chrono = chrono::Utc::now();
     let workers: Vec<WorkerInfoDiag> = worker_stats
         .into_iter()
         .map(|w| {
@@ -180,6 +192,14 @@ pub async fn get_miner_diagnostics(
             let hr_10m = (w.diff_sum_10m / 600.0) * mult;
             total_hashrate_1m += hr_1m;
             total_hashrate_10m += hr_10m;
+
+            // Compute seconds since first share (None if never mined).
+            let first_share_age_secs = w.first_share_at.as_ref().and_then(|ts| {
+                chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .map(|ndt| ndt.and_utc())
+                    .map(|dt| (now_chrono - dt).num_seconds())
+            });
 
             // Sum live rejection stats across this worker's active sessions.
             let mut acc = 0u64;
@@ -210,6 +230,7 @@ pub async fn get_miner_diagnostics(
                 total_shares: w.total_shares,
                 is_online: w.last_seen >= online_threshold,
                 last_seen: w.last_seen,
+                first_share_age_secs,
                 live_accepted: acc,
                 live_rejected_low_diff: rld,
                 live_rejected_job_not_found: rjnf,
@@ -254,12 +275,19 @@ pub async fn get_miner_diagnostics(
     // sessions_snapshot already fetched above.
     let live_session_stats = aggregate_for_address(&session_snapshots, &miner.address);
 
+    // Age of the longest-running worker for this miner. The dashboard
+    // uses this to decide whether to show the miner-level 10m hashrate.
+    let max_worker_age_secs = workers.iter()
+        .filter_map(|w| w.first_share_age_secs)
+        .max();
+
     Ok(Json(MinerDiagnostics {
         address: miner.address,
         pending_zec: balance.pending as f64 / ZATOSHIS_PER_ZEC,
         paid_zec: balance.paid as f64 / ZATOSHIS_PER_ZEC,
         total_hashrate_1m,
         total_hashrate_10m,
+        max_worker_age_secs,
         workers,
         recent_shares: share_entries,
         blocks_found: block_entries,
@@ -810,8 +838,20 @@ async function fetchDiagnostics() {
         document.title = 'Miner: ' + addr.substring(0, 16) + '...';
 
         // Summary cards
-        document.getElementById('hr-1m').textContent = formatHashrate(d.total_hashrate_1m);
-        document.getElementById('hr-10m').textContent = formatHashrate(d.total_hashrate_10m);
+        // Suppress miner-level hashrate averages until enough history exists.
+        const mAge = d.max_worker_age_secs;
+        const setHash = (id, hr, minAge) => {
+            const el = document.getElementById(id);
+            if (mAge != null && mAge >= minAge) {
+                el.textContent = formatHashrate(hr);
+                el.title = '';
+            } else {
+                el.textContent = '--';
+                el.title = 'Need at least ' + (minAge >= 600 ? '10 minutes' : '60 seconds') + ' of mining history';
+            }
+        };
+        setHash('hr-1m', d.total_hashrate_1m, 60);
+        setHash('hr-10m', d.total_hashrate_10m, 600);
         document.getElementById('bal-pending').textContent = d.pending_zec.toFixed(8) + ' ' + COIN;
         document.getElementById('bal-paid').textContent = d.paid_zec.toFixed(8) + ' ' + COIN;
         document.getElementById('total-workers').textContent = d.workers.length;
@@ -858,12 +898,18 @@ async function fetchDiagnostics() {
                     const tip = 'low_diff=' + rld + ' job_not_found=' + rjnf + ' other=' + roth + ' (' + acc + ' accepted)';
                     rejCell = '<td style="color:' + color + '" title="' + tip + '">' + pct.toFixed(1) + '%</td>';
                 }
+                // Suppress hashrate averages until the worker has enough history.
+                const age = w.first_share_age_secs;
+                const hr1m = (age != null && age >= 60) ? formatHashrate(w.hashrate_1m)
+                    : '<span title="Need at least 60s of history">--</span>';
+                const hr10m = (age != null && age >= 600) ? formatHashrate(w.hashrate_10m)
+                    : '<span title="Need at least 10m of history">--</span>';
                 return '<tr>' +
                     '<td><span class="status-dot ' + (w.is_online ? 'dot-online' : 'dot-offline') + '"></span>' +
                     '<span class="' + (w.is_online ? 'status-online' : 'status-offline') + '">' + (w.is_online ? 'Online' : 'Offline') + '</span></td>' +
                     '<td><a href="/sessions?worker=' + encodeURIComponent(w.name) + '" style="color:#e0e0e0;text-decoration:none" title="View live sessions">' + w.name + '</a></td>' +
-                    '<td>' + formatHashrate(w.hashrate_1m) + '</td>' +
-                    '<td>' + formatHashrate(w.hashrate_10m) + '</td>' +
+                    '<td>' + hr1m + '</td>' +
+                    '<td>' + hr10m + '</td>' +
                     '<td>' + (w.current_difficulty != null ? w.current_difficulty.toFixed(4) : '--') + '</td>' +
                     '<td>' + w.shares_1m.toLocaleString() + '</td>' +
                     '<td>' + w.shares_10m.toLocaleString() + '</td>' +
