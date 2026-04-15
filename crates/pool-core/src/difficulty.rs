@@ -98,10 +98,11 @@ impl VardiffTracker {
         let elapsed = self.window_start.elapsed().as_secs_f64();
         let shares_per_minute = (self.shares_in_window as f64 / elapsed.max(0.01)) * 60.0;
 
-        // Stable zone: if miner is producing 10-50 shares/min AND difficulty
-        // is above 10, don't adjust. Only applies once difficulty has ramped up
-        // enough — low-difficulty miners need to keep adjusting through this range.
-        if shares_per_minute >= 10.0 && shares_per_minute <= 50.0 && self.current_difficulty > 10.0 {
+        // Hard stable zone: if the miner is producing 10-50 shares/min, don't
+        // adjust at all. This range covers ratio 0.5-2.5 of target, which is
+        // plenty of tolerance for natural variance. Applies at any difficulty
+        // — a low-diff miner producing in this range is fine where they are.
+        if shares_per_minute >= 10.0 && shares_per_minute <= 50.0 {
             self.shares_in_window = 0;
             self.window_start = Instant::now();
             return None;
