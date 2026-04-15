@@ -341,11 +341,20 @@ impl ShareValidator {
                             // If difficulty is too high, miner can only submit
                             // low-difficulty shares. Reset to minimum so vardiff
                             // can ramp up from scratch.
+                            //
+                            // Safety: only reset if the miner has NEVER submitted
+                            // a valid share. A responsive miner that has any
+                            // accepts doesn't need this reset — vardiff will
+                            // self-correct. Without this guard, very fast GPUs
+                            // (5090-class) thrash: rate-limit ramps diff up, a
+                            // burst of in-flight shares at old diff fails as
+                            // low_diff, hits 10 streak, resets to diff 1, repeat.
                             if is_low_diff {
                                 let mut sessions = self.session_difficulty.write().await;
                                 if let Some(sd) = sessions.get_mut(&session_id) {
                                     sd.low_diff_streak += 1;
-                                    if sd.low_diff_streak >= 10 {
+                                    let never_accepted = sd.shares_accepted == 0;
+                                    if sd.low_diff_streak >= 10 && never_accepted {
                                         let new_diff = self.vardiff_config.initial_difficulty;
                                         let streak = sd.low_diff_streak;
                                         info!(%session_id, old_diff = sd.vardiff.current_difficulty(),
