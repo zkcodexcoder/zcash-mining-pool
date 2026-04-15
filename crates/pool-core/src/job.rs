@@ -263,6 +263,75 @@ impl JobManager {
         self.process_template(template).await
     }
 
+    /// Build and broadcast an empty-block notify: a mining job with no
+    /// mempool transactions, just our (tagged) coinbase. Used as the
+    /// race-to-tip fast path — lets miners start hashing on the new
+    /// prev_hash while we finish building the full template in parallel.
+    async fn broadcast_empty_block(&self, template: &BlockTemplate) {
+        // Clone into a stripped-down template with no mempool txs and no
+        // pre-cached merkle root (so compute_merkle_root runs over just
+        // the coinbase).
+        let mut empty = template.clone();
+        empty.transactions.clear();
+        if let Some(ref mut dr) = empty.defaultroots {
+            dr.merkleroot = None;
+        }
+
+        // Re-apply our coinbase tag with zero auth_digests (since the
+        // block will contain only the coinbase transaction).
+        if let Some(ref tag) = self.coinbase_tag {
+            if let Some(ref mut cb) = empty.coinbasetxn {
+                let chain_history_root = empty
+                    .defaultroots
+                    .as_ref()
+                    .and_then(|dr| dr.chainhistoryroot.as_deref())
+                    .unwrap_or("");
+                match crate::coinbase::inject_coinbase_tag(
+                    &cb.data,
+                    tag,
+                    chain_history_root,
+                    &[], // no other tx auth digests
+                ) {
+                    Ok(result) => {
+                        cb.data = result.new_coinbase_hex;
+                        if let Some(new_txid) = result.new_txid {
+                            cb.hash = new_txid;
+                        }
+                        if let Some(new_bc) = result.new_block_commitments {
+                            if let Some(ref mut dr) = empty.defaultroots {
+                                dr.blockcommitmentshash = Some(new_bc.clone());
+                            }
+                            empty.blockcommitmentshash = Some(new_bc);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "empty-block: failed to inject coinbase tag; skipping race-to-tip for this round");
+                        return;
+                    }
+                }
+            }
+        }
+
+        let job_id = self
+            .job_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string();
+        let job = MiningJob::from_template(empty, job_id.clone());
+        let notify = job.to_notify(true); // clean_jobs=true: switch to new tip
+
+        // Cache the empty job so shares submitted against it can be validated.
+        {
+            let mut jobs = self.jobs.write().await;
+            jobs.insert(job_id.clone(), job);
+        }
+        {
+            let mut latest = self.latest_notify.write().await;
+            *latest = Some(notify.clone());
+        }
+        self.stratum.broadcast_notify(notify);
+        debug!(job_id = %job_id, "Race-to-tip: emitted empty-block notify");
+    }
+
     /// Process a fetched template: detect new-block, inject coinbase tag,
     /// create job, broadcast notify. Shared by regular and longpoll paths.
     async fn process_template(&self, mut template: BlockTemplate) -> Result<bool, node_rpc::RpcError> {
@@ -277,6 +346,16 @@ impl JobManager {
             let last = self.last_prev_hash.read().await;
             *last != new_prev_hash
         };
+
+        // Race-to-tip: on a new block, emit a lightweight empty-block notify
+        // (no mempool txs) so miners switch to the new prev_hash ~5-15ms
+        // earlier than if we waited to finish the full template build. If a
+        // miner finds a share against the empty template it's still a valid
+        // block — we just forgo the mempool tx fees on that one block. The
+        // full-template notify follows immediately with clean_jobs=false.
+        if is_new_block {
+            self.broadcast_empty_block(&template).await;
+        }
 
         if let Some(ref at) = self.last_template_at_ms {
             let ms = SystemTime::now()
@@ -353,7 +432,11 @@ impl JobManager {
             .to_string();
 
         let job = MiningJob::from_template(template, job_id.clone());
-        let notify = job.to_notify(is_new_block);
+        // Race-to-tip already sent the clean_jobs=true empty notify when
+        // is_new_block. This follow-up full-template notify uses
+        // clean_jobs=false so miners keep any in-flight shares they
+        // already found against the empty job as still-valid.
+        let notify = job.to_notify(false);
 
         {
             let mut jobs = self.jobs.write().await;
