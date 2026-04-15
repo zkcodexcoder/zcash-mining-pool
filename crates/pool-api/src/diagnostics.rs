@@ -56,6 +56,18 @@ pub struct MinerDiagnostics {
     pub recent_shares: Vec<ShareEntry>,
     pub blocks_found: Vec<BlockEntry>,
     pub payouts: Vec<PayoutEntry>,
+    /// Live rejection stats summed across this miner's currently-active sessions.
+    pub live_session_stats: LiveSessionStats,
+}
+
+#[derive(Serialize, Default)]
+pub struct LiveSessionStats {
+    pub active_sessions: usize,
+    pub accepted: u64,
+    pub rejected_low_diff: u64,
+    pub rejected_job_not_found: u64,
+    pub rejected_other: u64,
+    pub rejection_pct: f64,
 }
 
 pub async fn get_miner_diagnostics(
@@ -197,6 +209,10 @@ pub async fn get_miner_diagnostics(
         })
         .collect();
 
+    // Aggregate live-session rejection stats for this miner from the
+    // sessions_snapshot maintained by pool-core.
+    let live_session_stats = aggregate_live_session_stats(&state, &miner.address).await;
+
     Ok(Json(MinerDiagnostics {
         address: miner.address,
         pending_zec: balance.pending as f64 / ZATOSHIS_PER_ZEC,
@@ -207,7 +223,40 @@ pub async fn get_miner_diagnostics(
         recent_shares: share_entries,
         blocks_found: block_entries,
         payouts: payout_entries,
+        live_session_stats,
     }))
+}
+
+/// Sum per-session rejection counters across all active sessions for one
+/// miner address. Reads the sessions_snapshot pool_status row written by
+/// pool-core every few seconds.
+async fn aggregate_live_session_stats(state: &AppState, address: &str) -> LiveSessionStats {
+    let snap = match state.db.get_pool_status("sessions_snapshot").await {
+        Ok(Some((v, _))) => v,
+        _ => return LiveSessionStats::default(),
+    };
+    let sessions: Vec<crate::sessions::SessionSnapshot> =
+        match serde_json::from_str(&snap) {
+            Ok(s) => s,
+            Err(_) => return LiveSessionStats::default(),
+        };
+    let mut stats = LiveSessionStats::default();
+    for s in sessions.iter() {
+        // Match the address prefix of the worker_name (everything before the dot).
+        let worker_addr = s.worker_name.split('.').next().unwrap_or("");
+        if worker_addr != address {
+            continue;
+        }
+        stats.active_sessions += 1;
+        stats.accepted = stats.accepted.saturating_add(s.shares_accepted);
+        stats.rejected_low_diff = stats.rejected_low_diff.saturating_add(s.shares_rejected_low_diff);
+        stats.rejected_job_not_found = stats.rejected_job_not_found.saturating_add(s.shares_rejected_job_not_found);
+        stats.rejected_other = stats.rejected_other.saturating_add(s.shares_rejected_other);
+    }
+    let total_rej = stats.rejected_low_diff + stats.rejected_job_not_found + stats.rejected_other;
+    let total = stats.accepted + total_rej;
+    stats.rejection_pct = if total > 0 { (total_rej as f64 / total as f64) * 100.0 } else { 0.0 };
+    stats
 }
 
 pub async fn miner_page(State(state): State<AppState>) -> Html<String> {
@@ -469,6 +518,10 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
                 <div class="label">Blocks Found</div>
                 <div class="value" id="blocks-found">--</div>
             </div>
+            <div class="hero-card">
+                <div class="label" title="Rejection rate across this miner's currently-active sessions (low-diff + job-not-found + other / total submissions)">Live Reject %</div>
+                <div class="value" id="reject-pct" title="Hover for breakdown">--</div>
+            </div>
         </div>
 
         <div class="section-title">Workers</div>
@@ -720,6 +773,26 @@ async function fetchDiagnostics() {
         document.getElementById('bal-paid').textContent = d.paid_zec.toFixed(8) + ' ' + COIN;
         document.getElementById('total-workers').textContent = d.workers.length;
         document.getElementById('blocks-found').textContent = d.blocks_found.length;
+
+        // Live rejection rate from active sessions
+        const lss = d.live_session_stats || {active_sessions:0, accepted:0, rejected_low_diff:0, rejected_job_not_found:0, rejected_other:0, rejection_pct:0};
+        const totalSubs = lss.accepted + lss.rejected_low_diff + lss.rejected_job_not_found + lss.rejected_other;
+        const rejEl = document.getElementById('reject-pct');
+        if (lss.active_sessions === 0 || totalSubs === 0) {
+            rejEl.textContent = '--';
+            rejEl.style.color = '#888';
+            rejEl.title = 'No active sessions';
+        } else {
+            const pct = lss.rejection_pct;
+            const color = pct > 10 ? '#fc8181' : pct > 2 ? '#f4b728' : '#48bb78';
+            rejEl.textContent = pct.toFixed(1) + '%';
+            rejEl.style.color = color;
+            rejEl.title = 'sessions=' + lss.active_sessions
+                + ' accepted=' + lss.accepted
+                + ' low_diff=' + lss.rejected_low_diff
+                + ' job_not_found=' + lss.rejected_job_not_found
+                + ' other=' + lss.rejected_other;
+        }
 
         // Workers table
         const wTbody = document.querySelector('#workers-table tbody');
