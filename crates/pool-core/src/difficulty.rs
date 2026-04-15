@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Variable difficulty (vardiff) tracker for a single miner.
 /// Adjusts the share target to maintain a desired share submission rate.
@@ -21,7 +21,15 @@ pub struct VardiffTracker {
     /// Track last retarget direction to detect oscillation.
     /// true = last retarget went up, false = went down, None = no retarget yet.
     last_went_up: Option<bool>,
+    /// When the most recent retarget was applied. Used to enforce a minimum
+    /// interval between retargets so the rate-limit path can't thrash.
+    last_retarget_at: Instant,
 }
+
+/// Minimum elapsed time between any two successful retargets. Prevents the
+/// rate-limit force_retarget path (which has no other guard) from firing
+/// repeatedly within milliseconds during a fast miner's ramp-up.
+const MIN_RETARGET_INTERVAL: Duration = Duration::from_millis(500);
 
 impl VardiffTracker {
     pub fn new(
@@ -40,6 +48,7 @@ impl VardiffTracker {
             max_difficulty: 10_000_000_000.0,
             smoothed_ratio: 1.0,
             last_went_up: None,
+            last_retarget_at: Instant::now(),
         }
     }
 
@@ -78,13 +87,21 @@ impl VardiffTracker {
 
     /// Shared retarget calculation used by both `record_share` and `force_retarget`.
     fn compute_retarget(&mut self, trigger: &str) -> Option<(f64, String)> {
+        // Minimum-interval guard: skip silently if we retargeted very
+        // recently. This prevents the rate-limit force_retarget path from
+        // firing multiple times per millisecond during a fast miner's
+        // ramp-up (observed with a 5090 producing 20+ retargets in <1s).
+        if self.last_retarget_at.elapsed() < MIN_RETARGET_INTERVAL {
+            return None;
+        }
+
         let elapsed = self.window_start.elapsed().as_secs_f64();
         let shares_per_minute = (self.shares_in_window as f64 / elapsed.max(0.01)) * 60.0;
 
-        // Stable zone: if miner is producing 20-100 shares/min AND difficulty
+        // Stable zone: if miner is producing 10-50 shares/min AND difficulty
         // is above 10, don't adjust. Only applies once difficulty has ramped up
         // enough — low-difficulty miners need to keep adjusting through this range.
-        if shares_per_minute >= 20.0 && shares_per_minute <= 100.0 && self.current_difficulty > 10.0 {
+        if shares_per_minute >= 10.0 && shares_per_minute <= 50.0 && self.current_difficulty > 10.0 {
             self.shares_in_window = 0;
             self.window_start = Instant::now();
             return None;
@@ -149,6 +166,7 @@ impl VardiffTracker {
         self.current_difficulty = final_difficulty;
         self.shares_in_window = 0;
         self.window_start = Instant::now();
+        self.last_retarget_at = Instant::now();
 
         Some((final_difficulty, format!("{direction}: {reason}")))
     }
@@ -213,5 +231,21 @@ mod tests {
     fn difficulty_to_target_valid() {
         let target = difficulty_to_target_hex(1.0);
         assert_eq!(target.len(), 64);
+    }
+
+    #[test]
+    fn vardiff_min_interval_blocks_rapid_retargets() {
+        // A fresh tracker has last_retarget_at = now(); within 500ms
+        // any force_retarget should be silently skipped.
+        let mut v = VardiffTracker::new(20.0, 30.0, 1000.0);
+        // First force_retarget: inside the 500ms grace after construction,
+        // so it should be blocked too.
+        assert!(v.force_retarget().is_none(),
+            "retarget within MIN_RETARGET_INTERVAL must be skipped");
+        // Second force_retarget immediately after: still blocked.
+        assert!(v.force_retarget().is_none(),
+            "back-to-back force_retargets must be skipped");
+        // Difficulty should remain at its initial value since nothing fired.
+        assert_eq!(v.current_difficulty(), 1000.0);
     }
 }
