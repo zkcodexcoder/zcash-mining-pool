@@ -444,8 +444,13 @@ impl JobManager {
                 // Keep the last few jobs so shares found just before a block
                 // change aren't rejected as "Job not found".
                 if jobs.len() > 10 {
+                    // Sort by numeric job_id, not string, so e.g. "1000" sorts
+                    // after "999" instead of after "1" (lexicographic). Without
+                    // this fix, every counter digit-boundary crossing evicts
+                    // the newest jobs and keeps old ones — causing spurious
+                    // Job-not-found rejections on the next block transition.
                     let mut ids: Vec<String> = jobs.keys().cloned().collect();
-                    ids.sort();
+                    ids.sort_by_key(|s| s.parse::<u64>().unwrap_or(0));
                     let remove_count = ids.len().saturating_sub(3);
                     for id in ids.into_iter().take(remove_count) {
                         jobs.remove(&id);
