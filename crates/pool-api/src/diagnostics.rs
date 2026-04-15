@@ -18,6 +18,18 @@ pub struct WorkerInfoDiag {
     pub total_shares: i64,
     pub last_seen: String,
     pub is_online: bool,
+    /// Live rejection stats for this worker's currently-active sessions.
+    /// Counts are 0 if the worker has no active session right now.
+    #[serde(default)]
+    pub live_accepted: u64,
+    #[serde(default)]
+    pub live_rejected_low_diff: u64,
+    #[serde(default)]
+    pub live_rejected_job_not_found: u64,
+    #[serde(default)]
+    pub live_rejected_other: u64,
+    #[serde(default)]
+    pub live_rejection_pct: f64,
 }
 
 #[derive(Serialize)]
@@ -157,6 +169,10 @@ pub async fn get_miner_diagnostics(
     let mut total_hashrate_1m = 0.0;
     let mut total_hashrate_10m = 0.0;
 
+    // Read sessions snapshot once — reused for miner-level and per-worker
+    // rejection aggregates.
+    let session_snapshots = read_session_snapshots(&state).await;
+
     let workers: Vec<WorkerInfoDiag> = worker_stats
         .into_iter()
         .map(|w| {
@@ -164,6 +180,26 @@ pub async fn get_miner_diagnostics(
             let hr_10m = (w.diff_sum_10m / 600.0) * mult;
             total_hashrate_1m += hr_1m;
             total_hashrate_10m += hr_10m;
+
+            // Sum live rejection stats across this worker's active sessions.
+            let mut acc = 0u64;
+            let mut rld = 0u64;
+            let mut rjnf = 0u64;
+            let mut roth = 0u64;
+            for s in session_snapshots.iter() {
+                let parts: Vec<&str> = s.worker_name.splitn(2, '.').collect();
+                if parts.len() < 2 { continue; }
+                if parts[0] != miner.address { continue; }
+                if parts[1] != w.name { continue; }
+                acc = acc.saturating_add(s.shares_accepted);
+                rld = rld.saturating_add(s.shares_rejected_low_diff);
+                rjnf = rjnf.saturating_add(s.shares_rejected_job_not_found);
+                roth = roth.saturating_add(s.shares_rejected_other);
+            }
+            let total_rej = rld + rjnf + roth;
+            let total_subs = acc + total_rej;
+            let pct = if total_subs > 0 { (total_rej as f64 / total_subs as f64) * 100.0 } else { 0.0 };
+
             WorkerInfoDiag {
                 name: w.name,
                 hashrate_1m: hr_1m,
@@ -174,6 +210,11 @@ pub async fn get_miner_diagnostics(
                 total_shares: w.total_shares,
                 is_online: w.last_seen >= online_threshold,
                 last_seen: w.last_seen,
+                live_accepted: acc,
+                live_rejected_low_diff: rld,
+                live_rejected_job_not_found: rjnf,
+                live_rejected_other: roth,
+                live_rejection_pct: pct,
             }
         })
         .collect();
@@ -210,8 +251,8 @@ pub async fn get_miner_diagnostics(
         .collect();
 
     // Aggregate live-session rejection stats for this miner from the
-    // sessions_snapshot maintained by pool-core.
-    let live_session_stats = aggregate_live_session_stats(&state, &miner.address).await;
+    // sessions_snapshot already fetched above.
+    let live_session_stats = aggregate_for_address(&session_snapshots, &miner.address);
 
     Ok(Json(MinerDiagnostics {
         address: miner.address,
@@ -227,22 +268,23 @@ pub async fn get_miner_diagnostics(
     }))
 }
 
+/// Read the live sessions_snapshot from pool_status. Returns an empty
+/// Vec if the row is missing or unparseable.
+async fn read_session_snapshots(state: &AppState) -> Vec<crate::sessions::SessionSnapshot> {
+    match state.db.get_pool_status("sessions_snapshot").await {
+        Ok(Some((v, _))) => serde_json::from_str(&v).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// Sum per-session rejection counters across all active sessions for one
-/// miner address. Reads the sessions_snapshot pool_status row written by
-/// pool-core every few seconds.
-async fn aggregate_live_session_stats(state: &AppState, address: &str) -> LiveSessionStats {
-    let snap = match state.db.get_pool_status("sessions_snapshot").await {
-        Ok(Some((v, _))) => v,
-        _ => return LiveSessionStats::default(),
-    };
-    let sessions: Vec<crate::sessions::SessionSnapshot> =
-        match serde_json::from_str(&snap) {
-            Ok(s) => s,
-            Err(_) => return LiveSessionStats::default(),
-        };
+/// miner address (any worker suffix).
+fn aggregate_for_address(
+    sessions: &[crate::sessions::SessionSnapshot],
+    address: &str,
+) -> LiveSessionStats {
     let mut stats = LiveSessionStats::default();
     for s in sessions.iter() {
-        // Match the address prefix of the worker_name (everything before the dot).
         let worker_addr = s.worker_name.split('.').next().unwrap_or("");
         if worker_addr != address {
             continue;
@@ -537,6 +579,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
                         <th>Shares (1m)</th>
                         <th>Shares (10m)</th>
                         <th>Total Shares</th>
+                        <th title="Live rejection rate from this worker's currently-active sessions">Reject %</th>
                         <th>Last Seen</th>
                     </tr>
                 </thead>
@@ -797,22 +840,38 @@ async function fetchDiagnostics() {
         // Workers table
         const wTbody = document.querySelector('#workers-table tbody');
         if (d.workers.length === 0) {
-            wTbody.innerHTML = '<tr><td colspan="9" class="empty-msg">No workers found</td></tr>';
+            wTbody.innerHTML = '<tr><td colspan="10" class="empty-msg">No workers found</td></tr>';
         } else {
-            wTbody.innerHTML = d.workers.map(w =>
-                '<tr>' +
-                '<td><span class="status-dot ' + (w.is_online ? 'dot-online' : 'dot-offline') + '"></span>' +
-                '<span class="' + (w.is_online ? 'status-online' : 'status-offline') + '">' + (w.is_online ? 'Online' : 'Offline') + '</span></td>' +
-                '<td><a href="/sessions?worker=' + encodeURIComponent(w.name) + '" style="color:#e0e0e0;text-decoration:none" title="View live sessions">' + w.name + '</a></td>' +
-                '<td>' + formatHashrate(w.hashrate_1m) + '</td>' +
-                '<td>' + formatHashrate(w.hashrate_10m) + '</td>' +
-                '<td>' + (w.current_difficulty != null ? w.current_difficulty.toFixed(4) : '--') + '</td>' +
-                '<td>' + w.shares_1m.toLocaleString() + '</td>' +
-                '<td>' + w.shares_10m.toLocaleString() + '</td>' +
-                '<td>' + w.total_shares.toLocaleString() + '</td>' +
-                '<td>' + w.last_seen + '</td>' +
-                '</tr>'
-            ).join('');
+            wTbody.innerHTML = d.workers.map(w => {
+                const acc = w.live_accepted || 0;
+                const rld = w.live_rejected_low_diff || 0;
+                const rjnf = w.live_rejected_job_not_found || 0;
+                const roth = w.live_rejected_other || 0;
+                const totRej = rld + rjnf + roth;
+                const totSubs = acc + totRej;
+                let rejCell;
+                if (totSubs === 0) {
+                    rejCell = '<td style="color:#666">--</td>';
+                } else {
+                    const pct = w.live_rejection_pct;
+                    const color = pct > 10 ? '#fc8181' : pct > 2 ? '#f4b728' : '#48bb78';
+                    const tip = 'low_diff=' + rld + ' job_not_found=' + rjnf + ' other=' + roth + ' (' + acc + ' accepted)';
+                    rejCell = '<td style="color:' + color + '" title="' + tip + '">' + pct.toFixed(1) + '%</td>';
+                }
+                return '<tr>' +
+                    '<td><span class="status-dot ' + (w.is_online ? 'dot-online' : 'dot-offline') + '"></span>' +
+                    '<span class="' + (w.is_online ? 'status-online' : 'status-offline') + '">' + (w.is_online ? 'Online' : 'Offline') + '</span></td>' +
+                    '<td><a href="/sessions?worker=' + encodeURIComponent(w.name) + '" style="color:#e0e0e0;text-decoration:none" title="View live sessions">' + w.name + '</a></td>' +
+                    '<td>' + formatHashrate(w.hashrate_1m) + '</td>' +
+                    '<td>' + formatHashrate(w.hashrate_10m) + '</td>' +
+                    '<td>' + (w.current_difficulty != null ? w.current_difficulty.toFixed(4) : '--') + '</td>' +
+                    '<td>' + w.shares_1m.toLocaleString() + '</td>' +
+                    '<td>' + w.shares_10m.toLocaleString() + '</td>' +
+                    '<td>' + w.total_shares.toLocaleString() + '</td>' +
+                    rejCell +
+                    '<td>' + w.last_seen + '</td>' +
+                    '</tr>';
+            }).join('');
         }
 
         // Store shares globally and populate worker filter
