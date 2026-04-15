@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pool_db::PoolDb;
 use serde::Serialize;
@@ -50,10 +50,30 @@ enum RateStatus {
 /// Max difficulty adjustments to keep per session.
 const MAX_DIFF_HISTORY: usize = 50;
 
+/// A previous target we still accept shares for (grace window). When the
+/// pool raises difficulty, in-flight shares from the miner were generated
+/// against the older, easier target; rejecting them as low_diff wastes the
+/// miner's work. Instead we credit them at the older difficulty.
+#[derive(Clone)]
+struct GraceTarget {
+    target: [u8; 32],
+    difficulty: f64,
+    set_at: Instant,
+}
+
+/// Max number of previous targets to remember.
+const GRACE_TARGET_HISTORY: usize = 3;
+/// Max age of a grace target before we stop accepting shares for it.
+/// Any miner still submitting at a target older than this is malfunctioning.
+const GRACE_TARGET_MAX_AGE: Duration = Duration::from_secs(60);
+
 /// Per-session state: vardiff tracker + current target + rate limiter.
 struct SessionDifficulty {
     vardiff: VardiffTracker,
     target: [u8; 32],
+    /// Recently-replaced targets that we still accept shares for. Newest
+    /// last. Capped at GRACE_TARGET_HISTORY entries.
+    recent_targets: Vec<GraceTarget>,
     /// Tracks share submissions for rate limiting.
     rate_window_start: Instant,
     rate_window_shares: u32,
@@ -367,6 +387,7 @@ impl ShareValidator {
                                         {
                                             let mut sessions = self.session_difficulty.write().await;
                                             if let Some(sd) = sessions.get_mut(&session_id) {
+                                                push_grace_target(sd);
                                                 sd.vardiff = tracker;
                                                 sd.target = target;
                                                 sd.diff_history.push(DiffAdjustment {
@@ -438,6 +459,7 @@ impl ShareValidator {
                         sessions.insert(session_id.clone(), SessionDifficulty {
                             vardiff: tracker,
                             target,
+                            recent_targets: Vec::new(),
                             rate_window_start: Instant::now(),
                             rate_window_shares: 0,
                             low_diff_streak: 0,
@@ -558,6 +580,10 @@ impl ShareValidator {
         {
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
+                // Save the previous target to the grace window so in-flight
+                // shares the miner already found at the old (easier) diff
+                // can still be credited at that diff.
+                push_grace_target(sd);
                 sd.target = new_target;
                 let entry = DiffAdjustment {
                     secs_since_connect: sd.connected_at.elapsed().as_secs(),
@@ -752,21 +778,44 @@ impl ShareValidator {
         // Compute SHA-256d of the header (Zcash/Bitcoin block hash)
         let hash_bytes = sha256d(&full_header);
 
-        // Read the session's pool difficulty target and current difficulty.
-        let (pool_target, difficulty) = {
+        // Read the session's pool difficulty target plus any recent (grace)
+        // targets we still accept shares for.
+        let (pool_target, current_difficulty, grace_targets) = {
             let sessions = self.session_difficulty.read().await;
             match sessions.get(session_id) {
-                Some(sd) => (sd.target, sd.vardiff.current_difficulty()),
-                None => (self.default_target, 1.0),
+                Some(sd) => (
+                    sd.target,
+                    sd.vardiff.current_difficulty(),
+                    sd.recent_targets.clone(),
+                ),
+                None => (self.default_target, 1.0, Vec::new()),
             }
         };
 
-        // Check against the session's POOL target — reject shares that don't
-        // meet the assigned difficulty. Without this check, high-hashrate
-        // miners flood the pool with low-difficulty shares.
-        if !meets_target(&hash_bytes, &pool_target) {
-            return Err(StratumError::low_difficulty());
-        }
+        // Check against the session's POOL target. If the share doesn't meet
+        // the current target, fall back to the grace window: in-flight shares
+        // generated against an older (easier) target should still be credited
+        // at that older difficulty rather than being rejected as low_diff.
+        let difficulty = if meets_target(&hash_bytes, &pool_target) {
+            current_difficulty
+        } else {
+            // Walk grace targets newest-first, accept the first that matches
+            // and is recent enough.
+            let mut matched: Option<f64> = None;
+            for gt in grace_targets.iter().rev() {
+                if gt.set_at.elapsed() > GRACE_TARGET_MAX_AGE {
+                    continue;
+                }
+                if meets_target(&hash_bytes, &gt.target) {
+                    matched = Some(gt.difficulty);
+                    break;
+                }
+            }
+            match matched {
+                Some(d) => d,
+                None => return Err(StratumError::low_difficulty()),
+            }
+        };
 
         // Check against the NETWORK target from the block template
         let network_target = parse_target(&job.template.target)
@@ -916,6 +965,23 @@ fn build_header_input(job: &MiningJob, time_hex: &str) -> Result<Vec<u8>, Stratu
 /// Check if hash <= target for PoW validity.
 /// SHA-256d output is interpreted as a little-endian 256-bit integer
 /// (byte[31] is MSB, byte[0] is LSB). The target from getblocktemplate
+/// Save the session's current target to the grace window. Called right
+/// before replacing `sd.target` with a new value. The old difficulty is
+/// derived from the old target bytes (since `vardiff.current_difficulty()`
+/// has already been updated to the new value by the time this runs).
+/// Caps the buffer at `GRACE_TARGET_HISTORY` entries (oldest evicted first).
+fn push_grace_target(sd: &mut SessionDifficulty) {
+    let entry = GraceTarget {
+        target: sd.target,
+        difficulty: target_to_difficulty(&sd.target),
+        set_at: Instant::now(),
+    };
+    sd.recent_targets.push(entry);
+    if sd.recent_targets.len() > GRACE_TARGET_HISTORY {
+        sd.recent_targets.remove(0);
+    }
+}
+
 /// is a big-endian hex string. We compare the reversed hash against
 /// the target, both as big-endian.
 fn meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
