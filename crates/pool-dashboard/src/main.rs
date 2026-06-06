@@ -711,10 +711,10 @@ async fn shield_coinbase(
         return Ok(());
     }
 
-    // Fire multiple z_shieldcoinbase calls concurrently. Each returns an opid
-    // immediately while the proof runs in the background inside Zallet.
-    // This lets us have multiple proofs running in parallel.
-    const CONCURRENT_BATCHES: u32 = 5;
+    // Queue one z_shieldcoinbase operation at a time. zcashd locks selected
+    // UTXOs for async shielding, but current Zallet builds do not expose that
+    // locking behavior yet, so parallel shielding can reuse the same UTXOs.
+    const MAX_IN_FLIGHT_SHIELDING_BATCHES: u32 = 1;
 
     let mut opids: Vec<(u32, String, u64, f64)> = Vec::new();
 
@@ -753,9 +753,9 @@ async fn shield_coinbase(
 
         opids.push((batch, opid, shielding_utxos, shielding_value));
 
-        // Once we have CONCURRENT_BATCHES queued, wait for them all before
-        // queuing more. This prevents overwhelming Zallet with too many proofs.
-        if opids.len() as u32 >= CONCURRENT_BATCHES || remaining_utxos == 0 {
+        // Wait before queuing more work. With MAX_IN_FLIGHT_SHIELDING_BATCHES=1
+        // this keeps shielding serialized for Zallet compatibility.
+        if opids.len() as u32 >= MAX_IN_FLIGHT_SHIELDING_BATCHES || remaining_utxos == 0 {
             let mut total_ok = 0u64;
             let mut total_val = 0.0f64;
             for (b, op, utxos, val) in opids.drain(..) {
@@ -771,7 +771,7 @@ async fn shield_coinbase(
                 }
             }
             if total_ok > 0 {
-                info!(utxos = total_ok, value_zec = total_val, "Concurrent batch group done");
+                info!(utxos = total_ok, value_zec = total_val, "Shielding batch group done");
             }
         }
 
