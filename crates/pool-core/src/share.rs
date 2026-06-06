@@ -867,9 +867,9 @@ impl ShareValidator {
 
                             match self.db.record_block(height, &hash_hex, reward, worker.id, luck_percent).await {
                                 Ok(block_id) => {
-                                    info!(height, reward, block_id, "Distributing PPLNS rewards");
-                                    if let Err(e) = self.pplns.distribute(reward, block_id).await {
-                                        error!(error = %e, "PPLNS distribution failed");
+                                    info!(height, reward, block_id, "Distributing block rewards");
+                                    if let Err(e) = self.pplns.distribute(reward, block_id, worker.id).await {
+                                        error!(error = %e, "Reward distribution failed");
                                     }
                                 }
                                 Err(e) => {

@@ -954,11 +954,14 @@ async function fetchDiagnostics() {
             pTbody.innerHTML = '<tr><td colspan="3" class="empty-msg">No payouts yet</td></tr>';
         } else {
             pTbody.innerHTML = d.payouts.map(p => {
-                const txid = p.txid ? p.txid.substring(0, 20) + '...' : '--';
+                const txShort = p.txid ? p.txid.substring(0, 20) + '...' : '--';
                 const txTitle = p.txid || '';
+                const txCell = p.txid
+                    ? '<a href="' + EXPLORER + '/tx/' + p.txid + '" target="_blank" rel="noopener" title="' + txTitle + '" style="color:#63b3ed;text-decoration:none">' + txShort + '</a>'
+                    : txShort;
                 return '<tr>' +
                     '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' ' + COIN + '</td>' +
-                    '<td title="' + txTitle + '">' + txid + '</td>' +
+                    '<td>' + txCell + '</td>' +
                     '<td>' + p.created_at + '</td>' +
                     '</tr>';
             }).join('');

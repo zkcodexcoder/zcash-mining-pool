@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use node_rpc::ZcashRpcClient;
 use pool_core::{BlockAssembler, JobManager, ShareValidator, VardiffConfig};
 use pool_db::PoolDb;
-use rewards::PplnsCalculator;
+use rewards::{PplnsCalculator, RewardMode};
 use stratum::StratumServer;
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +153,13 @@ fn default_longpoll_timeout_secs() -> u64 {
 #[derive(Debug, Deserialize)]
 struct PplnsConfig {
     window_multiplier: f64,
+    /// Reward distribution mode. "pplns" (default) or "solo".
+    #[serde(default = "default_reward_mode")]
+    mode: String,
+}
+
+fn default_reward_mode() -> String {
+    "pplns".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,12 +376,22 @@ async fn main() -> Result<()> {
         retarget_interval_secs: config.difficulty.retarget_interval_secs as f64,
     };
 
-    // Initialize PPLNS Calculator
+    // Initialize reward calculator (PPLNS or Solo).
     let pplns_window = (config.pplns.window_multiplier * 1000.0) as i64;
+    let reward_mode = match config.pplns.mode.to_lowercase().as_str() {
+        "solo" => RewardMode::Solo,
+        "pplns" => RewardMode::Pplns,
+        other => {
+            tracing::warn!(mode = other, "Unknown [pplns] mode, defaulting to pplns");
+            RewardMode::Pplns
+        }
+    };
+    tracing::info!(?reward_mode, pplns_window, fee_percent = config.pool.fee_percent, "Reward calculator initialized");
     let pplns = Arc::new(PplnsCalculator::new(
         db.clone(),
         pplns_window,
         config.pool.fee_percent / 100.0,
+        reward_mode,
     ));
 
     // Initialize Share Validator

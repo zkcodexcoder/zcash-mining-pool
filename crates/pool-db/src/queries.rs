@@ -39,6 +39,79 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_005).execute(&self.pool).await;
         let migration_006 = include_str!("../migrations/006_share_session_id.sql");
         let _ = sqlx::raw_sql(migration_006).execute(&self.pool).await;
+        let migration_007 = include_str!("../migrations/007_payout_attempts.sql");
+        let _ = sqlx::raw_sql(migration_007).execute(&self.pool).await;
+        Ok(())
+    }
+
+    /// Insert a new payout attempt row in 'queued' state. Returns the row id.
+    pub async fn create_payout_attempt(
+        &self,
+        miner_count: i64,
+        total_zatoshis: i64,
+        source: &str,
+    ) -> Result<i64, DbError> {
+        let r = sqlx::query(
+            "INSERT INTO payout_attempts (status, miner_count, total_zatoshis, source)
+             VALUES ('queued', ?1, ?2, ?3)",
+        )
+        .bind(miner_count)
+        .bind(total_zatoshis)
+        .bind(source)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.last_insert_rowid())
+    }
+
+    /// Check whether any payout attempt is currently in flight (queued or sent
+    /// in the last 5 minutes). Used by the manual trigger to refuse running
+    /// while the dashboard's 5-min loop has work in progress. Returns
+    /// (id, status, source) if one exists.
+    pub async fn get_inflight_payout_attempt(
+        &self,
+    ) -> Result<Option<(i64, String, String)>, DbError> {
+        let row = sqlx::query(
+            "SELECT id, status, source FROM payout_attempts
+             WHERE status IN ('queued', 'sent')
+               AND created_at > datetime('now', '-5 minutes')
+             ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            (
+                r.get::<i64, _>("id"),
+                r.get::<String, _>("status"),
+                r.get::<String, _>("source"),
+            )
+        }))
+    }
+
+    /// Update a payout attempt row with a new status, optionally setting opid/txid/error.
+    pub async fn update_payout_attempt(
+        &self,
+        id: i64,
+        status: &str,
+        opid: Option<&str>,
+        txid: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE payout_attempts
+             SET status = ?1,
+                 opid = COALESCE(?2, opid),
+                 txid = COALESCE(?3, txid),
+                 error_message = COALESCE(?4, error_message),
+                 updated_at = datetime('now')
+             WHERE id = ?5",
+        )
+        .bind(status)
+        .bind(opid)
+        .bind(txid)
+        .bind(error_message)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -142,6 +215,16 @@ impl PoolDb {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Returns the miner_id that owns a given worker. Used by Solo reward mode
+    /// to credit the block-finder.
+    pub async fn get_miner_id_for_worker(&self, worker_id: i64) -> Result<i64, DbError> {
+        let row = sqlx::query("SELECT miner_id FROM workers WHERE id = ?1")
+            .bind(worker_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("miner_id"))
     }
 
     pub async fn get_workers_for_miner(&self, miner_id: i64) -> Result<Vec<Worker>, DbError> {
