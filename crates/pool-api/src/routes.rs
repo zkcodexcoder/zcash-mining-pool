@@ -19,6 +19,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/miner/{address}", get(get_miner_stats))
         .route("/api/blocks", get(get_blocks))
         .route("/api/payouts", get(get_payouts))
+        .route("/api/pending-payouts", get(get_pending_payouts_list))
         .route("/api/zallet/status", get(get_zallet_status))
         .route("/api/blocks/immature", get(get_immature_blocks))
         .route("/api/payout/trigger", post(trigger_payout))
@@ -90,7 +91,8 @@ async fn dashboard(State(state): State<AppState>) -> Html<String> {
     Html(
         DASHBOARD_HTML
             .replace("__INITIAL_COIN__", coin)
-            .replace("__INITIAL_EXPLORER__", explorer),
+            .replace("__INITIAL_EXPLORER__", explorer)
+            .replace("__PAYOUT_SCHEME__", &state.payout_scheme),
     )
 }
 
@@ -500,6 +502,40 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
         .tip:hover::after { opacity: 1; }
         th .tip::after { width: 200px; }
+
+        .metric-clickable { cursor: pointer; transition: background 0.12s; }
+        .metric-clickable:hover { background: #151515; }
+        .metric-clickable .label::after {
+            content: ' →'; color: #f4b728; font-size: 0.7rem; opacity: 0.6;
+        }
+        .modal-backdrop {
+            display: none;
+            position: fixed; inset: 0; background: rgba(0,0,0,0.75);
+            z-index: 100; align-items: center; justify-content: center;
+            padding: 1rem;
+        }
+        .modal-backdrop.open { display: flex; }
+        .modal-panel {
+            background: #0d0d0d; border: 1px solid #2d3748; border-radius: 6px;
+            max-width: 900px; width: 100%; max-height: 85vh; display: flex; flex-direction: column;
+        }
+        .modal-header {
+            padding: 1rem 1.25rem; border-bottom: 1px solid #222;
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .modal-title { font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase; color: #e0e0e0; }
+        .modal-close {
+            background: none; border: none; color: #777; font-size: 1.4rem; cursor: pointer; line-height: 1;
+            padding: 0.25rem 0.6rem;
+        }
+        .modal-close:hover { color: #f4b728; }
+        .modal-body { padding: 0.5rem 0; overflow-y: auto; }
+        .modal-body table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+        .modal-body th, .modal-body td { padding: 0.5rem 1.25rem; text-align: left; border-bottom: 1px solid #1a1a1a; }
+        .modal-body th { color: #555; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; }
+        .modal-body .addr { font-family: 'JetBrains Mono', monospace; color: #e0e0e0; word-break: break-all; }
+        .modal-body .amount { color: #48bb78; font-variant-numeric: tabular-nums; }
+        .modal-body .empty-msg { text-align: center; color: #555; font-style: italic; padding: 2rem; }
     </style>
 </head>
 <body style="opacity:0;transition:opacity 0.15s">
@@ -570,11 +606,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="label">Network Share (24h)</div>
             <div class="value" id="stat-pool-pct">--</div>
         </div>
-        <div class="metric-cell">
+        <div class="metric-cell metric-clickable" onclick="showImmatureBlocks()" title="Click to see immature blocks maturing toward payout">
             <div class="label">Immature Blocks</div>
             <div class="value" id="stat-immature">0</div>
         </div>
-        <div class="metric-cell">
+        <div class="metric-cell metric-clickable" onclick="showPendingPayouts()" title="Click to see miners awaiting payout">
             <div class="label">Pending Payout</div>
             <div class="value" id="stat-pending-payout">0</div>
         </div>
@@ -610,7 +646,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </div>
             <div class="config-item">
                 <span class="config-label">Payout Scheme</span>
-                <span class="config-value">PPLNS</span>
+                <span class="config-value">__PAYOUT_SCHEME__</span>
             </div>
             <div class="config-item">
                 <span class="config-label">Min Payout</span>
@@ -715,6 +751,56 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <div class="footer-spacer"></div>
+</div>
+
+<!-- ── Immature Blocks Modal ── -->
+<div class="modal-backdrop" id="immature-blocks-modal" onclick="if(event.target===this)closeImmatureBlocks()">
+    <div class="modal-panel">
+        <div class="modal-header">
+            <div class="modal-title">Immature Blocks <span id="immature-blocks-count" style="color:#555;font-weight:normal"></span></div>
+            <button class="modal-close" onclick="closeImmatureBlocks()" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Height</th>
+                        <th style="text-align:right">Reward</th>
+                        <th>Confirmations</th>
+                        <th>Progress</th>
+                        <th>Found</th>
+                    </tr>
+                </thead>
+                <tbody id="immature-blocks-body">
+                    <tr><td colspan="5" class="empty-msg">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ── Pending Payouts Modal ── -->
+<div class="modal-backdrop" id="pending-payouts-modal" onclick="if(event.target===this)closePendingPayouts()">
+    <div class="modal-panel">
+        <div class="modal-header">
+            <div class="modal-title">Miners Awaiting Payout <span id="pending-payouts-count" style="color:#555;font-weight:normal"></span></div>
+            <button class="modal-close" onclick="closePendingPayouts()" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Address</th>
+                        <th style="text-align:right">Amount</th>
+                        <th>Joined</th>
+                    </tr>
+                </thead>
+                <tbody id="pending-payouts-body">
+                    <tr><td colspan="3" class="empty-msg">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
 </div>
 
 <!-- ── Status Footer ── -->
@@ -1107,12 +1193,15 @@ async function fetchPayouts() {
             return;
         }
         const rows = payouts.map(p => {
-            const txid = p.txid ? p.txid.substring(0, 16) + '...' : '--';
+            const txShort = p.txid ? p.txid.substring(0, 16) + '...' : '--';
             const txTitle = p.txid || '';
+            const txCell = p.txid
+                ? '<a href="' + EXPLORER + '/tx/' + p.txid + '" target="_blank" rel="noopener" title="' + txTitle + '" style="color:#63b3ed;text-decoration:none">' + txShort + '</a>'
+                : txShort;
             return '<tr>' +
                 '<td class="addr-cell" title="' + p.miner_address + '" style="color:#e0e0e0">' + p.miner_address + '</td>' +
                 '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' ' + COIN + '</td>' +
-                '<td title="' + txTitle + '">' + txid + '</td>' +
+                '<td>' + txCell + '</td>' +
                 '<td>' + p.created_at + '</td>' +
                 '</tr>';
         });
@@ -1194,6 +1283,90 @@ async function fetchHistory() {
         console.error('Failed to fetch stats history:', e);
     }
 }
+
+/* ── Pending Payouts Modal ── */
+async function showPendingPayouts() {
+    const modal = document.getElementById('pending-payouts-modal');
+    const tbody = document.getElementById('pending-payouts-body');
+    const countEl = document.getElementById('pending-payouts-count');
+    modal.classList.add('open');
+    tbody.innerHTML = '<tr><td colspan="3" class="empty-msg">Loading...</td></tr>';
+    countEl.textContent = '';
+    try {
+        const r = await fetch('/api/pending-payouts');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const rows = await r.json();
+        countEl.textContent = '(' + rows.length + ')';
+        if (!rows.length) {
+            tbody.innerHTML = '<tr><td colspan="3" class="empty-msg">No miners currently awaiting payout</td></tr>';
+            return;
+        }
+        tbody.innerHTML = rows.map(p => {
+            const addr = p.miner_address || '';
+            const minerHref = '/miner/' + encodeURIComponent(addr);
+            return '<tr>' +
+                '<td class="addr"><a href="' + minerHref + '" style="color:#63b3ed;text-decoration:none">' + addr + '</a></td>' +
+                '<td class="amount" style="text-align:right">' + p.amount_zec.toFixed(8) + ' ' + COIN + '</td>' +
+                '<td style="color:#777">' + (p.joined_at || '--') + '</td>' +
+                '</tr>';
+        }).join('');
+    } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="3" class="empty-msg">Failed to load: ' + e.message + '</td></tr>';
+    }
+}
+function closePendingPayouts() {
+    document.getElementById('pending-payouts-modal').classList.remove('open');
+}
+
+/* ── Immature Blocks Modal ── */
+async function showImmatureBlocks() {
+    const modal = document.getElementById('immature-blocks-modal');
+    const tbody = document.getElementById('immature-blocks-body');
+    const countEl = document.getElementById('immature-blocks-count');
+    modal.classList.add('open');
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-msg">Loading...</td></tr>';
+    countEl.textContent = '';
+    try {
+        const r = await fetch('/api/blocks/immature');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const rows = await r.json();
+        countEl.textContent = '(' + rows.length + ')';
+        if (!rows.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="empty-msg">No immature blocks — all recent blocks have matured</td></tr>';
+            return;
+        }
+        tbody.innerHTML = rows.map(b => {
+            const pct = Math.max(0, Math.min(100, b.progress_percent || 0));
+            const pctColor = pct >= 100 ? '#48bb78' : (pct >= 50 ? '#f4b728' : '#63b3ed');
+            const bar =
+                '<div style="display:flex;align-items:center;gap:0.5rem">' +
+                  '<div style="flex:1;background:#1a1a1a;border-radius:2px;height:6px;overflow:hidden">' +
+                    '<div style="width:' + pct.toFixed(1) + '%;height:100%;background:' + pctColor + '"></div>' +
+                  '</div>' +
+                  '<span style="color:#777;font-variant-numeric:tabular-nums;min-width:3em;text-align:right">' + pct.toFixed(0) + '%</span>' +
+                '</div>';
+            return '<tr>' +
+                '<td style="font-variant-numeric:tabular-nums">' + b.height + '</td>' +
+                '<td class="amount" style="text-align:right">' + b.reward_zec.toFixed(8) + ' ' + COIN + '</td>' +
+                '<td style="color:#a0aec0;font-variant-numeric:tabular-nums">' + b.confirmations + ' / ' + b.required + '</td>' +
+                '<td style="min-width:180px">' + bar + '</td>' +
+                '<td style="color:#777">' + (b.found_at || '--') + '</td>' +
+                '</tr>';
+        }).join('');
+    } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty-msg">Failed to load: ' + e.message + '</td></tr>';
+    }
+}
+function closeImmatureBlocks() {
+    document.getElementById('immature-blocks-modal').classList.remove('open');
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        closePendingPayouts();
+        closeImmatureBlocks();
+    }
+});
 
 /* ── Init ── */
 document.addEventListener('DOMContentLoaded', () => {

@@ -24,12 +24,25 @@ struct Config {
     node: NodeConfig,
     difficulty: DifficultyConfig,
     #[serde(default)]
+    pplns: PplnsModeOnlyConfig,
+    #[serde(default)]
     payout: PayoutConfig,
     api: ApiConfig,
     database: DatabaseConfig,
     #[serde(default)]
     admin: Option<AdminConfig>,
-    // Ignored sections: pplns (mining only)
+}
+
+/// Dashboard only needs the reward mode from [pplns] (for the Payout Scheme
+/// label). All other [pplns] fields are pool-server concerns.
+#[derive(Debug, Deserialize, Default)]
+struct PplnsModeOnlyConfig {
+    #[serde(default = "default_pplns_mode")]
+    mode: String,
+}
+
+fn default_pplns_mode() -> String {
+    "pplns".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +204,13 @@ struct PayoutConfig {
     interval_secs: u64,
     #[serde(default = "default_maturity")]
     maturity_confirmations: u64,
+    /// Minimum shielded balance (in ZEC/TAZ) to keep as a reserve so that
+    /// miners can be paid from mature funds without waiting for newly-mined
+    /// coinbase to reach 100-confirmation maturity and then be shielded.
+    /// Payouts that would drop the balance below this threshold are deferred
+    /// until shielding replenishes the reserve. Set to 0 to disable (default).
+    #[serde(default)]
+    reserve_min: f64,
 }
 
 fn default_minimum_payout() -> f64 {
@@ -215,6 +235,7 @@ impl Default for PayoutConfig {
             minimum_payout: default_minimum_payout(),
             interval_secs: default_payout_interval(),
             maturity_confirmations: default_maturity(),
+            reserve_min: 0.0,
         }
     }
 }
@@ -348,6 +369,10 @@ async fn main() -> Result<()> {
         shares_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)), // DB fallback
         banner: config.pool.banner.clone(),
         difficulty_multiplier,
+        payout_scheme: match config.pplns.mode.to_lowercase().as_str() {
+            "solo" => "Solo".to_string(),
+            _ => "PPLNS".to_string(),
+        },
     });
 
     // Background stats history recorder (10s snapshots, 1hr ring buffer)
@@ -467,6 +492,7 @@ async fn main() -> Result<()> {
             _ => Arc::new(ZcashRpcClient::new(&wallet_url)),
         };
         let min_payout_zatoshis = (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64;
+        let reserve_min_zatoshis = (config.payout.reserve_min * ZATOSHIS_PER_ZEC) as i64;
         let interval = Duration::from_secs(config.payout.interval_secs);
         let maturity = config.payout.maturity_confirmations;
         let payout_db = db.clone();
@@ -477,6 +503,7 @@ async fn main() -> Result<()> {
             mining_address = %mining_address,
             wallet_rpc = %wallet_url,
             min_payout_zec = config.payout.minimum_payout,
+            reserve_min_zec = config.payout.reserve_min,
             interval_secs = config.payout.interval_secs,
             maturity_confirmations = maturity,
             "Payout loop enabled"
@@ -485,7 +512,8 @@ async fn main() -> Result<()> {
             run_payout_loop(
                 payout_db, node_rpc, payout_wallet_rpc,
                 &pool_address, &mining_address,
-                min_payout_zatoshis, maturity, interval,
+                min_payout_zatoshis, reserve_min_zatoshis,
+                maturity, interval,
                 &payout_network,
             ).await;
         }))
@@ -560,6 +588,7 @@ async fn run_payout_loop(
     pool_address: &str,
     mining_address: &str,
     min_payout_zatoshis: i64,
+    reserve_min_zatoshis: i64,
     maturity_confirmations: u64,
     interval: Duration,
     network: &str,
@@ -577,14 +606,16 @@ async fn run_payout_loop(
             error!(error = %e, "Block maturity check failed");
         }
 
-        // Phase 2: Shield mature coinbase UTXOs (transparent -> shielded).
-        // Shields in batches of 50 UTXOs, up to MAX_SHIELD_BATCHES_PER_CYCLE per cycle.
+        // Phase 2: Shield mature coinbase UTXOs (transparent -> shielded)
         if let Err(e) = shield_coinbase(&wallet_rpc, mining_address, pool_address).await {
             error!(error = %e, "Coinbase shielding failed (will retry next cycle)");
         }
 
-        // Phase 3: Pay miners from shielded pool (only if balance is sufficient)
-        match process_payouts(&db, &wallet_rpc, pool_address, mining_address, min_payout_zatoshis, network).await {
+        // Phase 3: Pay miners from shielded pool (respects reserve_min)
+        match process_payouts(
+            &db, &wallet_rpc, &node_rpc, pool_address, mining_address,
+            min_payout_zatoshis, reserve_min_zatoshis, network,
+        ).await {
             Ok(count) => {
                 if count > 0 {
                     info!(payouts = count, "Payout round completed");
@@ -599,9 +630,8 @@ async fn run_payout_loop(
             }
         }
 
-        // Write payout health status for the admin health page to read.
         let _ = write_payout_health(
-            &db, &wallet_rpc, mining_address,
+            &db, &wallet_rpc, mining_address, reserve_min_zatoshis,
             consecutive_payout_failures, &last_payout_error,
         ).await;
 
@@ -614,6 +644,7 @@ async fn write_payout_health(
     db: &PoolDb,
     wallet_rpc: &ZcashRpcClient,
     mining_address: &str,
+    reserve_min_zatoshis: i64,
     consecutive_failures: u32,
     last_error: &str,
 ) -> anyhow::Result<()> {
@@ -640,11 +671,16 @@ async fn write_payout_health(
         "z_gettotalbalance", serde_json::json!([0, true])
     ).await.is_ok();
 
+    let reserve_min_zec = reserve_min_zatoshis as f64 / ZATOSHIS_PER_ZEC;
+    let spendable_zec = (private_zec - reserve_min_zec).max(0.0);
+
     let health = serde_json::json!({
         "consecutive_payout_failures": consecutive_failures,
         "last_payout_error": last_error,
         "transparent_balance_zec": transparent_zec,
         "private_balance_zec": private_zec,
+        "reserve_min_zec": reserve_min_zec,
+        "spendable_balance_zec": spendable_zec,
         "shielding_stuck": shielding_stuck,
         "wallet_responsive": wallet_responsive,
         "checked_at": chrono::Utc::now().to_rfc3339(),
@@ -711,10 +747,14 @@ async fn shield_coinbase(
         return Ok(());
     }
 
-    // Fire multiple z_shieldcoinbase calls concurrently. Each returns an opid
-    // immediately while the proof runs in the background inside Zallet.
-    // This lets us have multiple proofs running in parallel.
-    const CONCURRENT_BATCHES: u32 = 5;
+    // Serialize z_shieldcoinbase batches. Each call returns an opid immediately
+    // while the proof runs async in Zallet — so launching N in parallel races
+    // them all against the same transparent UTXO set. Only the first to
+    // broadcast wins; the rest are rejected from the mempool and their
+    // half-built transactions remain in wallet.db, locking the inputs until
+    // the zallet sweeper purges them on expiry. One in flight at a time keeps
+    // coin selection consistent.
+    const CONCURRENT_BATCHES: u32 = 1;
 
     let mut opids: Vec<(u32, String, u64, f64)> = Vec::new();
 
@@ -853,9 +893,11 @@ async fn wait_for_operation(
 async fn process_payouts(
     db: &PoolDb,
     rpc: &ZcashRpcClient,
+    node_rpc: &ZcashRpcClient,
     pool_address: &str,
     mining_address: &str,
     min_payout_zatoshis: i64,
+    reserve_min_zatoshis: i64,
     network: &str,
 ) -> anyhow::Result<usize> {
     let pending = db.get_pending_payouts(min_payout_zatoshis).await?;
@@ -880,10 +922,18 @@ async fn process_payouts(
         }
     };
 
-    let available_zec = (private_balance * 0.90).max(0.0);
+    // Enforce the reserve threshold: only spend the portion of the balance
+    // above the reserve. Keeps a buffer so subsequent payouts can fire
+    // without waiting for fresh shielding.
+    let reserve_min_zec = reserve_min_zatoshis as f64 / ZATOSHIS_PER_ZEC;
+    let spendable_zec = (private_balance - reserve_min_zec).max(0.0);
+    let available_zec = (spendable_zec * 0.90).max(0.0);
 
     if available_zec < min_payout_zatoshis as f64 / ZATOSHIS_PER_ZEC {
-        info!(private_balance, available_zec, "Shielded balance too low for any payouts");
+        info!(
+            private_balance, reserve_min_zec, available_zec,
+            "Shielded balance too low for any payouts (reserve protected)"
+        );
         return Ok(0);
     }
 
@@ -925,6 +975,17 @@ async fn process_payouts(
     let actual_total_zec = actual_total_zatoshis as f64 / ZATOSHIS_PER_ZEC;
     info!(miners = payout_list.len(), total_zec = actual_total_zec, private_balance, scale, "Processing payouts");
 
+    let attempt_id = match db
+        .create_payout_attempt(payout_list.len() as i64, actual_total_zatoshis, "loop")
+        .await
+    {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(error = %e, "Failed to create payout_attempt row, continuing");
+            None
+        }
+    };
+
     let (opid, payout_list) = {
         let mut current_list = payout_list;
         let mut retries = 0u32;
@@ -944,6 +1005,9 @@ async fn process_payouts(
                             let actual_available = have_zats as f64 * 0.95;
                             let current_total: f64 = current_list.iter().map(|(_, z, _)| *z as f64).sum();
                             if actual_available < min_payout_zatoshis as f64 || current_total <= 0.0 {
+                                if let Some(id) = attempt_id {
+                                    let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("Wallet balance too low: {msg}"))).await;
+                                }
                                 return Err(anyhow::anyhow!("Wallet balance too low: {msg}"));
                             }
                             let rescale = actual_available / current_total;
@@ -956,6 +1020,9 @@ async fn process_payouts(
                                 })
                                 .collect();
                             if current_list.is_empty() {
+                                if let Some(id) = attempt_id {
+                                    let _ = db.update_payout_attempt(id, "failed", None, None, Some("All payouts below minimum after rescaling")).await;
+                                }
                                 return Err(anyhow::anyhow!("All payouts below minimum after rescaling"));
                             }
                             retries += 1;
@@ -970,11 +1037,17 @@ async fn process_payouts(
                         // and retry — eventually the bad one gets isolated.
                         let half = current_list.len() / 2;
                         if half == 0 {
+                            if let Some(id) = attempt_id {
+                                let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("z_sendmany failed on single entry: {e}"))).await;
+                            }
                             return Err(anyhow::anyhow!("z_sendmany failed on single entry: {e}"));
                         }
                         current_list.truncate(half);
                         retries += 1;
                         continue;
+                    }
+                    if let Some(id) = attempt_id {
+                        let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("z_sendmany failed: {e}"))).await;
                     }
                     return Err(anyhow::anyhow!("z_sendmany failed: {e}"));
                 }
@@ -983,16 +1056,64 @@ async fn process_payouts(
     };
 
     info!(opid = %opid, "z_sendmany submitted, waiting for completion");
+    if let Some(id) = attempt_id {
+        let _ = db.update_payout_attempt(id, "sent", Some(&opid), None, None).await;
+    }
 
-    let txid = match wait_for_operation(rpc, &opid).await? {
-        OpResult::Success(txid) => {
-            info!(opid = %opid, txid = %txid, "Payout transaction broadcast");
+    let txid = match wait_for_operation(rpc, &opid).await {
+        Ok(OpResult::Success(txid)) => {
+            info!(opid = %opid, txid = %txid, "Payout operation reported success");
             txid
         }
-        OpResult::Failed(msg) => {
+        Ok(OpResult::Failed(msg)) => {
+            if let Some(id) = attempt_id {
+                let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("z_sendmany operation failed: {msg}"))).await;
+            }
             return Err(anyhow::anyhow!("z_sendmany failed: {msg}"));
         }
+        Err(e) => {
+            if let Some(id) = attempt_id {
+                let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("wait_for_operation error: {e}"))).await;
+            }
+            return Err(e);
+        }
     };
+
+    // Verify the tx is actually visible on the node (mempool or chain) before
+    // recording payouts. z_getoperationstatus "success" only means Zallet
+    // finished proof generation; it does NOT guarantee broadcast or mining.
+    // Without this check, expired-unmined txs were getting recorded as paid
+    // in pool.db while the wallet kept the notes locked (ghost-lock).
+    // Retry briefly: mempool propagation can take a beat after Zallet returns.
+    let mut verify_ok = false;
+    let mut last_verify_err = String::new();
+    for attempt in 0..6 {
+        match node_rpc.get_raw_transaction(&txid, 1).await {
+            Ok(_) => {
+                verify_ok = true;
+                break;
+            }
+            Err(e) => {
+                last_verify_err = format!("{e}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = attempt;
+            }
+        }
+    }
+    if !verify_ok {
+        error!(
+            opid = %opid, txid = %txid, error = %last_verify_err,
+            "Payout tx not visible on node after retries — NOT recording as paid; will retry next cycle"
+        );
+        if let Some(id) = attempt_id {
+            let _ = db.update_payout_attempt(id, "failed", None, Some(&txid), Some(&format!("tx not visible on node: {last_verify_err}"))).await;
+        }
+        return Ok(0);
+    }
+    info!(txid = %txid, "Payout transaction broadcast and visible on node");
+    if let Some(id) = attempt_id {
+        let _ = db.update_payout_attempt(id, "confirmed", None, Some(&txid), None).await;
+    }
 
     let mut count = 0;
     for (i, amt_zatoshis, pay_to) in &payout_list {
