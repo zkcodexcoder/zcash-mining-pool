@@ -11,3 +11,9 @@
 # Real config files (use .example versions as templates)
 config/pool.toml
 config/zebrad.toml
+
+# Runtime logs and backups (added 2026-06-06)
+pool.log
+dashboard.log
+*.log
+*.bak

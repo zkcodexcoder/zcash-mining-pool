@@ -52,6 +52,8 @@ pub struct ApiState {
     pub shares_rejected: Arc<std::sync::atomic::AtomicU64>,
     /// Optional banner message shown at the top of the public dashboard.
     pub banner: Option<String>,
+    /// Reward distribution scheme label for the dashboard UI ("PPLNS" or "Solo").
+    pub payout_scheme: String,
 }
 
 impl ApiState {
@@ -576,6 +578,26 @@ pub async fn trigger_payout(
         }))),
     };
 
+    // Refuse to run if another payout (loop or manual) is in flight. The 5-min
+    // dashboard loop and the manual trigger both call z_sendmany on the same
+    // pending balances; running both in parallel guarantees a mempool double-
+    // spend rejection for whichever loses the race. Bail out cleanly instead.
+    match state.db.get_inflight_payout_attempt().await {
+        Ok(Some((id, status, source))) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "status": "error",
+                "message": format!("another payout is in flight (attempt id={id}, status={status}, source={source}); try again in a few minutes"),
+                "inflight_attempt_id": id,
+                "inflight_status": status,
+                "inflight_source": source,
+            })));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to check in-flight payout attempts, proceeding anyway");
+        }
+    }
+
     // Phase 1: Check block maturity
     let current_height = match state.rpc.get_block_count().await {
         Ok(h) => h,
@@ -692,22 +714,175 @@ pub async fn trigger_payout(
         .map(|p| (p.address.as_str(), p.amount as f64 / ZATOSHIS_PER_ZEC_F64))
         .collect();
 
+    let total_zatoshis: i64 = pending.iter().map(|p| p.amount).sum();
+    let attempt_id = match state
+        .db
+        .create_payout_attempt(pending.len() as i64, total_zatoshis, "manual")
+        .await
+    {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create payout_attempt row, continuing");
+            None
+        }
+    };
+
     let opid = match wallet_rpc.z_sendmany(&pool_address, &amounts).await {
         Ok(id) => id,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+        Err(e) => {
+            if let Some(id) = attempt_id {
+                let _ = state
+                    .db
+                    .update_payout_attempt(id, "failed", None, None, Some(&format!("z_sendmany failed: {e}")))
+                    .await;
+            }
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "status": "error",
+                "message": format!("z_sendmany failed: {e}"),
+                "blocks_confirmed": confirmed,
+                "blocks_orphaned": orphaned,
+            })));
+        }
+    };
+
+    if let Some(id) = attempt_id {
+        let _ = state.db.update_payout_attempt(id, "sent", Some(&opid), None, None).await;
+    }
+
+    // Wait for the async operation to produce a txid. Mirrors the post-shielding
+    // pattern earlier in this function: poll every 5s up to 120s.
+    let mut maybe_txid: Option<String> = None;
+    let mut op_error: Option<String> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        match wallet_rpc.z_get_operation_status(&[&opid]).await {
+            Ok(statuses) => {
+                if let Some(s) = statuses.first() {
+                    let st = s.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    if st == "success" {
+                        maybe_txid = s
+                            .get("result")
+                            .and_then(|r| r.get("txid"))
+                            .or_else(|| s.get("result").and_then(|r| r.get("txids")).and_then(|a| a.as_array()).and_then(|a| a.first()))
+                            .and_then(|t| t.as_str())
+                            .map(|t| t.to_string());
+                        break;
+                    } else if st == "failed" {
+                        op_error = Some(
+                            s.get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("unknown error")
+                                .to_string(),
+                        );
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                op_error = Some(format!("z_getoperationstatus failed: {e}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(err) = op_error {
+        if let Some(id) = attempt_id {
+            let _ = state
+                .db
+                .update_payout_attempt(id, "failed", None, None, Some(&format!("operation failed: {err}")))
+                .await;
+        }
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error",
-            "message": format!("z_sendmany failed: {e}"),
+            "message": format!("z_sendmany operation failed: {err}"),
+            "opid": opid,
             "blocks_confirmed": confirmed,
             "blocks_orphaned": orphaned,
-        }))),
+        })));
+    }
+
+    let txid = match maybe_txid {
+        Some(t) => t,
+        None => {
+            if let Some(id) = attempt_id {
+                let _ = state
+                    .db
+                    .update_payout_attempt(id, "failed", None, None, Some("timed out waiting for operation"))
+                    .await;
+            }
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "status": "error",
+                "message": "Timed out waiting for z_sendmany operation",
+                "opid": opid,
+                "blocks_confirmed": confirmed,
+                "blocks_orphaned": orphaned,
+            })));
+        }
     };
+
+    // Verify the tx is actually visible on the node before recording payouts.
+    // Same safety check as the dashboard's process_payouts.
+    let mut verify_ok = false;
+    let mut last_verify_err = String::new();
+    for _ in 0..6 {
+        match state.rpc.get_raw_transaction(&txid, 1).await {
+            Ok(_) => {
+                verify_ok = true;
+                break;
+            }
+            Err(e) => {
+                last_verify_err = format!("{e}");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+    if !verify_ok {
+        if let Some(id) = attempt_id {
+            let _ = state
+                .db
+                .update_payout_attempt(
+                    id,
+                    "failed",
+                    None,
+                    Some(&txid),
+                    Some(&format!("tx not visible on node: {last_verify_err}")),
+                )
+                .await;
+        }
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "status": "error",
+            "message": format!("Payout tx not visible on node: {last_verify_err}"),
+            "opid": opid,
+            "txid": txid,
+            "blocks_confirmed": confirmed,
+            "blocks_orphaned": orphaned,
+        })));
+    }
+
+    // Record each payout in pool.db so balances move from pending → paid.
+    let mut recorded = 0u32;
+    for p in &pending {
+        if let Err(e) = state.db.create_payout(p.miner_id, p.amount, &txid).await {
+            tracing::error!(miner_id = p.miner_id, error = %e, "Failed to record payout");
+        } else {
+            recorded += 1;
+        }
+    }
+
+    if let Some(id) = attempt_id {
+        let _ = state.db.update_payout_attempt(id, "confirmed", None, Some(&txid), None).await;
+    }
 
     (StatusCode::OK, Json(serde_json::json!({
         "status": "ok",
-        "message": "Payout submitted",
+        "message": "Payout broadcast and recorded",
         "opid": opid,
+        "txid": txid,
         "miners": pending.len(),
-        "total_zec": pending.iter().map(|p| p.amount).sum::<i64>() as f64 / ZATOSHIS_PER_ZEC_F64,
+        "recorded": recorded,
+        "total_zec": total_zatoshis as f64 / ZATOSHIS_PER_ZEC_F64,
         "blocks_confirmed": confirmed,
         "blocks_orphaned": orphaned,
         "shielding_triggered": shielded,
