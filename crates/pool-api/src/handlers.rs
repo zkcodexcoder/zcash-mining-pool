@@ -1036,6 +1036,36 @@ pub async fn get_payouts(
     Ok(Json(result))
 }
 
+#[derive(Serialize)]
+pub struct PendingPayoutEntry {
+    pub miner_address: String,
+    pub amount_zatoshis: i64,
+    pub amount_zec: f64,
+    pub joined_at: String,
+}
+
+pub async fn get_pending_payouts_list(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PendingPayoutEntry>>, StatusCode> {
+    let entries = state
+        .db
+        .get_pending_payouts(state.min_payout_zatoshis)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let result: Vec<PendingPayoutEntry> = entries
+        .into_iter()
+        .map(|p| PendingPayoutEntry {
+            miner_address: p.address,
+            amount_zatoshis: p.amount,
+            amount_zec: p.amount as f64 / ZATOSHIS_PER_ZEC,
+            joined_at: p.created_at,
+        })
+        .collect();
+
+    Ok(Json(result))
+}
+
 // --- Wallet status (RPC only; pool does not manage Zallet process) ---
 
 #[derive(Serialize)]
