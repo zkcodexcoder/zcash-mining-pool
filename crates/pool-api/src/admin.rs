@@ -1368,8 +1368,13 @@ async function fetchHealth() {
                 phHtml += '<tr><td>Last Error</td><td style="color:#fc8181;font-size:0.75rem">' + ph.last_payout_error.substring(0, 200) + '</td></tr>';
             }
             const tColor = ph.transparent_balance_zec > 0.01 ? '#f4b728' : '#68d391';
-            phHtml += '<tr><td>Transparent (Unshielded)</td><td style="color:' + tColor + '">' + ph.transparent_balance_zec.toFixed(8) + ' ZEC</td></tr>';
-            phHtml += '<tr><td>Private (Shielded)</td><td>' + ph.private_balance_zec.toFixed(8) + ' ZEC</td></tr>';
+            phHtml += '<tr><td>Transparent (Unshielded)</td><td style="color:' + tColor + '">' + ph.transparent_balance_zec.toFixed(8) + ' ' + coinUnit + '</td></tr>';
+            phHtml += '<tr><td>Private (Shielded)</td><td>' + ph.private_balance_zec.toFixed(8) + ' ' + coinUnit + '</td></tr>';
+            if (ph.reserve_min_zec !== undefined && ph.reserve_min_zec > 0) {
+                phHtml += '<tr><td>Reserve (Protected)</td><td style="color:#63b3ed">' + ph.reserve_min_zec.toFixed(8) + ' ' + coinUnit + '</td></tr>';
+                const spendColor = ph.spendable_balance_zec <= 0 ? '#f4b728' : '#68d391';
+                phHtml += '<tr><td>Spendable (Above Reserve)</td><td style="color:' + spendColor + '">' + ph.spendable_balance_zec.toFixed(8) + ' ' + coinUnit + '</td></tr>';
+            }
             const wColor = ph.wallet_responsive ? '#68d391' : '#fc8181';
             phHtml += '<tr><td>Wallet RPC</td><td style="color:' + wColor + '">' + (ph.wallet_responsive ? 'Responsive' : 'Not responding') + '</td></tr>';
             phHtml += '<tr><td>Last Check</td><td style="color:#718096">' + (ph.checked_at || '?') + '</td></tr>';
