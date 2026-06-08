@@ -90,7 +90,8 @@ async fn dashboard(State(state): State<AppState>) -> Html<String> {
     Html(
         DASHBOARD_HTML
             .replace("__INITIAL_COIN__", coin)
-            .replace("__INITIAL_EXPLORER__", explorer),
+            .replace("__INITIAL_EXPLORER__", explorer)
+            .replace("__PAYOUT_SCHEME__", &state.payout_scheme),
     )
 }
 
@@ -610,7 +611,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </div>
             <div class="config-item">
                 <span class="config-label">Payout Scheme</span>
-                <span class="config-value">PPLNS</span>
+                <span class="config-value">__PAYOUT_SCHEME__</span>
             </div>
             <div class="config-item">
                 <span class="config-label">Min Payout</span>
