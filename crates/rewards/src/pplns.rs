@@ -1,17 +1,26 @@
 use pool_db::PoolDb;
 use tracing::info;
 
-/// PPLNS (Pay Per Last N Shares) reward calculator.
-///
-/// When a block is found, the reward is distributed proportionally among miners
-/// based on their share of difficulty-weighted work within a sliding window of
-/// the last N shares.
+/// Reward distribution mode. PPLNS spreads each block across all miners in the
+/// share window proportionally; Solo credits the full reward (minus pool_fee)
+/// to the single miner whose worker found the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewardMode {
+    Pplns,
+    Solo,
+}
+
+/// Reward calculator. Routes to PPLNS or Solo distribution based on `mode`.
+/// Name retained as `PplnsCalculator` for backwards compatibility; the struct
+/// now handles both modes.
 pub struct PplnsCalculator {
     db: PoolDb,
-    /// Number of shares in the PPLNS window.
+    /// Number of shares in the PPLNS window. Ignored when mode == Solo.
     window_size: i64,
     /// Pool fee as a fraction (e.g., 0.01 = 1%).
     pool_fee: f64,
+    /// Reward distribution mode.
+    mode: RewardMode,
 }
 
 /// Result of a PPLNS distribution for a single miner.
@@ -23,25 +32,55 @@ pub struct PplnsReward {
 }
 
 impl PplnsCalculator {
-    pub fn new(db: PoolDb, window_size: i64, pool_fee: f64) -> Self {
+    pub fn new(db: PoolDb, window_size: i64, pool_fee: f64, mode: RewardMode) -> Self {
         Self {
             db,
             window_size,
             pool_fee: pool_fee.clamp(0.0, 1.0),
+            mode,
         }
     }
 
-    /// Distribute a block reward among miners using PPLNS.
+    /// Distribute a block reward.
     ///
     /// - `block_reward`: The total block reward in zatoshis.
     /// - `block_id`: The database ID of the block (for logging).
+    /// - `found_by_worker_id`: The worker that submitted the share that solved
+    ///   the block. Used by Solo mode to determine the sole recipient; ignored
+    ///   by PPLNS mode.
     ///
     /// Returns the list of individual rewards credited.
     pub async fn distribute(
         &self,
         block_reward: i64,
         block_id: i64,
+        found_by_worker_id: i64,
     ) -> Result<Vec<PplnsReward>, RewardError> {
+        // Pool fee applies in both modes.
+        let distributable = ((block_reward as f64) * (1.0 - self.pool_fee)) as i64;
+        let pool_fee_amount = block_reward - distributable;
+
+        if self.mode == RewardMode::Solo {
+            let miner_id = self.db.get_miner_id_for_worker(found_by_worker_id).await?;
+            info!(
+                block_id,
+                block_reward,
+                pool_fee_amount,
+                distributable,
+                miner_id,
+                found_by_worker_id,
+                "Distributing solo reward (100% to block finder)"
+            );
+            if distributable > 0 {
+                self.db.credit_balance(miner_id, distributable).await?;
+            }
+            return Ok(vec![PplnsReward {
+                miner_id,
+                share_fraction: 1.0,
+                amount_zatoshis: distributable,
+            }]);
+        }
+
         let shares = self.db.get_pplns_shares(self.window_size).await?;
 
         if shares.is_empty() {
@@ -54,7 +93,8 @@ impl PplnsCalculator {
             return Ok(vec![]);
         }
 
-        // Deduct pool fee
+        // Pool fee (`distributable` and `pool_fee_amount` already computed above
+        // before the Solo-mode short-circuit; recompute here for clarity).
         let distributable = ((block_reward as f64) * (1.0 - self.pool_fee)) as i64;
         let pool_fee_amount = block_reward - distributable;
 
