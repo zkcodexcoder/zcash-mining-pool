@@ -353,8 +353,20 @@ impl JobManager {
         // miner finds a share against the empty template it's still a valid
         // block — we just forgo the mempool tx fees on that one block. The
         // full-template notify follows immediately with clean_jobs=false.
-        if is_new_block {
+        //
+        // If the node template includes mempool transactions, however, the
+        // coinbase already accounts for their fees. Stripping those transactions
+        // without rebuilding the coinbase creates an overpaying block that Zebra
+        // rejects with transaction-subsidy-invalidminerfees. In that case send
+        // the full template as the clean job instead.
+        let sent_empty_block = is_new_block && template.transactions.is_empty();
+        if sent_empty_block {
             self.broadcast_empty_block(&template).await;
+        } else if is_new_block {
+            debug!(
+                tx_count = template.transactions.len(),
+                "Skipping empty-block notify because template contains transactions"
+            );
         }
 
         if let Some(ref at) = self.last_template_at_ms {
@@ -433,10 +445,10 @@ impl JobManager {
 
         let job = MiningJob::from_template(template, job_id.clone());
         // Race-to-tip already sent the clean_jobs=true empty notify when
-        // is_new_block. This follow-up full-template notify uses
-        // clean_jobs=false so miners keep any in-flight shares they
-        // already found against the empty job as still-valid.
-        let notify = job.to_notify(false);
+        // sent_empty_block. If we skipped that fast path, the full-template
+        // notify must be clean so miners switch to the new prev_hash.
+        let clean_jobs = is_new_block && !sent_empty_block;
+        let notify = job.to_notify(clean_jobs);
 
         {
             let mut jobs = self.jobs.write().await;
