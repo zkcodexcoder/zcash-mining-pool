@@ -41,10 +41,14 @@ const STALE_ATTEMPT_MINUTES: i64 = 10;
 /// Window for the phantom-payout chain check.
 const PHANTOM_CHECK_HOURS: i64 = 24;
 
-/// Invariant drift beyond this many zatoshis raises an alert.
-/// 0.1 ZEC: comfortably above the known ~0.06 ZEC historical orphan-reversal
-/// rounding residue, low enough to catch a single misrecorded payout.
-const INVARIANT_DRIFT_ALERT_ZATOSHIS: i64 = 10_000_000;
+/// Invariant drift *movement* between sweeps beyond this many zatoshis
+/// raises an alert. The absolute drift is reported as context but not
+/// alerted on: long-lived pools accumulate benign residue (blocks found
+/// with an empty share window distribute nothing; operator balance
+/// adjustments; pre-fix orphan-reversal rounding) that would otherwise
+/// alarm forever. A *change* in drift means money moved without matching
+/// bookkeeping right now — that's the actionable signal.
+const INVARIANT_DRIFT_DELTA_ALERT_ZATOSHIS: i64 = 10_000_000;
 
 pub struct Reconciler {
     pub db: PoolDb,
@@ -254,20 +258,46 @@ impl Reconciler {
         }
     }
 
-    /// Check 3: confirmed-rewards vs balances invariant.
+    /// Check 3: confirmed-rewards vs balances invariant. Alerts on drift
+    /// *movement* since the previous sweep, not on the absolute value.
     async fn check_invariant(&self, summary: &mut SweepSummary) {
         match self.db.get_accounting_invariant().await {
             Ok((reward, balances)) => {
                 let distributable = ((reward as f64) * (1.0 - self.pool_fee)) as i64;
                 let drift = balances - distributable;
                 summary.invariant_drift_zatoshis = drift;
-                if drift.abs() > INVARIANT_DRIFT_ALERT_ZATOSHIS {
-                    summary.alerts.push(format!(
-                        "accounting invariant drift: balances exceed confirmed rewards \
-                         by {:.4} coins (threshold {:.4})",
-                        drift as f64 / ZATOSHIS_PER_ZEC,
-                        INVARIANT_DRIFT_ALERT_ZATOSHIS as f64 / ZATOSHIS_PER_ZEC,
-                    ));
+
+                // Baseline = the drift recorded by the previous sweep.
+                let previous = self
+                    .db
+                    .get_pool_status("reconciler_health")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|(v, _)| serde_json::from_str::<serde_json::Value>(&v).ok())
+                    .and_then(|j| j.get("invariant_drift_zec").and_then(|d| d.as_f64()))
+                    .map(|zec| (zec * ZATOSHIS_PER_ZEC) as i64);
+
+                match previous {
+                    Some(prev) => {
+                        let delta = drift - prev;
+                        if delta.abs() > INVARIANT_DRIFT_DELTA_ALERT_ZATOSHIS {
+                            summary.alerts.push(format!(
+                                "accounting invariant moved by {:+.4} coins since last \
+                                 sweep (absolute drift now {:.4}) — money moved without \
+                                 matching bookkeeping",
+                                delta as f64 / ZATOSHIS_PER_ZEC,
+                                drift as f64 / ZATOSHIS_PER_ZEC,
+                            ));
+                        }
+                    }
+                    None => {
+                        // First sweep ever: establish the baseline, inform only.
+                        info!(
+                            drift_zec = drift as f64 / ZATOSHIS_PER_ZEC,
+                            "Reconciler invariant baseline established"
+                        );
+                    }
                 }
             }
             Err(e) => summary.alerts.push(format!("invariant query failed: {e}")),
@@ -442,7 +472,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn invariant_drift_alert() {
         let (db, pool) = setup_db().await;
-        // Confirmed reward 10.0 but balances total 10.5 → 0.5 drift > 0.1 threshold.
+        // First sweep establishes a 0-drift baseline; then reward/balances
+        // diverge by 0.5 → the second sweep alerts on the delta.
         sqlx::query(
             "INSERT INTO blocks (height, hash, reward, status, found_by)
              VALUES (100, 'aa', 1000000000, 'confirmed', NULL)",
@@ -463,9 +494,24 @@ pub(crate) mod tests {
         let wallet = mock_rpc(HashMap::new()).await;
 
         let r = reconciler(db, &node, &wallet);
-        let s = r.sweep_once().await.unwrap();
-        assert_eq!(s.invariant_drift_zatoshis, 50_000_000);
-        assert!(s.alerts.iter().any(|a| a.contains("invariant")), "alerts: {:?}", s.alerts);
+        // Sweep 1: no prior reconciler_health → baseline only, no alert.
+        let s1 = r.sweep_once().await.unwrap();
+        assert_eq!(s1.invariant_drift_zatoshis, 50_000_000);
+        assert!(s1.alerts.is_empty(), "first sweep should baseline: {:?}", s1.alerts);
+        // Sweep 2: drift unchanged → still quiet.
+        let s2 = r.sweep_once().await.unwrap();
+        assert!(s2.alerts.is_empty(), "unchanged drift must not alert: {:?}", s2.alerts);
+        // Now balances move by 0.5 with no matching reward → delta alert.
+        sqlx::query("UPDATE balances SET paid = paid + 50000000 WHERE miner_id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let s3 = r.sweep_once().await.unwrap();
+        assert!(
+            s3.alerts.iter().any(|a| a.contains("invariant moved")),
+            "delta must alert: {:?}",
+            s3.alerts
+        );
     }
 
     #[tokio::test]
@@ -522,7 +568,7 @@ mod fee_tests {
         let mut r = reconciler(db, &node, &wallet);
         r.pool_fee = 0.01;
         let s = r.sweep_once().await.unwrap();
-        assert_eq!(s.invariant_drift_zatoshis, 0);
+        assert_eq!(s.invariant_drift_zatoshis, 0, "fee-blind check would see -1.0");
         assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
     }
 }
