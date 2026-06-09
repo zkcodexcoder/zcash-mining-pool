@@ -114,7 +114,8 @@ fn identify_pool(miner_address: &str, coinbase_text: &str) -> Option<String> {
         "t1LRTUjrLE2RHsS75cjCrxB7xaLTwaVkwao" => Some("2Miners-Solo"),
         "t1L2b66MXbgpVMXDfUa94GCBFAN4dCxGohM" => Some("AntPool"),
         "t1e6hceYHkzCbwcwGZzKeMfXXW7x7gr19Cw" => Some("Kryptex"),
-        "t1SqwRAAdSig6dE4EBPLonAait219VmkUjP" => Some("ZEC Pool X"),
+        // Foundry (formerly "ZEC Pool X") — same mining address, rebranded.
+        "t1SqwRAAdSig6dE4EBPLonAait219VmkUjP" => Some("Foundry"),
         _ => None,
     };
     if let Some(n) = name {
@@ -125,8 +126,10 @@ fn identify_pool(miner_address: &str, coinbase_text: &str) -> Option<String> {
     if coinbase_text.contains("2Miners") {
         return Some("2Miners".to_string());
     }
-    if coinbase_text.contains("/ZEC Pool X/") {
-        return Some("ZEC Pool X".to_string());
+    if coinbase_text.contains("Foundry") || coinbase_text.contains("/ZEC Pool X/") {
+        // Historical blocks tagged "/ZEC Pool X/" before the rename also
+        // identify as Foundry — same operator.
+        return Some("Foundry".to_string());
     }
     if coinbase_text.contains("Mined by") {
         return Some("F2Pool".to_string());

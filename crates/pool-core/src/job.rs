@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use node_rpc::types::BlockTemplate;
 use node_rpc::ZcashRpcClient;
@@ -10,6 +10,8 @@ use stratum::server::StratumServer;
 use stratum::ServerMessage;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+use crate::lag::{LagKind, TemplateLagTracker};
 
 
 /// A mining job derived from a block template.
@@ -125,6 +127,18 @@ pub struct JobManager {
     last_longpollid: Arc<RwLock<Option<String>>>,
     /// Counter of successful longpoll wake-ups (new template returned).
     longpoll_wake_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Counter of longpoll failures (RPC error, HTTP timeout, etc.). Each
+    /// failure triggers a fall-back to a regular `getblocktemplate` poll;
+    /// the wake counter doesn't tick for those, so this is the only way
+    /// to see "how flaky is the longpoll path" from the dashboard.
+    longpoll_fail_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Unix timestamp (ms) of the most recent longpoll failure. Lets the
+    /// dashboard render the row red when it's currently flaring (recent
+    /// fail) and green when it's been quiet for a while.
+    last_longpoll_fail_at_ms: Arc<AtomicI64>,
+    /// Tracks the lag between longpoll-return and broadcast_notify so the
+    /// dashboard can surface our pool-side orphan-window contribution.
+    lag_tracker: Arc<TemplateLagTracker>,
 }
 
 impl JobManager {
@@ -161,6 +175,9 @@ impl JobManager {
             longpoll: LongpollConfig::default(),
             last_longpollid: Arc::new(RwLock::new(None)),
             longpoll_wake_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            longpoll_fail_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_longpoll_fail_at_ms: Arc::new(AtomicI64::new(0)),
+            lag_tracker: Arc::new(TemplateLagTracker::new()),
         }
     }
 
@@ -177,6 +194,22 @@ impl JobManager {
     /// Accessor for the longpoll wake counter (for dashboards).
     pub fn longpoll_wake_count(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.longpoll_wake_count)
+    }
+
+    /// Accessor for the longpoll failure counter.
+    pub fn longpoll_fail_count(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.longpoll_fail_count)
+    }
+
+    /// Accessor for the unix-ms timestamp of the most recent longpoll failure.
+    pub fn last_longpoll_fail_at_ms(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.last_longpoll_fail_at_ms)
+    }
+
+    /// Accessor for the template-lag tracker so the pool-server status loop
+    /// can snapshot it into pool_status for the dashboard to read.
+    pub fn lag_tracker(&self) -> Arc<TemplateLagTracker> {
+        Arc::clone(&self.lag_tracker)
     }
 
     pub fn jobs(&self) -> Arc<RwLock<HashMap<String, MiningJob>>> {
@@ -242,13 +275,24 @@ impl JobManager {
     async fn poll_template_with_longpoll(&self, longpollid: &str) -> Result<bool, node_rpc::RpcError> {
         match self.rpc.get_block_template_longpoll(longpollid, self.longpoll.timeout).await {
             Ok(template) => {
+                // Stamp T0 = the moment zebrad released us with a new tip.
+                // Anything we do between now and broadcast_notify is
+                // orphan-window time the dashboard surfaces as template lag.
+                let t0 = Instant::now();
                 self.longpoll_wake_count.fetch_add(1, Ordering::Relaxed);
-                self.process_template(template).await
+                self.process_template(template, Some(t0)).await
             }
             Err(e) => {
-                // Longpoll failed (timeout, HTTP error, etc.) — fall back
-                // to a normal poll so we always have a fresh template and
-                // longpollid for the next iteration.
+                // Longpoll failed (timeout, HTTP error, etc.) — bump the
+                // failure counters so the dashboard can render flakiness,
+                // then fall back to a normal poll so we always have a
+                // fresh template and longpollid for the next iteration.
+                self.longpoll_fail_count.fetch_add(1, Ordering::Relaxed);
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.last_longpoll_fail_at_ms.store(now_ms, Ordering::Relaxed);
                 warn!(error = %e, "Longpoll failed, falling back to regular poll");
                 self.poll_template().await
             }
@@ -260,14 +304,20 @@ impl JobManager {
     /// to avoid spamming miners that ignore them.
     async fn poll_template(&self) -> Result<bool, node_rpc::RpcError> {
         let template = self.rpc.get_block_template().await?;
-        self.process_template(template).await
+        // Regular polls aren't race-driven (we polled, no external trigger);
+        // recording a lag sample here would skew the orphan-window metric.
+        self.process_template(template, None).await
     }
 
     /// Build and broadcast an empty-block notify: a mining job with no
     /// mempool transactions, just our (tagged) coinbase. Used as the
     /// race-to-tip fast path — lets miners start hashing on the new
     /// prev_hash while we finish building the full template in parallel.
-    async fn broadcast_empty_block(&self, template: &BlockTemplate) {
+    ///
+    /// `t0` is the longpoll-return instant. When provided, the elapsed
+    /// time from t0 to the broadcast is recorded as an EmptyBlock lag
+    /// sample for the dashboard.
+    async fn broadcast_empty_block(&self, template: &BlockTemplate, t0: Option<Instant>) {
         // Clone into a stripped-down template with no mempool txs and no
         // pre-cached merkle root (so compute_merkle_root runs over just
         // the coinbase).
@@ -329,18 +379,33 @@ impl JobManager {
             *latest = Some(notify.clone());
         }
         self.stratum.broadcast_notify(notify);
+        if let Some(start) = t0 {
+            self.lag_tracker
+                .record(start.elapsed(), template.height, LagKind::EmptyBlock);
+        }
         debug!(job_id = %job_id, "Race-to-tip: emitted empty-block notify");
     }
 
     /// Process a fetched template: detect new-block, inject coinbase tag,
     /// create job, broadcast notify. Shared by regular and longpoll paths.
-    async fn process_template(&self, mut template: BlockTemplate) -> Result<bool, node_rpc::RpcError> {
+    ///
+    /// `t0` is the moment the source RPC returned (the longpoll wake
+    /// timestamp). When `Some`, lag samples are recorded; when `None`
+    /// (regular polls), no samples are recorded — those are timer-driven,
+    /// not race-driven.
+    async fn process_template(
+        &self,
+        mut template: BlockTemplate,
+        t0: Option<Instant>,
+    ) -> Result<bool, node_rpc::RpcError> {
         // Capture the longpollid for the next request (if present).
         {
             let mut lpid = self.last_longpollid.write().await;
             *lpid = template.longpollid.clone();
         }
         let new_prev_hash = template.previousblockhash.clone();
+        // Remember height now — `template` gets moved into MiningJob below.
+        let template_height = template.height;
 
         let is_new_block = {
             let last = self.last_prev_hash.read().await;
@@ -361,7 +426,7 @@ impl JobManager {
         // the full template as the clean job instead.
         let sent_empty_block = is_new_block && template.transactions.is_empty();
         if sent_empty_block {
-            self.broadcast_empty_block(&template).await;
+            self.broadcast_empty_block(&template, t0).await;
         } else if is_new_block {
             debug!(
                 tx_count = template.transactions.len(),
@@ -485,6 +550,15 @@ impl JobManager {
             *latest = Some(notify.clone());
         }
         self.stratum.broadcast_notify(notify);
+        if is_new_block {
+            if let Some(start) = t0 {
+                self.lag_tracker.record(
+                    start.elapsed(),
+                    template_height,
+                    LagKind::FullTemplate,
+                );
+            }
+        }
 
         Ok(is_new_block)
     }

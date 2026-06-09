@@ -12,8 +12,7 @@
 config/pool.toml
 config/zebrad.toml
 
-# Runtime logs and backups (added 2026-06-06)
-pool.log
-dashboard.log
+# Runtime logs, backups, operational artifacts
 *.log
 *.bak
+backups/
