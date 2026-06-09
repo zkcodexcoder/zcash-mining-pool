@@ -104,10 +104,18 @@ impl StratumServer {
     }
 
     /// Send a targeted message to a specific session (e.g., share response).
+    ///
+    /// Uses `try_send` rather than `send().await` to avoid blocking the caller
+    /// on a slow miner. The validator runs in a single task and feeds all
+    /// sessions; one stalled miner whose per-session channel fills must NEVER
+    /// be able to wedge it. Dropping a message is preferable: the miner will
+    /// just retry the next stratum exchange.
     pub async fn send_to_session(&self, session_id: &str, msg: ServerMessage) {
         let senders = self.session_senders.read().await;
         if let Some(tx) = senders.get(session_id) {
-            let _ = tx.send(msg).await;
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg) {
+                warn!(%session_id, "Per-session channel full; dropping message");
+            }
         }
     }
 
@@ -330,7 +338,18 @@ impl StratumServer {
                     });
                     let latest = self.latest_notify.read().await;
                     if let Some(ref notify) = *latest {
-                        responses.push(notify.clone());
+                        // A new subscriber has no prior work, so its first job
+                        // must be clean. The cached broadcast notify is usually
+                        // clean_jobs=false (the race-to-tip full-template path
+                        // sets it that way so existing miners keep in-flight
+                        // shares) — override it for this new connection so the
+                        // miner starts hashing immediately instead of waiting
+                        // for the next new-block notify.
+                        let mut first = notify.clone();
+                        if let ServerMessage::Notify { clean_jobs, .. } = &mut first {
+                            *clean_jobs = true;
+                        }
+                        responses.push(first);
                     }
                 }
             }

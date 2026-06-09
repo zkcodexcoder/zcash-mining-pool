@@ -52,6 +52,19 @@ pub struct ApiState {
     pub shares_rejected: Arc<std::sync::atomic::AtomicU64>,
     /// Optional banner message shown at the top of the public dashboard.
     pub banner: Option<String>,
+    /// Background-refreshed snapshot of zebra's /metrics endpoint. The
+    /// admin health handler reads this directly instead of triggering a
+    /// live scrape — zebra 4.4.x's metrics body grew to ~9 MB with
+    /// per-peer cardinality, and the endpoint serves the full body (no
+    /// gzip, no Range, no chunked encoding), so a live scrape costs
+    /// ~1.5s per call. The background task in `zcash-dashboard` refreshes
+    /// this every ~30s, keeping the admin endpoint constant-time.
+    pub zebra_metrics_cache: Arc<tokio::sync::RwLock<crate::zebra_metrics::ZebraMetrics>>,
+    /// Background-refreshed authoritative chain tip from a fan-out across
+    /// several public lwd servers. Lets the admin page surface a
+    /// second-opinion tip when zebra's local `sync_estimated_network_tip`
+    /// looks wrong (we've seen it report below verified_height in 4.4.1).
+    pub authoritative_tip_cache: Arc<tokio::sync::RwLock<crate::lwd_tip::AuthoritativeTip>>,
 }
 
 impl ApiState {
@@ -151,6 +164,10 @@ pub struct StratumPortInfo {
 pub struct PoolStats {
     pub name: String,
     pub fee_percent: f64,
+    /// Minimum payout threshold in ZEC.
+    #[serde(rename = "minpay")]
+    pub min_payout_zec: f64,
+    pub payout_scheme: String,
     pub stratum_url: String,
     pub stratum_port: u16,
     pub stratum_ports: Vec<StratumPortInfo>,
@@ -163,8 +180,13 @@ pub struct PoolStats {
     /// Short-term (1 min) pool hashrate for responsive display.
     pub hashrate_current: f64,
     pub network_hashrate: f64,
+    pub network_height: u64,
     /// Pool luck over the last 24h as a percentage (100 = exactly as expected).
     pub luck_percent: Option<f64>,
+    /// Average luck across the last 10 blocks found (100 = expected, lower = luckier).
+    pub luck_last_10: Option<f64>,
+    /// Average luck across every block the pool has ever found.
+    pub luck_lifetime: Option<f64>,
     /// Pool's share of network blocks in the last 24h (percentage).
     pub pool_percent_24h: Option<f64>,
     pub node_ok: bool,
@@ -250,6 +272,8 @@ pub struct StatsSnapshot {
     pub pool_hashrate: f64,
     pub pool_hashrate_1m: f64,
     pub network_hashrate: f64,
+    #[serde(default)]
+    pub network_height: u64,
     pub connected_miners: i64,
     pub total_blocks: i64,
     pub total_shares: i64,
@@ -321,8 +345,9 @@ pub async fn compute_stats_snapshot(state: &ApiState) -> StatsSnapshot {
     let hashrate_current = (diff_sum_1m / 60.0) * state.difficulty_multiplier;
 
     // Run slow RPC calls concurrently to avoid blocking the snapshot.
-    let (network_hashrate, wallet_ok) = tokio::join!(
+    let (network_hashrate, network_height, wallet_ok) = tokio::join!(
         async { state.rpc.get_network_sol_ps(Some(120)).await.unwrap_or(0.0) },
+        async { state.rpc.get_block_count().await.unwrap_or(0) },
         check_wallet_rpc(state),
     );
 
@@ -331,6 +356,7 @@ pub async fn compute_stats_snapshot(state: &ApiState) -> StatsSnapshot {
         pool_hashrate: hashrate,
         pool_hashrate_1m: hashrate_current,
         network_hashrate,
+        network_height,
         connected_miners: connected,
         total_blocks: blocks,
         total_shares: shares,
@@ -397,12 +423,28 @@ pub async fn get_pool_stats(
         None
     };
 
+    // Historical luck: average of last-10 and lifetime per-block luck_percent values.
+    let luck_last_10 = match state.db.get_recent_blocks(10).await {
+        Ok(blocks) => {
+            let lucks: Vec<f64> = blocks.iter().filter_map(|b| b.luck_percent).collect();
+            if lucks.is_empty() {
+                None
+            } else {
+                Some(lucks.iter().sum::<f64>() / lucks.len() as f64)
+            }
+        }
+        Err(_) => None,
+    };
+    let luck_lifetime = state.db.get_lifetime_luck().await.unwrap_or(None);
+
     Ok(Json(PoolStats {
         name: state.pool_name.clone(),
         fee_percent: state.pool_fee,
+        payout_scheme: "PPLNS".to_string(),
         stratum_url: format!("stratum+tcp://{}:{}", state.hostname, state.stratum_port),
         stratum_port: state.stratum_port,
         stratum_ports: state.stratum_ports.clone(),
+        min_payout_zec: state.min_payout_zatoshis as f64 / 100_000_000.0,
         connected_miners: snap.connected_miners,
         total_blocks: snap.total_blocks,
         immature_blocks: immature,
@@ -411,7 +453,10 @@ pub async fn get_pool_stats(
         hashrate_estimate: snap.pool_hashrate,
         hashrate_current: snap.pool_hashrate_1m,
         network_hashrate: snap.network_hashrate,
+        network_height: snap.network_height,
         luck_percent,
+        luck_last_10,
+        luck_lifetime,
         pool_percent_24h,
         node_ok,
         last_template_at,
@@ -501,6 +546,13 @@ pub async fn get_pool_stats_nomp(
         "maturedTotal": matured,
         "luck": luck,
         "minPayout": min_payout_zec,
+        "minpay": min_payout_zec,
+        "fee": state.pool_fee,
+        "payoutScheme": "PPLNS",
+        "paymentMethod": "PPLNS",
+        "payout_scheme": "PPLNS",
+        "height": network_height,
+        "last_block_found": last_block_found,
         "nodes": [{
             "name": "zcash_pplns",
             "difficulty": format!("{:.4}", network_difficulty),

@@ -61,8 +61,10 @@ struct GraceTarget {
     set_at: Instant,
 }
 
-/// Max number of previous targets to remember.
-const GRACE_TARGET_HISTORY: usize = 3;
+/// Max number of previous targets to remember. Sized to cover a full
+/// vardiff up-ramp (~4 early-trigger steps over ~48s with the cooldown)
+/// so in-flight shares straddling any step still get credited.
+const GRACE_TARGET_HISTORY: usize = 8;
 /// Max age of a grace target before we stop accepting shares for it.
 /// Any miner still submitting at a target older than this is malfunctioning.
 const GRACE_TARGET_MAX_AGE: Duration = Duration::from_secs(60);
@@ -340,8 +342,15 @@ impl ShareValidator {
                                 23 => { self.rejects_low_diff.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                                 _ => { self.rejects_other.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                             }
-                            // Bump per-session counters for live visibility
-                            {
+                            // Bump per-session counters for live visibility,
+                            // and decide whether this session is a bad-share
+                            // flooder we should kick. A miner with zero accepts
+                            // and 50+ rejects after 5 s connected is almost
+                            // certainly running the wrong algorithm or broken
+                            // hardware — vardiff alone can't defend (it just
+                            // ramps), and at high rates this storm can wedge
+                            // the single validator task.
+                            let should_disconnect = {
                                 let mut sessions = self.session_difficulty.write().await;
                                 if let Some(sd) = sessions.get_mut(&session_id) {
                                     match code {
@@ -349,7 +358,24 @@ impl ShareValidator {
                                         23 => sd.shares_rejected_low_diff = sd.shares_rejected_low_diff.saturating_add(1),
                                         _ => sd.shares_rejected_other = sd.shares_rejected_other.saturating_add(1),
                                     }
+                                    let total_rejects = sd.shares_rejected_low_diff
+                                        + sd.shares_rejected_job_not_found
+                                        + sd.shares_rejected_other;
+                                    sd.shares_accepted == 0
+                                        && total_rejects >= 50
+                                        && sd.connected_at.elapsed() >= std::time::Duration::from_secs(5)
+                                } else {
+                                    false
                                 }
+                            };
+                            if should_disconnect {
+                                warn!(
+                                    %session_id,
+                                    worker = %worker_name,
+                                    "Disconnecting bad-share flooder (no accepts, 50+ rejects in 5s+)"
+                                );
+                                self.stratum.disconnect_session(&session_id).await;
+                                continue;
                             }
                             let is_low_diff = e.is_low_difficulty();
                             warn!(worker = %worker_name, error = %e, "Share rejected");

@@ -24,12 +24,24 @@ pub struct VardiffTracker {
     /// When the most recent retarget was applied. Used to enforce a minimum
     /// interval between retargets so the rate-limit path can't thrash.
     last_retarget_at: Instant,
+    /// When the most recent *early-trigger* retarget fired. Distinct from
+    /// last_retarget_at: gates the early-trigger cascade specifically so
+    /// each up-step settles before the next is measured. None = no
+    /// early-trigger yet (the first one is always allowed).
+    last_early_retarget_at: Option<Instant>,
 }
 
 /// Minimum elapsed time between any two successful retargets. Prevents the
 /// rate-limit force_retarget path (which has no other guard) from firing
 /// repeatedly within milliseconds during a fast miner's ramp-up.
 const MIN_RETARGET_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Minimum time after an early-trigger retarget before another early-trigger
+/// may fire. Lets each ramp step's in-flight shares drain and the new
+/// difficulty reach the miner before re-measuring, so vardiff climbs in
+/// controlled steps instead of overshooting past the miner's equilibrium.
+/// Interval retargets (retarget_interval_secs) are NOT gated by this.
+const EARLY_TRIGGER_COOLDOWN: Duration = Duration::from_secs(12);
 
 impl VardiffTracker {
     pub fn new(
@@ -49,6 +61,7 @@ impl VardiffTracker {
             smoothed_ratio: 1.0,
             last_went_up: None,
             last_retarget_at: Instant::now(),
+            last_early_retarget_at: None,
         }
     }
 
@@ -68,8 +81,17 @@ impl VardiffTracker {
         // ramp-path jumps that then immediately overcorrected downward.
         let expected_in_elapsed =
             self.target_shares_per_minute * elapsed / 60.0;
+        // Suppress further early-triggers for EARLY_TRIGGER_COOLDOWN after one
+        // fires, so each ramp step settles (in-flight shares drain, new diff
+        // reaches the miner) before the next measurement. Without this the
+        // early-trigger cascades every 3-5s and overshoots ~2x past the
+        // miner's equilibrium, shedding low-diff rejects on the big jumps.
+        let in_early_cooldown = self
+            .last_early_retarget_at
+            .is_some_and(|t| t.elapsed() < EARLY_TRIGGER_COOLDOWN);
         let early_trigger = self.shares_in_window as f64 > expected_in_elapsed * 4.0
-            && elapsed >= 3.0;
+            && elapsed >= 3.0
+            && !in_early_cooldown;
 
         if !early_trigger && elapsed < self.retarget_interval_secs {
             return None;
@@ -168,6 +190,9 @@ impl VardiffTracker {
         self.shares_in_window = 0;
         self.window_start = Instant::now();
         self.last_retarget_at = Instant::now();
+        if trigger == "early-trigger" {
+            self.last_early_retarget_at = Some(Instant::now());
+        }
 
         Some((final_difficulty, format!("{direction}: {reason}")))
     }
@@ -248,5 +273,44 @@ mod tests {
             "back-to-back force_retargets must be skipped");
         // Difficulty should remain at its initial value since nothing fired.
         assert_eq!(v.current_difficulty(), 1000.0);
+    }
+
+    #[test]
+    fn vardiff_early_trigger_cooldown_suppresses_cascade() {
+        // After an early-trigger retarget fires, a second early-trigger must
+        // be suppressed for EARLY_TRIGGER_COOLDOWN. This is what stops the
+        // rapid up-ramp cascade that overshoots the miner's equilibrium and
+        // sheds low-diff rejects on the big jumps.
+        let mut v = VardiffTracker::new(20.0, 30.0, 1000.0);
+
+        // Clear the 3s elapsed gate (and the 500ms MIN_RETARGET_INTERVAL).
+        std::thread::sleep(Duration::from_millis(3100));
+
+        // Feed a flood: >4x expected shares fires the early-trigger path.
+        let mut first: Option<(f64, String)> = None;
+        for _ in 0..15 {
+            if let Some(r) = v.record_share() {
+                first = Some(r);
+                break;
+            }
+        }
+        let (_, reason) = first.expect("flood should fire an early-trigger retarget");
+        assert!(reason.contains("early-trigger"),
+            "first retarget should be early-trigger, got: {reason}");
+        let diff_after_first = v.current_difficulty();
+
+        // The retarget reset the window, so sleep again to clear the 3s gate.
+        // Now the ONLY thing that can block a second early-trigger is the
+        // cooldown (we're ~6s in, well under EARLY_TRIGGER_COOLDOWN's 12s).
+        std::thread::sleep(Duration::from_millis(3100));
+
+        // Same flood — every record_share must return None: the early-trigger
+        // is suppressed and the 30s interval retarget hasn't elapsed.
+        for _ in 0..15 {
+            assert!(v.record_share().is_none(),
+                "early-trigger within EARLY_TRIGGER_COOLDOWN must be suppressed");
+        }
+        // Difficulty unchanged since the cascade was blocked.
+        assert_eq!(v.current_difficulty(), diff_after_first);
     }
 }

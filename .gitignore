@@ -11,3 +11,7 @@
 # Real config files (use .example versions as templates)
 config/pool.toml
 config/zebrad.toml
+
+# Runtime/operational artifacts (added 2026-06-09)
+*.log
+backups/
