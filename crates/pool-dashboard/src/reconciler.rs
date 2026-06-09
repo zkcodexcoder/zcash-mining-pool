@@ -88,6 +88,7 @@ impl Reconciler {
         self.check_invariant(&mut summary).await;
 
         let health = serde_json::json!({
+            "invariant_version": self.invariant_version(),
             "last_run": chrono::Utc::now().to_rfc3339(),
             "attempts_resolved": summary.attempts_resolved,
             "attempts_failed": summary.attempts_failed,
@@ -258,6 +259,14 @@ impl Reconciler {
         }
     }
 
+    /// Identifies the invariant formula + parameters. When this changes
+    /// (formula edits across deploys, operator fee changes), the stored
+    /// baseline is meaningless — re-baseline silently instead of alerting
+    /// on the definition jump.
+    fn invariant_version(&self) -> String {
+        format!("v2-pendingblocks-fee{:.4}", self.pool_fee)
+    }
+
     /// Check 3: confirmed-rewards vs balances invariant. Alerts on drift
     /// *movement* since the previous sweep, not on the absolute value.
     async fn check_invariant(&self, summary: &mut SweepSummary) {
@@ -267,7 +276,8 @@ impl Reconciler {
                 let drift = balances - distributable;
                 summary.invariant_drift_zatoshis = drift;
 
-                // Baseline = the drift recorded by the previous sweep.
+                // Baseline = the drift recorded by the previous sweep, valid
+                // only if it was computed with the same formula + parameters.
                 let previous = self
                     .db
                     .get_pool_status("reconciler_health")
@@ -275,6 +285,10 @@ impl Reconciler {
                     .ok()
                     .flatten()
                     .and_then(|(v, _)| serde_json::from_str::<serde_json::Value>(&v).ok())
+                    .filter(|j| {
+                        j.get("invariant_version").and_then(|v| v.as_str())
+                            == Some(self.invariant_version().as_str())
+                    })
                     .and_then(|j| j.get("invariant_drift_zec").and_then(|d| d.as_f64()))
                     .map(|zec| (zec * ZATOSHIS_PER_ZEC) as i64);
 
@@ -292,9 +306,11 @@ impl Reconciler {
                         }
                     }
                     None => {
-                        // First sweep ever: establish the baseline, inform only.
+                        // First sweep ever, or the formula/fee changed:
+                        // establish a fresh baseline, inform only.
                         info!(
                             drift_zec = drift as f64 / ZATOSHIS_PER_ZEC,
+                            version = %self.invariant_version(),
                             "Reconciler invariant baseline established"
                         );
                     }
