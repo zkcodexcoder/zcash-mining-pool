@@ -51,6 +51,10 @@ pub struct Reconciler {
     pub node_rpc: Arc<ZcashRpcClient>,
     pub wallet_rpc: Arc<ZcashRpcClient>,
     pub interval: Duration,
+    /// Pool fee as a fraction (e.g. 0.01 for 1%). Distribution credits
+    /// reward × (1 - fee), so the invariant must compare balances against
+    /// the post-fee distributable total, not the raw reward sum.
+    pub pool_fee: f64,
 }
 
 impl Reconciler {
@@ -254,7 +258,8 @@ impl Reconciler {
     async fn check_invariant(&self, summary: &mut SweepSummary) {
         match self.db.get_accounting_invariant().await {
             Ok((reward, balances)) => {
-                let drift = balances - reward;
+                let distributable = ((reward as f64) * (1.0 - self.pool_fee)) as i64;
+                let drift = balances - distributable;
                 summary.invariant_drift_zatoshis = drift;
                 if drift.abs() > INVARIANT_DRIFT_ALERT_ZATOSHIS {
                     summary.alerts.push(format!(
@@ -281,7 +286,7 @@ pub struct SweepSummary {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{extract::State, routing::post, Json, Router};
     use sqlx::sqlite::SqlitePoolOptions;
@@ -290,7 +295,7 @@ mod tests {
     /// Mock JSON-RPC server: answers each method from a canned response map.
     /// Unknown methods get a JSON-RPC error (matching a node that doesn't
     /// know the tx / op).
-    async fn mock_rpc(responses: HashMap<&'static str, serde_json::Value>) -> String {
+    pub(crate) async fn mock_rpc(responses: HashMap<&'static str, serde_json::Value>) -> String {
         let state = Arc::new(responses);
         async fn handler(
             State(state): State<Arc<HashMap<&'static str, serde_json::Value>>>,
@@ -316,7 +321,7 @@ mod tests {
     }
 
     /// In-memory pool DB + a raw handle for seeding rows directly.
-    async fn setup_db() -> (PoolDb, sqlx::SqlitePool) {
+    pub(crate) async fn setup_db() -> (PoolDb, sqlx::SqlitePool) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -327,12 +332,13 @@ mod tests {
         (db, pool)
     }
 
-    fn reconciler(db: PoolDb, node_url: &str, wallet_url: &str) -> Reconciler {
+    pub(crate) fn reconciler(db: PoolDb, node_url: &str, wallet_url: &str) -> Reconciler {
         Reconciler {
             db,
             node_rpc: Arc::new(ZcashRpcClient::new(node_url)),
             wallet_rpc: Arc::new(ZcashRpcClient::new(wallet_url)),
             interval: Duration::from_secs(600),
+            pool_fee: 0.0,
         }
     }
 
@@ -480,6 +486,43 @@ mod tests {
         let r = reconciler(db.clone(), &node, &wallet);
         let s = r.sweep_once().await.unwrap();
         assert_eq!(s.attempts_resolved + s.attempts_failed, 0);
+        assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
+    }
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::tests::*;
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn invariant_accounts_for_pool_fee() {
+        let (db, pool) = setup_db().await;
+        // 100 coins confirmed, 1% fee → distributable 99. Balances at 99
+        // must NOT alert; the old fee-blind check would see -1.0 drift.
+        sqlx::query(
+            "INSERT INTO blocks (height, hash, reward, status, found_by)
+             VALUES (100, 'bb', 10000000000, 'confirmed', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO miners (address) VALUES ('utest1fee')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO balances (miner_id, pending, paid) VALUES (1, 0, 9900000000)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let node = mock_rpc(HashMap::new()).await;
+        let wallet = mock_rpc(HashMap::new()).await;
+        let mut r = reconciler(db, &node, &wallet);
+        r.pool_fee = 0.01;
+        let s = r.sweep_once().await.unwrap();
+        assert_eq!(s.invariant_drift_zatoshis, 0);
         assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
     }
 }
