@@ -170,14 +170,20 @@ impl PoolDb {
         Ok(rows.iter().map(|r| (r.get("txid"), r.get("total"))).collect())
     }
 
-    /// Accounting invariant inputs (audit P4): the sum of confirmed block
+    /// Accounting invariant inputs (audit P4): the sum of credited block
     /// rewards should approximately equal the sum of all miner balances
     /// (pending + paid). Sustained drift beyond rounding indicates a
     /// crediting bug (e.g. the imprecise orphan reversal, Finding #4).
-    /// Returns (confirmed_reward_zatoshis, balances_total_zatoshis).
+    ///
+    /// Includes BOTH 'confirmed' and 'pending' (immature) blocks: credits
+    /// are written at find time, ~maturity_confirmations before the block
+    /// confirms, so a confirmed-only sum would show every fresh block as
+    /// drift for ~2 hours. Orphaned blocks are excluded — their credits
+    /// are reversed.
+    /// Returns (credited_reward_zatoshis, balances_total_zatoshis).
     pub async fn get_accounting_invariant(&self) -> Result<(i64, i64), DbError> {
         let reward: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(reward), 0) FROM blocks WHERE status = 'confirmed'",
+            "SELECT COALESCE(SUM(reward), 0) FROM blocks WHERE status IN ('pending', 'confirmed')",
         )
         .fetch_one(&self.pool)
         .await?;
