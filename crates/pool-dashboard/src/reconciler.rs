@@ -512,6 +512,25 @@ pub(crate) mod tests {
             "delta must alert: {:?}",
             s3.alerts
         );
+        // A freshly-found immature block credited at find time must NOT
+        // register as drift: pending blocks count toward the reward side.
+        sqlx::query(
+            "INSERT INTO blocks (height, hash, reward, status, found_by)
+             VALUES (101, 'cc', 100000000, 'pending', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE balances SET pending = pending + 100000000 WHERE miner_id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let s4 = r.sweep_once().await.unwrap();
+        assert!(
+            s4.alerts.is_empty(),
+            "find-time credit on immature block must not alert: {:?}",
+            s4.alerts
+        );
     }
 
     #[tokio::test]
