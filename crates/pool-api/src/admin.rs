@@ -147,6 +147,9 @@ pub struct PoolConfigView {
     pub wallet_rpc_url: Option<String>,
     pub coinbase_tag: Option<String>,
     pub payout_interval_secs: u64,
+    /// Zebrad Prometheus metrics URL — derived from `node_rpc_url` if the
+    /// operator didn't set `[node].metrics_url` explicitly.
+    pub zebra_metrics_url: String,
 }
 
 /// Shared state for the admin server.
@@ -506,6 +509,46 @@ struct AdminHealth {
     rejects_other: u64,
     system: Option<SystemStats>,
     payout_health: Option<serde_json::Value>,
+    /// Curated set of zebrad prometheus metrics.
+    zebra: crate::zebra_metrics::ZebraMetrics,
+    /// Authoritative chain tip from a fan-out across public lwd servers.
+    /// Independent second-opinion on where the network actually is.
+    authoritative_tip: crate::lwd_tip::AuthoritativeTip,
+    /// Pool-side template-to-notify lag stats persisted by `zcash-pool`
+    /// into `pool_status` as JSON. None when not yet populated (pool not
+    /// running, or no new-block events since last restart).
+    template_lag: Option<TemplateLagStats>,
+    /// Longpoll wake/fail stats read from `pool_status`. Lets the operator
+    /// see how flaky the pool→zebra longpoll path is currently.
+    longpoll: LongpollStats,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+struct LongpollStats {
+    wakes_total: u64,
+    fails_total: u64,
+    /// Age in seconds since the most recent longpoll failure. `None` if
+    /// there's been no failure since pool start (or the counter never
+    /// got persisted).
+    last_fail_age_secs: Option<i64>,
+}
+
+/// Mirror of `pool_core::TemplateLagSnapshot`. We keep a local copy here so
+/// the dashboard crate doesn't have to pull in `pool-core` (which would
+/// transitively bring `stratum`); the JSON written into `pool_status` is
+/// the contract.
+#[derive(Debug, Default, Clone, Serialize, serde::Deserialize)]
+struct TemplateLagStats {
+    samples_total: u64,
+    samples_window: usize,
+    last_sample_age_secs: Option<u64>,
+    last_height: Option<u64>,
+    last_empty_ms: Option<f64>,
+    p50_empty_ms: Option<f64>,
+    p95_empty_ms: Option<f64>,
+    last_full_ms: Option<f64>,
+    p50_full_ms: Option<f64>,
+    p95_full_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -592,6 +635,38 @@ async fn api_health(
         .ok().flatten()
         .and_then(|(v, _)| serde_json::from_str::<serde_json::Value>(&v).ok());
 
+    // Pool-side lag stats (written by zcash-pool every 5 s into pool_status).
+    let template_lag = state.app.db.get_pool_status("template_lag_stats").await
+        .ok().flatten()
+        .and_then(|(v, _)| serde_json::from_str::<TemplateLagStats>(&v).ok());
+
+    // Longpoll wake/fail counters (also from pool_status).
+    let longpoll = {
+        let wakes = state.app.db.get_pool_status("longpoll_wakes_total").await
+            .ok().flatten()
+            .and_then(|(v, _)| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let fails = state.app.db.get_pool_status("longpoll_fails_total").await
+            .ok().flatten()
+            .and_then(|(v, _)| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let last_fail_ms = state.app.db.get_pool_status("last_longpoll_fail_at_ms").await
+            .ok().flatten()
+            .and_then(|(v, _)| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let last_fail_age_secs = if last_fail_ms > 0 {
+            Some((now_ms - last_fail_ms) / 1000)
+        } else {
+            None
+        };
+        LongpollStats { wakes_total: wakes, fails_total: fails, last_fail_age_secs }
+    };
+
+    // Zebra metrics + authoritative-tip both come from background-refreshed
+    // caches — see the field docs on ApiState for the rationale.
+    let zebra = state.app.zebra_metrics_cache.read().await.clone();
+    let authoritative_tip = state.app.authoritative_tip_cache.read().await.clone();
+
     Json(AdminHealth {
         node_ok,
         node_height,
@@ -620,6 +695,10 @@ async fn api_health(
         rejects_other: rej_other,
         system,
         payout_health,
+        zebra,
+        authoritative_tip,
+        template_lag,
+        longpoll,
     })
 }
 
@@ -983,6 +1062,10 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
         <div id="health-content" class="loading">Loading...</div>
     </div>
     <div class="card">
+        <h2>Mining Node (Zebra)</h2>
+        <div id="zebra-content" class="loading">Loading...</div>
+    </div>
+    <div class="card">
         <h2>Payout Pipeline</h2>
         <div id="payout-health-content" style="color:#718096;font-size:0.85rem">Loading...</div>
     </div>
@@ -1270,6 +1353,198 @@ function fmtDuration(secs) {
     return s;
 }
 
+// Tracks when the lwd-vs-verified gap first went non-zero so we can flag
+// a sustained at-tip miss (>30s = red, <30s = transitional yellow).
+let _firstNonZeroDistanceAt = null;
+
+function renderZebraCard(d) {
+    const z = d.zebra || {};
+    const at = d.authoritative_tip || null;
+    const lag = d.template_lag || null;
+    const fmtMs = (v) => (v == null) ? '?' : v.toFixed(1) + ' ms';
+    const lagColor = (v) => (v == null) ? '#718096' : (v > 200 ? '#fc8181' : (v > 50 ? '#f4b728' : '#68d391'));
+
+    // Compute at-tip status from the lwd consensus (authoritative tip)
+    // against our own verified height. Zebra's local distance_to_tip is
+    // peer-gossip-derived and has been observed to lie, so we ignore it
+    // here. If the lwd quorum has too few responses to trust (<3) or no
+    // data yet, the badge falls back to "Unknown".
+    let dist = null;          // signed gap: positive = we are behind lwd
+    let trustable = false;
+    if (at && at.max_height != null && z.verified_height != null && at.responses_ok >= 3) {
+        dist = at.max_height - z.verified_height;
+        trustable = true;
+    }
+    const nowMs = Date.now();
+    if (!trustable || dist === 0) {
+        _firstNonZeroDistanceAt = null;
+    } else if (_firstNonZeroDistanceAt === null) {
+        _firstNonZeroDistanceAt = nowMs;
+    }
+    const distAgeSecs = (_firstNonZeroDistanceAt != null) ? Math.floor((nowMs - _firstNonZeroDistanceAt) / 1000) : 0;
+
+    let html = '';
+
+    if (z.scrape_error) {
+        html += '<div style="padding:0.6rem 0.75rem;background:#742a2a;color:#fc8181;border-radius:4px;font-size:0.8rem;margin-bottom:0.75rem">Metrics scrape failed: ' + z.scrape_error + '</div>';
+    }
+
+    html += '<table class="kv-table">';
+
+    // At-tip status (lwd-derived)
+    let tipBadge;
+    if (!trustable) {
+        tipBadge = '<span class="badge badge-fail">Unknown</span>';
+    } else if (dist === 0) {
+        tipBadge = '<span class="badge badge-ok">At Tip</span>';
+    } else if (Math.abs(dist) <= 1 && distAgeSecs < 30) {
+        const sign = dist > 0 ? '+' : '';
+        tipBadge = '<span class="badge" style="background:#5a4a1a;color:#f4b728">Transitioning (' + sign + dist + ')</span>';
+    } else {
+        const sign = dist > 0 ? '+' : '';
+        tipBadge = '<span class="badge badge-fail">' + sign + dist + ' for ' + distAgeSecs + 's</span>';
+    }
+    html += '<tr><td>At Tip</td><td>' + tipBadge + '</td></tr>';
+
+    html += '<tr><td>Verified Height</td><td class="gold">' + (z.verified_height != null ? z.verified_height.toLocaleString() : '?') + '</td></tr>';
+    if (z.finalized_height != null && z.verified_height != null) {
+        const finDelta = z.verified_height - z.finalized_height;
+        html += '<tr><td>Finalized Height</td><td>' + z.finalized_height.toLocaleString() + ' <span style="color:#718096">(' + finDelta + ' back)</span></td></tr>';
+    }
+
+    // Network Tip — fan-out across public lwd servers. Replaces zebra's
+    // own peer-gossip estimate (`sync_estimated_network_tip_height`) which
+    // has been observed to report below verified_height in 4.4.x. The
+    // lwd consensus is the trustworthy second-opinion measurement. We
+    // reuse the `at` const declared at the top of the function.
+    if (at && at.responses_total > 0) {
+        if (at.max_height != null) {
+            // Compare to zebra's verified tip. Green if within 1 block (a
+            // brief mid-transition gap), yellow at 2-5, red at 6+ — and
+            // red if too few servers responded for the answer to be
+            // trustworthy.
+            const delta = (z.verified_height != null) ? (at.max_height - z.verified_height) : null;
+            let color;
+            if (at.responses_ok < 3) {
+                color = '#fc8181';
+            } else if (delta == null || Math.abs(delta) <= 1) {
+                color = '#68d391';
+            } else if (Math.abs(delta) <= 5) {
+                color = '#f4b728';
+            } else {
+                color = '#fc8181';
+            }
+            let deltaTxt = '';
+            if (delta != null && delta !== 0) {
+                deltaTxt = ' <span style="color:#718096">(Δ ' + (delta > 0 ? '+' : '') + delta + ')</span>';
+            }
+            const respTxt = ' <span style="color:#718096">(' + at.responses_ok + '/' + at.responses_total + ' responding)</span>';
+            html += '<tr><td>Network Tip</td><td style="color:' + color + '">' + at.max_height.toLocaleString() + deltaTxt + respTxt + '</td></tr>';
+        } else {
+            // Cache populated but every server failed — fall back to
+            // showing nothing useful and color it red so the operator
+            // notices the lwd fan-out is broken.
+            html += '<tr><td>Network Tip</td><td style="color:#fc8181">unavailable (0/' + at.responses_total + ' lwd responding)</td></tr>';
+        }
+    }
+
+    // Peers
+    if (z.peers != null) {
+        const peersColor = z.peers < 8 ? '#fc8181' : z.peers < 30 ? '#f4b728' : '#68d391';
+        html += '<tr><td>Connected Peers</td><td style="color:' + peersColor + '">' + z.peers + '</td></tr>';
+    }
+
+    // RPC health
+    if (z.rpc_active_requests != null) {
+        const rc = z.rpc_active_requests > 50 ? '#fc8181' : z.rpc_active_requests > 10 ? '#f4b728' : '#68d391';
+        html += '<tr><td>RPC Active</td><td style="color:' + rc + '">' + z.rpc_active_requests + '</td></tr>';
+    }
+    if (z.gbt_requests_total != null && z.gbt_requests_total > 0) {
+        const errs = z.gbt_errors_total || 0;
+        const total = z.gbt_requests_total;
+        const ok = total - errs;
+        const pct = (errs / total) * 100;
+        const c = pct > 5 ? '#fc8181' : pct > 1 ? '#f4b728' : '#68d391';
+        html += '<tr><td>getblocktemplate Error Rate</td><td style="color:' + c + '">' + pct.toFixed(2) + '% <span style="color:#718096">(' + errs.toLocaleString() + ' / ' + total.toLocaleString() + ')</span></td></tr>';
+        html += '<tr><td>getblocktemplate Successful</td><td style="color:#68d391">' + ok.toLocaleString() + '</td></tr>';
+    }
+
+    // Mempool
+    if (z.mempool_txs != null) {
+        let kb = '';
+        if (z.mempool_bytes != null) kb = ' <span style="color:#718096">(' + (z.mempool_bytes / 1024).toFixed(1) + ' KB)</span>';
+        html += '<tr><td>Mempool</td><td>' + z.mempool_txs + ' txs' + kb + '</td></tr>';
+    }
+
+    // Block flow
+    if (z.verified_blocks_total != null) {
+        html += '<tr><td>Blocks Verified (since zebra start)</td><td>' + z.verified_blocks_total.toLocaleString() + '</td></tr>';
+    }
+    if (z.gossip_queued_blocks != null && z.gossip_queued_blocks > 0) {
+        html += '<tr><td>Gossip Queue Depth</td><td>' + z.gossip_queued_blocks + '</td></tr>';
+    }
+
+    if (z.zebra_version) {
+        html += '<tr><td>Zebra Version</td><td>' + z.zebra_version + '</td></tr>';
+    }
+
+    // Longpoll health — wakes/fails counters + recency of last failure.
+    // Colour is recency-driven (NOT a ratio), because the totals carry
+    // permanent residue from past warmup windows but the operator only
+    // cares about *current* health.
+    const lp = d.longpoll;
+    if (lp) {
+        const age = lp.last_fail_age_secs;
+        let color, recencyTxt;
+        if (lp.wakes_total === 0 && lp.fails_total === 0) {
+            color = '#718096';                   // no data yet
+            recencyTxt = ' <span style="color:#718096">(no activity yet)</span>';
+        } else if (age == null) {
+            color = '#68d391';
+            recencyTxt = ' <span style="color:#718096">(no failures since start)</span>';
+        } else if (age < 60) {
+            color = '#fc8181';
+            recencyTxt = ' <span style="color:#fc8181">(last fail ' + age + 's ago)</span>';
+        } else if (age < 300) {
+            color = '#f4b728';
+            recencyTxt = ' <span style="color:#f4b728">(last fail ' + Math.floor(age/60) + 'm ago)</span>';
+        } else {
+            color = '#68d391';
+            const minutes = Math.floor(age/60);
+            recencyTxt = ' <span style="color:#718096">(last fail ' + (minutes >= 60 ? Math.floor(minutes/60)+'h' : minutes+'m') + ' ago)</span>';
+        }
+        html += '<tr><td>Longpoll</td><td style="color:' + color + '">wakes ' + lp.wakes_total.toLocaleString() +
+            ' / fails ' + lp.fails_total.toLocaleString() + recencyTxt + '</td></tr>';
+    }
+
+    // Pool-side notify lag (the orphan-window we control)
+    html += '<tr><td style="padding-top:0.75rem;color:#718096;font-size:0.75rem">Pool to Miner Notify Lag</td><td></td></tr>';
+    if (lag && lag.samples_total > 0) {
+        html += '<tr><td style="padding-left:1rem">&bull; Last (empty-block)</td><td style="color:' + lagColor(lag.last_empty_ms) + '">' + fmtMs(lag.last_empty_ms) + '</td></tr>';
+        html += '<tr><td style="padding-left:1rem">&bull; p50 / p95 (empty-block)</td><td>' +
+            '<span style="color:' + lagColor(lag.p50_empty_ms) + '">' + fmtMs(lag.p50_empty_ms) + '</span> / ' +
+            '<span style="color:' + lagColor(lag.p95_empty_ms) + '">' + fmtMs(lag.p95_empty_ms) + '</span></td></tr>';
+        html += '<tr><td style="padding-left:1rem">&bull; p50 / p95 (full template)</td><td>' +
+            '<span style="color:' + lagColor(lag.p50_full_ms) + '">' + fmtMs(lag.p50_full_ms) + '</span> / ' +
+            '<span style="color:' + lagColor(lag.p95_full_ms) + '">' + fmtMs(lag.p95_full_ms) + '</span></td></tr>';
+        const ageTxt = lag.last_sample_age_secs != null ? lag.last_sample_age_secs + 's ago' : '';
+        html += '<tr><td style="padding-left:1rem">&bull; Samples (window / total)</td><td>' + lag.samples_window + ' / ' + lag.samples_total + ' <span style="color:#718096">' + ageTxt + '</span></td></tr>';
+    } else {
+        html += '<tr><td style="padding-left:1rem;color:#718096">Awaiting first new-block event after pool start...</td><td></td></tr>';
+    }
+
+    // Scrape meta
+    if (z.scrape_duration_ms != null) {
+        const c = z.scrape_duration_ms > 1500 ? '#fc8181' : z.scrape_duration_ms > 500 ? '#f4b728' : '#718096';
+        html += '<tr><td style="padding-top:0.75rem;color:#718096;font-size:0.75rem">Metrics scrape time</td><td style="color:' + c + ';font-size:0.75rem">' + z.scrape_duration_ms + ' ms</td></tr>';
+    }
+
+    html += '</table>';
+
+    const el = document.getElementById('zebra-content');
+    if (el) el.innerHTML = html;
+}
+
 async function fetchHealth() {
     try {
         const d = await fetchJson('/admin/api/health');
@@ -1355,6 +1630,9 @@ async function fetchHealth() {
         }
 
         document.getElementById('health-content').innerHTML = html;
+
+        // Mining Node (Zebra) section
+        renderZebraCard(d);
 
         // Payout health section
         let ph = d.payout_health;

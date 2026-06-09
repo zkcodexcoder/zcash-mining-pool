@@ -571,6 +571,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="label">Network Hashrate</div>
             <div class="value-row">
                 <div class="value" id="stat-net-hashrate">--</div>
+                <div class="sub" id="stat-block-height"></div>
             </div>
             <div class="sparkline-wrap"><canvas id="spark-net-hashrate"></canvas></div>
         </div>
@@ -603,6 +604,14 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="value" id="stat-luck">--</div>
         </div>
         <div class="metric-cell">
+            <div class="label"><span class="tip" data-tip="Average luck across the last 10 blocks found. Lower is luckier: green ≤100%, yellow ≤150%, red >150%.">Luck (10 blocks)</span></div>
+            <div class="value" id="stat-luck-10">--</div>
+        </div>
+        <div class="metric-cell">
+            <div class="label"><span class="tip" data-tip="Average luck across every block this pool has ever found. Lower is luckier: green ≤100%, yellow ≤150%, red >150%.">Luck (lifetime)</span></div>
+            <div class="value" id="stat-luck-lifetime">--</div>
+        </div>
+        <div class="metric-cell">
             <div class="label">Network Share (24h)</div>
             <div class="value" id="stat-pool-pct">--</div>
         </div>
@@ -618,7 +627,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <div class="label">Pool Fee</div>
             <div class="value" id="stat-fee">--</div>
         </div>
-        <div class="metric-cell" style="grid-column: span 2">
+        <div class="metric-cell" style="grid-column: 1 / -1">
             <div class="label">Stratum Ports</div>
             <div id="stat-ports" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px"></div>
         </div>
@@ -1040,6 +1049,7 @@ async function fetchStats() {
         setVal('stat-hashrate', formatHashrate(d.hashrate_current));
         document.getElementById('stat-hashrate-avg').textContent = '10m: ' + formatHashrate(d.hashrate_estimate);
         setVal('stat-net-hashrate', formatHashrate(d.network_hashrate));
+        if (d.network_height) setVal('stat-block-height', 'Block #' + d.network_height.toLocaleString());
         setVal('stat-blocks', d.total_blocks);
         setVal('stat-miners', d.connected_miners);
 
@@ -1065,15 +1075,21 @@ async function fetchStats() {
         const stratumUrl = document.getElementById('stratum-url');
         if (stratumUrl) stratumUrl.textContent = d.stratum_url || ('stratum+tcp://' + window.location.hostname + ':' + d.stratum_port);
 
-        const luckEl = document.getElementById('stat-luck');
-        if (d.luck_percent != null) {
-            const lv = d.luck_percent;
-            luckEl.textContent = lv.toFixed(0) + '%';
-            luckEl.style.color = lv <= 100 ? '#48bb78' : lv <= 150 ? '#ecc94b' : '#fc8181';
-        } else {
-            luckEl.textContent = '--';
-            luckEl.style.color = '#555';
-        }
+        const luckColor = (lv) => lv <= 100 ? '#48bb78' : lv <= 150 ? '#ecc94b' : '#fc8181';
+        const renderLuck = (id, value) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (value != null) {
+                el.textContent = value.toFixed(0) + '%';
+                el.style.color = luckColor(value);
+            } else {
+                el.textContent = '--';
+                el.style.color = '#555';
+            }
+        };
+        renderLuck('stat-luck', d.luck_percent);
+        renderLuck('stat-luck-10', d.luck_last_10);
+        renderLuck('stat-luck-lifetime', d.luck_lifetime);
 
         const pctEl = document.getElementById('stat-pool-pct');
         if (d.pool_percent_24h != null) {

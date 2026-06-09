@@ -31,6 +31,8 @@ struct Config {
     database: DatabaseConfig,
     #[serde(default)]
     admin: Option<AdminConfig>,
+    #[serde(default)]
+    lwd_tip: LwdTipConfig,
 }
 
 /// Dashboard only needs the reward mode from [pplns] (for the Payout Scheme
@@ -171,6 +173,19 @@ struct NodeConfig {
     rpc_user: Option<String>,
     #[serde(default)]
     rpc_password: Option<String>,
+    /// Optional zebrad Prometheus metrics endpoint. If unset, derived
+    /// from `rpc_url` by swapping port 8232 → 9999 and appending `/metrics`.
+    #[serde(default)]
+    metrics_url: Option<String>,
+}
+
+/// Public lightwalletd servers used to cross-check the chain tip. When the
+/// list is empty (or the section is omitted) the authoritative-tip row on
+/// the admin Mining Node card stays blank and no fan-out is performed.
+#[derive(Debug, Default, Deserialize)]
+struct LwdTipConfig {
+    #[serde(default)]
+    servers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,6 +354,23 @@ async fn main() -> Result<()> {
 
     let stratum_ports = config.stratum.port_info();
 
+    // Resolve the zebra metrics URL once, share with the background scraper.
+    let zebra_metrics_url = config
+        .node
+        .metrics_url
+        .clone()
+        .unwrap_or_else(|| pool_api::derive_metrics_url(&config.node.rpc_url));
+
+    // Background-refreshed cache of zebra's /metrics output. See the doc on
+    // ApiState::zebra_metrics_cache for why this exists.
+    let zebra_metrics_cache: Arc<tokio::sync::RwLock<pool_api::ZebraMetrics>> =
+        Arc::new(tokio::sync::RwLock::new(pool_api::ZebraMetrics::default()));
+
+    // Background-refreshed cache of the authoritative chain tip from public
+    // lwd servers. See ApiState::authoritative_tip_cache.
+    let authoritative_tip_cache: Arc<tokio::sync::RwLock<pool_api::AuthoritativeTip>> =
+        Arc::new(tokio::sync::RwLock::new(pool_api::AuthoritativeTip::default()));
+
     // Build ApiState with no live atomics (triggers DB fallback in helpers)
     let api_state: AppState = Arc::new(ApiState {
         db: db.clone(),
@@ -373,7 +405,48 @@ async fn main() -> Result<()> {
             "solo" => "Solo".to_string(),
             _ => "PPLNS".to_string(),
         },
+        zebra_metrics_cache: Arc::clone(&zebra_metrics_cache),
+        authoritative_tip_cache: Arc::clone(&authoritative_tip_cache),
     });
+
+    // Background zebra-metrics scraper. Refreshes the cache every 30 s; the
+    // admin health endpoint reads from the cache, never blocking on the
+    // scrape. The first iteration runs immediately so the cache has real
+    // data within seconds of startup.
+    let scrape_cache = Arc::clone(&zebra_metrics_cache);
+    let scrape_url = zebra_metrics_url.clone();
+    let zebra_scrape_handle = tokio::spawn(async move {
+        loop {
+            let snap = pool_api::fetch_zebra_metrics(&scrape_url).await;
+            {
+                let mut w = scrape_cache.write().await;
+                *w = snap;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+
+    // Background authoritative-tip fan-out. Same pattern — refresh every
+    // 30 s, dashboard reads instantly. Skipped entirely when the operator
+    // didn't configure any servers in [lwd_tip].
+    let lwd_servers = config.lwd_tip.servers.clone();
+    let lwd_cache = Arc::clone(&authoritative_tip_cache);
+    let lwd_tip_handle = if !lwd_servers.is_empty() {
+        info!(server_count = lwd_servers.len(), "Starting authoritative-tip fan-out");
+        Some(tokio::spawn(async move {
+            loop {
+                let snap = pool_api::fetch_authoritative_tip(&lwd_servers).await;
+                {
+                    let mut w = lwd_cache.write().await;
+                    *w = snap;
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }))
+    } else {
+        info!("No [lwd_tip].servers configured — authoritative-tip card row disabled");
+        None
+    };
 
     // Background stats history recorder (10s snapshots, 1hr ring buffer)
     let history_state = Arc::clone(&api_state);
@@ -428,6 +501,7 @@ async fn main() -> Result<()> {
                 wallet_rpc_url: config.payout.wallet_rpc_url.clone(),
                 coinbase_tag: config.pool.coinbase_tag.clone(),
                 payout_interval_secs: config.payout.interval_secs,
+                zebra_metrics_url: zebra_metrics_url.clone(),
             };
             let log_paths = pool_api::LogPaths {
                 pool: admin_cfg.pool_log.clone(),
@@ -1001,6 +1075,14 @@ async fn process_payouts(
                     let msg = format!("{e}");
                     if retries < 2 && msg.contains("Insufficient balance") {
                         if let Some(have_zats) = parse_have_balance(&msg) {
+                            // "have 0" with a positive z_gettotalbalance means the wallet
+                            // sees the notes but can't yet build a Merkle witness (Orchard
+                            // commitment subtree past the note hasn't filled). Resolves on
+                            // its own as more Orchard txs land — skip quietly.
+                            if have_zats == 0 && private_balance > 0.0 {
+                                info!(private_balance, "Notes present but no spendable witness yet, waiting");
+                                return Ok(0);
+                            }
                             let actual_available = have_zats as f64 * 0.95;
                             let current_total: f64 = current_list.iter().map(|(_, z, _)| *z as f64).sum();
                             if actual_available < min_payout_zatoshis as f64 || current_total <= 0.0 {

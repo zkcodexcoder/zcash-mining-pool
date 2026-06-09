@@ -353,6 +353,13 @@ async fn main() -> Result<()> {
         timeout: Duration::from_secs(config.difficulty.longpoll_timeout_secs),
     });
     let jobs = job_manager.jobs();
+    // Grab the lag tracker before the JobManager is moved into its task —
+    // the status loop snapshots it every cycle into pool_status so the
+    // dashboard (separate process) can render template-lag stats.
+    let lag_tracker = job_manager.lag_tracker();
+    let longpoll_wakes = job_manager.longpoll_wake_count();
+    let longpoll_fails = job_manager.longpoll_fail_count();
+    let last_longpoll_fail_ms = job_manager.last_longpoll_fail_at_ms();
 
     // Initialize Block Assembler
     let block_assembler = Arc::new(BlockAssembler::new(Arc::clone(&rpc)));
@@ -452,6 +459,10 @@ async fn main() -> Result<()> {
     let status_rejects_job_not_found = Arc::clone(&rejects_job_not_found);
     let status_rejects_duplicate = Arc::clone(&rejects_duplicate);
     let status_rejects_other = Arc::clone(&rejects_other);
+    let status_lag_tracker = Arc::clone(&lag_tracker);
+    let status_longpoll_wakes = Arc::clone(&longpoll_wakes);
+    let status_longpoll_fails = Arc::clone(&longpoll_fails);
+    let status_last_longpoll_fail_ms = Arc::clone(&last_longpoll_fail_ms);
     let status_handle = tokio::spawn(async move {
         let _ = status_db.set_pool_status(
             "pool_started_at",
@@ -477,6 +488,21 @@ async fn main() -> Result<()> {
             let _ = status_db.set_pool_status("rejects_duplicate", &rdu.to_string()).await;
             let rot = status_rejects_other.load(std::sync::atomic::Ordering::Relaxed);
             let _ = status_db.set_pool_status("rejects_other", &rot.to_string()).await;
+            // Snapshot template-lag tracker as JSON. Read by the dashboard
+            // (separate process) via pool_status; key is the contract.
+            let snap = status_lag_tracker.snapshot();
+            if let Ok(snap_json) = serde_json::to_string(&snap) {
+                let _ = status_db.set_pool_status("template_lag_stats", &snap_json).await;
+            }
+            // Longpoll counters — wake/fail totals and the unix-ms timestamp of
+            // the most recent failure. Dashboard reads these to render the
+            // Longpoll row in the Mining Node card.
+            let lw = status_longpoll_wakes.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("longpoll_wakes_total", &lw.to_string()).await;
+            let lf = status_longpoll_fails.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("longpoll_fails_total", &lf.to_string()).await;
+            let lfm = status_last_longpoll_fail_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = status_db.set_pool_status("last_longpoll_fail_at_ms", &lfm.to_string()).await;
         }
     });
 
@@ -496,8 +522,17 @@ async fn main() -> Result<()> {
         job_manager.run(Duration::from_millis(500)).await;
     });
 
+    // Validator runs in a single task and is the only consumer of share
+    // events. If it ever exits or panics, the pool silently stops processing
+    // shares while still accepting connections — exactly the wedge we hit in
+    // production. Wrap the spawn so any unexpected termination crashes the
+    // process loudly; an operator (or process supervisor) can then restart.
+    // Aborts via .abort() during normal shutdown cancel the future before
+    // these post-await lines run, so this only fires on real failures.
     let share_handle = tokio::spawn(async move {
         share_validator.run(event_rx).await;
+        error!("Share validator exited unexpectedly — pool is useless without it, terminating");
+        std::process::exit(2);
     });
 
     info!(

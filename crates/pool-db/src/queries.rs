@@ -443,6 +443,17 @@ impl PoolDb {
         Ok(row.0)
     }
 
+    /// Average luck_percent across all blocks that have a recorded value (lifetime pool luck).
+    /// Returns None if no blocks have luck recorded.
+    pub async fn get_lifetime_luck(&self) -> Result<Option<f64>, DbError> {
+        let row: (Option<f64>,) = sqlx::query_as(
+            "SELECT AVG(luck_percent) FROM blocks WHERE luck_percent IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
     /// Reverse PPLNS credits for an orphaned block by subtracting reward from pending balances.
     pub async fn reverse_block_credits(&self, block_reward: i64) -> Result<(), DbError> {
         // Distribute the reversal proportionally across all miners with pending balance
