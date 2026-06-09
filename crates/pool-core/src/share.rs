@@ -882,27 +882,47 @@ impl ShareValidator {
                             let reward = compute_block_reward(height);
                             let hash_hex = hex::encode(hash_bytes);
 
-                            // Compute luck at discovery time
-                            let luck_percent = match self.compute_block_luck().await {
-                                Ok(luck) => luck,
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to compute block luck");
-                                    None
-                                }
-                            };
+                            // Audit P11: submitblock success only means the block
+                            // passed validation — it can still lose the height race
+                            // or land on a side chain. Confirm it's the best block
+                            // at its height before crediting; a mismatch skipped
+                            // here avoids 100 blocks of phantom pending credits and
+                            // the imprecise reverse_block_credits claw-back.
+                            // Unknown (verify RPC failed) proceeds: the maturity
+                            // sweep re-checks the hash and orphans on mismatch.
+                            let inclusion = self
+                                .block_assembler
+                                .verify_block_inclusion(height as u64, &hash_hex)
+                                .await;
+                            if inclusion == crate::block::InclusionCheck::Mismatch {
+                                warn!(
+                                    height,
+                                    hash = %hash_hex,
+                                    "Block lost the height race; not recording or crediting"
+                                );
+                            } else {
+                                // Compute luck at discovery time
+                                let luck_percent = match self.compute_block_luck().await {
+                                    Ok(luck) => luck,
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to compute block luck");
+                                        None
+                                    }
+                                };
 
-                            match self.db.record_block(height, &hash_hex, reward, worker.id, luck_percent).await {
-                                Ok(block_id) => {
-                                    info!(height, reward, block_id, "Distributing block rewards");
-                                    if let Err(e) = self.pplns.distribute(reward, block_id, worker.id).await {
-                                        error!(error = %e, "Reward distribution failed");
+                                match self.db.record_block(height, &hash_hex, reward, worker.id, luck_percent).await {
+                                    Ok(block_id) => {
+                                        info!(height, reward, block_id, "Distributing block rewards");
+                                        if let Err(e) = self.pplns.distribute(reward, block_id, worker.id).await {
+                                            error!(error = %e, "Reward distribution failed");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to record block");
                                     }
                                 }
-                                Err(e) => {
-                                    error!(error = %e, "Failed to record block");
-                                }
+                                block_height = Some(height);
                             }
-                            block_height = Some(height);
                         }
                         Err(e) => {
                             error!(error = %e, "Block submission failed");
