@@ -442,7 +442,7 @@ pub async fn get_pool_stats(
     Ok(Json(PoolStats {
         name: state.pool_name.clone(),
         fee_percent: state.pool_fee,
-        payout_scheme: "PPLNS".to_string(),
+        payout_scheme: state.payout_scheme.clone(),
         stratum_url: format!("stratum+tcp://{}:{}", state.hostname, state.stratum_port),
         stratum_port: state.stratum_port,
         stratum_ports: state.stratum_ports.clone(),
@@ -550,9 +550,9 @@ pub async fn get_pool_stats_nomp(
         "minPayout": min_payout_zec,
         "minpay": min_payout_zec,
         "fee": state.pool_fee,
-        "payoutScheme": "PPLNS",
-        "paymentMethod": "PPLNS",
-        "payout_scheme": "PPLNS",
+        "payoutScheme": state.payout_scheme,
+        "paymentMethod": state.payout_scheme,
+        "payout_scheme": state.payout_scheme,
         "height": network_height,
         "last_block_found": last_block_found,
         "nodes": [{
