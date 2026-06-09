@@ -115,6 +115,80 @@ impl PoolDb {
         Ok(())
     }
 
+    /// Payout attempts stuck in 'queued' or 'sent' for longer than
+    /// `stale_minutes` (audit P4). These are the residue of crashes or RPC
+    /// failures between z_sendmany and the status poll — exactly the gap
+    /// that produced unrecorded on-chain payouts on mainnet (2026-06-08).
+    /// Returns (id, status, opid, txid, total_zatoshis, created_at).
+    pub async fn get_stale_payout_attempts(
+        &self,
+        stale_minutes: i64,
+    ) -> Result<Vec<(i64, String, Option<String>, Option<String>, i64, String)>, DbError> {
+        let rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT id, status, opid, txid, total_zatoshis, created_at
+             FROM payout_attempts
+             WHERE status IN ('queued', 'sent')
+               AND created_at < datetime('now', '-' || ?1 || ' minutes')
+             ORDER BY id ASC",
+        )
+        .bind(stale_minutes)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get("id"),
+                    r.get("status"),
+                    r.get("opid"),
+                    r.get("txid"),
+                    r.get("total_zatoshis"),
+                    r.get("created_at"),
+                )
+            })
+            .collect())
+    }
+
+    /// Distinct txids referenced by payout rows created in the last
+    /// `hours` hours, with the summed amount per txid (audit P4). Used to
+    /// verify every recorded payout exists on chain (catches phantom rows
+    /// like the 2026-03-16 id=9 incident, where a failed broadcast was
+    /// recorded as paid).
+    pub async fn get_recent_payout_txids(
+        &self,
+        hours: i64,
+    ) -> Result<Vec<(String, i64)>, DbError> {
+        let rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT txid, SUM(amount) as total
+             FROM payouts
+             WHERE created_at > datetime('now', '-' || ?1 || ' hours')
+             GROUP BY txid",
+        )
+        .bind(hours)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| (r.get("txid"), r.get("total"))).collect())
+    }
+
+    /// Accounting invariant inputs (audit P4): the sum of confirmed block
+    /// rewards should approximately equal the sum of all miner balances
+    /// (pending + paid). Sustained drift beyond rounding indicates a
+    /// crediting bug (e.g. the imprecise orphan reversal, Finding #4).
+    /// Returns (confirmed_reward_zatoshis, balances_total_zatoshis).
+    pub async fn get_accounting_invariant(&self) -> Result<(i64, i64), DbError> {
+        let reward: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(reward), 0) FROM blocks WHERE status = 'confirmed'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let balances: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(pending), 0) + COALESCE(SUM(paid), 0) FROM balances",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((reward.0, balances.0))
+    }
+
     /// Enable WAL mode for concurrent reads (dashboard) + single writer (pool).
     pub async fn set_wal_mode(&self) -> Result<(), DbError> {
         sqlx::query("PRAGMA journal_mode=WAL")

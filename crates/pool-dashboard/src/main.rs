@@ -13,6 +13,8 @@ use node_rpc::ZcashRpcClient;
 use pool_api::{ApiState, AppState};
 use pool_db::PoolDb;
 
+mod reconciler;
+
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
 
 // -- Config structs (subset of pool-server, reads the same pool.toml) --
@@ -226,6 +228,11 @@ struct PayoutConfig {
     /// until shielding replenishes the reserve. Set to 0 to disable (default).
     #[serde(default)]
     reserve_min: f64,
+    /// Interval for the independent payout-reconciliation sweep (audit P4):
+    /// resolves stale payout_attempts, verifies recorded payouts exist on
+    /// chain, and checks the rewards-vs-balances invariant. 0 disables.
+    #[serde(default = "default_reconcile_interval")]
+    reconcile_interval_secs: u64,
 }
 
 fn default_minimum_payout() -> f64 {
@@ -236,6 +243,9 @@ fn default_payout_interval() -> u64 {
 }
 fn default_maturity() -> u64 {
     100
+}
+fn default_reconcile_interval() -> u64 {
+    600
 }
 
 impl Default for PayoutConfig {
@@ -251,6 +261,7 @@ impl Default for PayoutConfig {
             interval_secs: default_payout_interval(),
             maturity_confirmations: default_maturity(),
             reserve_min: 0.0,
+            reconcile_interval_secs: default_reconcile_interval(),
         }
     }
 }
@@ -582,7 +593,24 @@ async fn main() -> Result<()> {
             maturity_confirmations = maturity,
             "Payout loop enabled"
         );
-        Some(tokio::spawn(async move {
+        // Independent reconciliation sweep (audit P4). Shares the same RPC
+        // endpoints but runs on its own cadence so a wedged payout loop
+        // can't silence it.
+        let reconcile_secs = config.payout.reconcile_interval_secs;
+        let reconciler_handle = if reconcile_secs > 0 {
+            let r = reconciler::Reconciler {
+                db: db.clone(),
+                node_rpc: Arc::clone(&rpc),
+                wallet_rpc: Arc::clone(&payout_wallet_rpc),
+                interval: Duration::from_secs(reconcile_secs),
+            };
+            Some(tokio::spawn(async move { r.run().await }))
+        } else {
+            info!("Reconciler disabled (reconcile_interval_secs = 0)");
+            None
+        };
+
+        let payout_task = tokio::spawn(async move {
             run_payout_loop(
                 payout_db, node_rpc, payout_wallet_rpc,
                 &pool_address, &mining_address,
@@ -590,7 +618,8 @@ async fn main() -> Result<()> {
                 maturity, interval,
                 &payout_network,
             ).await;
-        }))
+        });
+        Some((payout_task, reconciler_handle))
     } else {
         info!("Payouts disabled");
         None
@@ -623,8 +652,11 @@ async fn main() -> Result<()> {
     }
     history_handle.abort();
     net_cache_handle.abort();
-    if let Some(h) = payout_handle {
-        h.abort();
+    if let Some((payout_task, reconciler_handle)) = payout_handle {
+        payout_task.abort();
+        if let Some(r) = reconciler_handle {
+            r.abort();
+        }
     }
 
     info!("Dashboard shut down gracefully");
@@ -673,16 +705,40 @@ async fn run_payout_loop(
 
     let mut consecutive_payout_failures: u32 = 0;
     let mut last_payout_error = String::new();
+    // Per-phase failure counters (audit P8): maturity-check and shielding
+    // failures previously only hit the log, so payout_health undercounted
+    // pipeline problems — a wedged shielding phase looked healthy as long
+    // as process_payouts had nothing to do.
+    let mut consecutive_maturity_failures: u32 = 0;
+    let mut consecutive_shielding_failures: u32 = 0;
+    let mut last_maturity_error = String::new();
+    let mut last_shielding_error = String::new();
 
     loop {
         // Phase 1: Check block maturity
-        if let Err(e) = check_block_maturity(&db, &node_rpc, maturity_confirmations).await {
-            error!(error = %e, "Block maturity check failed");
+        match check_block_maturity(&db, &node_rpc, maturity_confirmations).await {
+            Ok(()) => {
+                consecutive_maturity_failures = 0;
+                last_maturity_error.clear();
+            }
+            Err(e) => {
+                error!(error = %e, "Block maturity check failed");
+                consecutive_maturity_failures += 1;
+                last_maturity_error = format!("{e}");
+            }
         }
 
         // Phase 2: Shield mature coinbase UTXOs (transparent -> shielded)
-        if let Err(e) = shield_coinbase(&wallet_rpc, mining_address, pool_address).await {
-            error!(error = %e, "Coinbase shielding failed (will retry next cycle)");
+        match shield_coinbase(&wallet_rpc, mining_address, pool_address).await {
+            Ok(()) => {
+                consecutive_shielding_failures = 0;
+                last_shielding_error.clear();
+            }
+            Err(e) => {
+                error!(error = %e, "Coinbase shielding failed (will retry next cycle)");
+                consecutive_shielding_failures += 1;
+                last_shielding_error = format!("{e}");
+            }
         }
 
         // Phase 3: Pay miners from shielded pool (respects reserve_min)
@@ -706,11 +762,22 @@ async fn run_payout_loop(
 
         let _ = write_payout_health(
             &db, &wallet_rpc, mining_address, reserve_min_zatoshis,
-            consecutive_payout_failures, &last_payout_error,
+            PhaseFailures {
+                payout: (consecutive_payout_failures, &last_payout_error),
+                maturity: (consecutive_maturity_failures, &last_maturity_error),
+                shielding: (consecutive_shielding_failures, &last_shielding_error),
+            },
         ).await;
 
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Per-phase failure state for payout_health (audit P8).
+struct PhaseFailures<'a> {
+    payout: (u32, &'a str),
+    maturity: (u32, &'a str),
+    shielding: (u32, &'a str),
 }
 
 /// Collect and persist payout pipeline health metrics.
@@ -719,8 +786,7 @@ async fn write_payout_health(
     wallet_rpc: &ZcashRpcClient,
     mining_address: &str,
     reserve_min_zatoshis: i64,
-    consecutive_failures: u32,
-    last_error: &str,
+    failures: PhaseFailures<'_>,
 ) -> anyhow::Result<()> {
     // Check transparent balance (unshielded funds)
     let (transparent_zec, private_zec) = match wallet_rpc.call_raw::<serde_json::Value>(
@@ -749,8 +815,14 @@ async fn write_payout_health(
     let spendable_zec = (private_zec - reserve_min_zec).max(0.0);
 
     let health = serde_json::json!({
-        "consecutive_payout_failures": consecutive_failures,
-        "last_payout_error": last_error,
+        // Kept under the original key for dashboard/API compatibility.
+        "consecutive_payout_failures": failures.payout.0,
+        "last_payout_error": failures.payout.1,
+        // Per-phase counters (audit P8).
+        "consecutive_maturity_failures": failures.maturity.0,
+        "last_maturity_error": failures.maturity.1,
+        "consecutive_shielding_failures": failures.shielding.0,
+        "last_shielding_error": failures.shielding.1,
         "transparent_balance_zec": transparent_zec,
         "private_balance_zec": private_zec,
         "reserve_min_zec": reserve_min_zec,
