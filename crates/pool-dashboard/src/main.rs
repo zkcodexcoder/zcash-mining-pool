@@ -603,6 +603,7 @@ async fn main() -> Result<()> {
                 node_rpc: Arc::clone(&rpc),
                 wallet_rpc: Arc::clone(&payout_wallet_rpc),
                 interval: Duration::from_secs(reconcile_secs),
+                pool_fee: (config.pool.fee_percent / 100.0).clamp(0.0, 1.0),
             };
             Some(tokio::spawn(async move { r.run().await }))
         } else {
