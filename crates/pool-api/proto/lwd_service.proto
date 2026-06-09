@@ -1,0 +1,21 @@
+// Minimal subset of lightwalletd's service.proto — only the call we use
+// (GetLatestBlock) and the message types it touches. Source of truth:
+// https://github.com/zcash/lightwalletd/blob/master/walletrpc/service.proto
+
+syntax = "proto3";
+
+package cash.z.wallet.sdk.rpc;
+
+// Empty request type, opaque to us.
+message ChainSpec {}
+
+// Returned by GetLatestBlock.
+message BlockID {
+    uint64 height = 1;
+    bytes  hash   = 2;
+}
+
+service CompactTxStreamer {
+    // Reports the current chain tip the lwd's backing node has verified.
+    rpc GetLatestBlock(ChainSpec) returns (BlockID) {}
+}
