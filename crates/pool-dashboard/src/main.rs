@@ -1154,6 +1154,16 @@ async fn process_payouts(
                             // its own as more Orchard txs land — skip quietly.
                             if have_zats == 0 && private_balance > 0.0 {
                                 info!(private_balance, "Notes present but no spendable witness yet, waiting");
+                                // Close out the attempt row — this was the one early
+                                // return that leaked attempts in 'queued', which the
+                                // reconciler then flagged as unresolvable every sweep
+                                // (first seen testnet 2026-06-10 06:45, attempt 1416).
+                                if let Some(id) = attempt_id {
+                                    let _ = db.update_payout_attempt(
+                                        id, "failed", None, None,
+                                        Some("deferred: notes present but no spendable witness yet"),
+                                    ).await;
+                                }
                                 return Ok(0);
                             }
                             let actual_available = have_zats as f64 * 0.95;
