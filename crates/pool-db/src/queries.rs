@@ -43,6 +43,8 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_007).execute(&self.pool).await;
         let migration_008 = include_str!("../migrations/008_block_credits.sql");
         let _ = sqlx::raw_sql(migration_008).execute(&self.pool).await;
+        let migration_009 = include_str!("../migrations/009_clawback_ack_maturity.sql");
+        let _ = sqlx::raw_sql(migration_009).execute(&self.pool).await;
         Ok(())
     }
 
@@ -530,7 +532,8 @@ impl PoolDb {
     ) -> Result<Vec<(i64, i64, i64)>, DbError> {
         let rows: Vec<SqliteRow> = sqlx::query(
             "SELECT block_id, miner_id, amount FROM orphan_clawbacks
-             WHERE created_at > datetime('now', '-' || ?1 || ' hours')",
+             WHERE created_at > datetime('now', '-' || ?1 || ' hours')
+               AND acknowledged = 0",
         )
         .bind(hours)
         .fetch_all(&self.pool)
@@ -539,6 +542,17 @@ impl PoolDb {
             .iter()
             .map(|r| (r.get("block_id"), r.get("miner_id"), r.get("amount")))
             .collect())
+    }
+
+    /// Record the operator's decision for all unacknowledged clawbacks.
+    pub async fn acknowledge_clawbacks(&self, note: &str) -> Result<u64, DbError> {
+        let r = sqlx::query(
+            "UPDATE orphan_clawbacks SET acknowledged = 1, ack_note = ?1 WHERE acknowledged = 0",
+        )
+        .bind(note)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
     }
 
     pub async fn get_recent_blocks(&self, limit: i64) -> Result<Vec<Block>, DbError> {
@@ -748,14 +762,29 @@ impl PoolDb {
         Ok(row.0)
     }
 
-    /// Find miners with pending balance >= min_amount (in zatoshis).
+    /// Find miners with PAYABLE balance >= min_amount (in zatoshis).
+    ///
+    /// Payable = pending MINUS credits attached to blocks that haven't
+    /// matured yet (operator policy 2026-06-10: never pay out a block's
+    /// credits before the block confirms). When the block confirms, its
+    /// credits become payable automatically; when it orphans, the precise
+    /// reversal removes them from pending in full — which makes orphan
+    /// clawbacks structurally impossible short of a >maturity-depth reorg.
+    /// Credits from pre-008 blocks have no ledger rows and count as
+    /// payable (those blocks are long confirmed).
     pub async fn get_pending_payouts(&self, min_amount: i64) -> Result<Vec<PendingPayout>, DbError> {
         let rows: Vec<SqliteRow> = sqlx::query(
-            "SELECT b.miner_id, m.address, b.pending, m.created_at \
-             FROM balances b \
-             JOIN miners m ON m.id = b.miner_id \
-             WHERE b.pending >= ?1 \
-             ORDER BY b.pending DESC",
+            "SELECT * FROM ( \
+                 SELECT b.miner_id, m.address, m.created_at, \
+                        b.pending - COALESCE(( \
+                            SELECT SUM(bc.amount) FROM block_credits bc \
+                            JOIN blocks bl ON bc.block_id = bl.id \
+                            WHERE bc.miner_id = b.miner_id AND bl.status = 'pending' \
+                        ), 0) AS payable \
+                 FROM balances b \
+                 JOIN miners m ON m.id = b.miner_id \
+             ) WHERE payable >= ?1 \
+             ORDER BY payable DESC",
         )
         .bind(min_amount)
         .fetch_all(&self.pool)
@@ -766,7 +795,7 @@ impl PoolDb {
             .map(|row| PendingPayout {
                 miner_id: row.get("miner_id"),
                 address: row.get("address"),
-                amount: row.get("pending"),
+                amount: row.get("payable"),
                 created_at: row.get("created_at"),
             })
             .collect();
