@@ -16,3 +16,4 @@ config/zebrad.toml
 *.log
 *.bak
 backups/
+pool.db.*
