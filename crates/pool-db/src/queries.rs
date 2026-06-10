@@ -41,6 +41,8 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_006).execute(&self.pool).await;
         let migration_007 = include_str!("../migrations/007_payout_attempts.sql");
         let _ = sqlx::raw_sql(migration_007).execute(&self.pool).await;
+        let migration_008 = include_str!("../migrations/008_block_credits.sql");
+        let _ = sqlx::raw_sql(migration_008).execute(&self.pool).await;
         Ok(())
     }
 
@@ -179,11 +181,18 @@ impl PoolDb {
     /// are written at find time, ~maturity_confirmations before the block
     /// confirms, so a confirmed-only sum would show every fresh block as
     /// drift for ~2 hours. Orphaned blocks are excluded — their credits
-    /// are reversed.
-    /// Returns (credited_reward_zatoshis, balances_total_zatoshis).
-    pub async fn get_accounting_invariant(&self) -> Result<(i64, i64), DbError> {
+    /// are reversed (and any unrecoverable remainder is tracked in
+    /// orphan_clawbacks, returned separately so the invariant can treat it
+    /// as explained drift rather than an anomaly).
+    ///
+    /// Reward basis is COALESCE(actual_reward, reward): post-Phase-C blocks
+    /// distribute the actual coinbase value (subsidy + tx fees); historical
+    /// rows fall back to the subsidy-only column.
+    /// Returns (credited_reward_zatoshis, balances_total_zatoshis, clawback_zatoshis).
+    pub async fn get_accounting_invariant(&self) -> Result<(i64, i64, i64), DbError> {
         let reward: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(reward), 0) FROM blocks WHERE status IN ('pending', 'confirmed')",
+            "SELECT COALESCE(SUM(COALESCE(actual_reward, reward)), 0) FROM blocks \
+             WHERE status IN ('pending', 'confirmed')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -192,7 +201,11 @@ impl PoolDb {
         )
         .fetch_one(&self.pool)
         .await?;
-        Ok((reward.0, balances.0))
+        let clawbacks: (i64,) =
+            sqlx::query_as("SELECT COALESCE(SUM(amount), 0) FROM orphan_clawbacks")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok((reward.0, balances.0, clawbacks.0))
     }
 
     /// Enable WAL mode for concurrent reads (dashboard) + single writer (pool).
@@ -392,21 +405,140 @@ impl PoolDb {
         height: i64,
         hash: &str,
         reward: i64,
+        actual_reward: Option<i64>,
         found_by: i64,
         luck_percent: Option<f64>,
     ) -> Result<i64, DbError> {
         let result = sqlx::query(
-            "INSERT INTO blocks (height, hash, reward, found_by, luck_percent) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO blocks (height, hash, reward, actual_reward, found_by, luck_percent) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(height)
         .bind(hash)
         .bind(reward)
+        .bind(actual_reward)
         .bind(found_by)
         .bind(luck_percent)
         .execute(&self.pool)
         .await?;
 
         Ok(result.last_insert_rowid())
+    }
+
+    /// Atomically record a block's per-miner credits AND apply them to
+    /// pending balances (audit P5 + NEW-E). Either every credit lands or
+    /// none do — no more partial distributions when a write fails mid-loop,
+    /// and orphan reversal can later debit exactly these rows.
+    pub async fn distribute_block_credits(
+        &self,
+        block_id: i64,
+        credits: &[(i64, i64)], // (miner_id, amount_zatoshis)
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        for (miner_id, amount) in credits {
+            sqlx::query("INSERT OR IGNORE INTO balances (miner_id) VALUES (?1)")
+                .bind(miner_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("INSERT INTO block_credits (block_id, miner_id, amount) VALUES (?1, ?2, ?3)")
+                .bind(block_id)
+                .bind(miner_id)
+                .bind(amount)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE balances SET pending = pending + ?1 WHERE miner_id = ?2")
+                .bind(amount)
+                .bind(miner_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Precise orphan reversal (audit P5): debit exactly the miners that
+    /// were credited for `block_id`, by exactly their credited amounts.
+    /// Credits that can't be recovered from pending (already paid out) are
+    /// recorded in `orphan_clawbacks` instead of being clawed from other
+    /// miners. Returns (reversed_zatoshis, clawback_zatoshis).
+    ///
+    /// Blocks recorded before migration 008 have no block_credits rows;
+    /// the caller should fall back to the legacy proportional reversal.
+    pub async fn reverse_block_credits_precise(
+        &self,
+        block_id: i64,
+    ) -> Result<Option<(i64, i64)>, DbError> {
+        let credits: Vec<(i64, i64)> = sqlx::query(
+            "SELECT miner_id, amount FROM block_credits WHERE block_id = ?1",
+        )
+        .bind(block_id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|r| (r.get("miner_id"), r.get("amount")))
+        .collect();
+
+        if credits.is_empty() {
+            return Ok(None);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut reversed: i64 = 0;
+        let mut clawback: i64 = 0;
+        for (miner_id, amount) in credits {
+            let pending: (i64,) =
+                sqlx::query_as("SELECT COALESCE(pending, 0) FROM balances WHERE miner_id = ?1")
+                    .bind(miner_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .unwrap_or((0,));
+            let recoverable = amount.min(pending.0).max(0);
+            let shortfall = amount - recoverable;
+            if recoverable > 0 {
+                sqlx::query("UPDATE balances SET pending = pending - ?1 WHERE miner_id = ?2")
+                    .bind(recoverable)
+                    .bind(miner_id)
+                    .execute(&mut *tx)
+                    .await?;
+                reversed += recoverable;
+            }
+            if shortfall > 0 {
+                sqlx::query(
+                    "INSERT INTO orphan_clawbacks (block_id, miner_id, amount) VALUES (?1, ?2, ?3)",
+                )
+                .bind(block_id)
+                .bind(miner_id)
+                .bind(shortfall)
+                .execute(&mut *tx)
+                .await?;
+                clawback += shortfall;
+            }
+        }
+        // Remove the credit rows so a double-reversal is impossible.
+        sqlx::query("DELETE FROM block_credits WHERE block_id = ?1")
+            .bind(block_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some((reversed, clawback)))
+    }
+
+    /// Clawbacks recorded in the last `hours` hours (for reconciler alerts).
+    pub async fn get_recent_clawbacks(
+        &self,
+        hours: i64,
+    ) -> Result<Vec<(i64, i64, i64)>, DbError> {
+        let rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT block_id, miner_id, amount FROM orphan_clawbacks
+             WHERE created_at > datetime('now', '-' || ?1 || ' hours')",
+        )
+        .bind(hours)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("block_id"), r.get("miner_id"), r.get("amount")))
+            .collect())
     }
 
     pub async fn get_recent_blocks(&self, limit: i64) -> Result<Vec<Block>, DbError> {

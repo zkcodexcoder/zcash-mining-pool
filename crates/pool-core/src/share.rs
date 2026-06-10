@@ -880,6 +880,22 @@ impl ShareValidator {
                         Ok(_) => {
                             let height = job.template.height as i64;
                             let reward = compute_block_reward(height);
+                            // Audit P2: actual coinbase value = subsidy + the tx
+                            // fees this job's template collected. BIP22 reports
+                            // the coinbase "fee" as MINUS the collected fees.
+                            // Falls back to tx-fee summation, then to subsidy
+                            // only (recorded as NULL so consumers know).
+                            let collected_fees = job
+                                .template
+                                .coinbasetxn
+                                .as_ref()
+                                .and_then(|cb| cb.fee)
+                                .map(|f| -f)
+                                .unwrap_or_else(|| {
+                                    job.template.transactions.iter().map(|t| t.fee).sum()
+                                })
+                                .max(0);
+                            let actual_reward = Some(reward + collected_fees);
                             let hash_hex = hex::encode(hash_bytes);
 
                             // Audit P11: submitblock success only means the block
@@ -910,10 +926,11 @@ impl ShareValidator {
                                     }
                                 };
 
-                                match self.db.record_block(height, &hash_hex, reward, worker.id, luck_percent).await {
+                                match self.db.record_block(height, &hash_hex, reward, actual_reward, worker.id, luck_percent).await {
                                     Ok(block_id) => {
-                                        info!(height, reward, block_id, "Distributing block rewards");
-                                        if let Err(e) = self.pplns.distribute(reward, block_id, worker.id).await {
+                                        let distribution_basis = actual_reward.unwrap_or(reward);
+                                        info!(height, reward, distribution_basis, block_id, "Distributing block rewards");
+                                        if let Err(e) = self.pplns.distribute(distribution_basis, block_id, worker.id).await {
                                             error!(error = %e, "Reward distribution failed");
                                         }
                                     }

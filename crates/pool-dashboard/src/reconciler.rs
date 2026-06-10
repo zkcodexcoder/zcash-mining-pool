@@ -85,6 +85,7 @@ impl Reconciler {
 
         self.resolve_stale_attempts(&mut summary).await;
         self.check_phantom_payouts(&mut summary).await;
+        self.check_clawbacks(&mut summary).await;
         self.check_invariant(&mut summary).await;
 
         let health = serde_json::json!({
@@ -236,6 +237,24 @@ impl Reconciler {
         }
     }
 
+    /// Check: surface fresh orphan clawbacks (credits for orphaned blocks
+    /// that were already paid out — operator decides recovery).
+    async fn check_clawbacks(&self, summary: &mut SweepSummary) {
+        match self.db.get_recent_clawbacks(24).await {
+            Ok(rows) => {
+                for (block_id, miner_id, amount) in rows {
+                    summary.alerts.push(format!(
+                        "orphan clawback: miner {miner_id} kept {:.4} coins credited for \
+                         orphaned block id {block_id} (already paid out before reversal) — \
+                         operator decision: net against future earnings or absorb",
+                        amount as f64 / ZATOSHIS_PER_ZEC,
+                    ));
+                }
+            }
+            Err(e) => summary.alerts.push(format!("clawback query failed: {e}")),
+        }
+    }
+
     /// Check 2: every recently recorded payout txid must exist on chain.
     async fn check_phantom_payouts(&self, summary: &mut SweepSummary) {
         let recent = match self.db.get_recent_payout_txids(PHANTOM_CHECK_HOURS).await {
@@ -264,16 +283,20 @@ impl Reconciler {
     /// baseline is meaningless — re-baseline silently instead of alerting
     /// on the definition jump.
     fn invariant_version(&self) -> String {
-        format!("v2-pendingblocks-fee{:.4}", self.pool_fee)
+        format!("v3-actualreward-clawbacks-fee{:.4}", self.pool_fee)
     }
 
     /// Check 3: confirmed-rewards vs balances invariant. Alerts on drift
     /// *movement* since the previous sweep, not on the absolute value.
     async fn check_invariant(&self, summary: &mut SweepSummary) {
         match self.db.get_accounting_invariant().await {
-            Ok((reward, balances)) => {
+            Ok((reward, balances, clawbacks)) => {
                 let distributable = ((reward as f64) * (1.0 - self.pool_fee)) as i64;
-                let drift = balances - distributable;
+                // Clawbacks are credits for orphaned blocks that had already
+                // been paid out — explained, explicitly-ledgered drift.
+                // Subtract them so the invariant only alarms on the
+                // UNEXPLAINED kind.
+                let drift = balances - clawbacks - distributable;
                 summary.invariant_drift_zatoshis = drift;
 
                 // Baseline = the drift recorded by the previous sweep, valid
