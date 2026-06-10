@@ -237,3 +237,45 @@ async fn test_invariant_uses_actual_reward_and_clawbacks() {
     assert_eq!(reward, 125_300_000, "must use actual_reward when present");
     assert_eq!(clawbacks, 700);
 }
+
+#[tokio::test]
+async fn test_immature_block_credits_not_payable() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1mat").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+    // Immature block credited 1.2375 — must NOT be payable.
+    let block_id = db
+        .record_block(300, "feedaa", 125_000_000, Some(125_000_000), w.id, None)
+        .await
+        .unwrap();
+    db.distribute_block_credits(block_id, &[(m.id, 123_750_000)])
+        .await
+        .unwrap();
+
+    let payable = db.get_pending_payouts(1_000_000).await.unwrap();
+    assert!(
+        payable.iter().all(|p| p.miner_id != m.id),
+        "immature credits must not be payable: {payable:?}"
+    );
+
+    // Block confirms → becomes payable in full.
+    db.update_block_status(block_id, "confirmed").await.unwrap();
+    let payable = db.get_pending_payouts(1_000_000).await.unwrap();
+    let row = payable.iter().find(|p| p.miner_id == m.id).expect("now payable");
+    assert_eq!(row.amount, 123_750_000);
+}
+
+#[tokio::test]
+async fn test_clawback_acknowledgement_silences_alerts() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1ack").await.unwrap();
+    sqlx::query("INSERT INTO orphan_clawbacks (block_id, miner_id, amount) VALUES (1, ?1, 5000)")
+        .bind(m.id)
+        .execute(db.inner())
+        .await
+        .unwrap();
+    assert_eq!(db.get_recent_clawbacks(24).await.unwrap().len(), 1);
+    let n = db.acknowledge_clawbacks("absorbed from reserve per operator").await.unwrap();
+    assert_eq!(n, 1);
+    assert!(db.get_recent_clawbacks(24).await.unwrap().is_empty());
+}
