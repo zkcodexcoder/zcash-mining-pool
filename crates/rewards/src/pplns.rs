@@ -72,7 +72,12 @@ impl PplnsCalculator {
                 "Distributing solo reward (100% to block finder)"
             );
             if distributable > 0 {
-                self.db.credit_balance(miner_id, distributable).await?;
+                // Atomic: block_credits row + balance update in one
+                // transaction (audit P5 + NEW-E), so orphan reversal can
+                // later debit exactly this credit.
+                self.db
+                    .distribute_block_credits(block_id, &[(miner_id, distributable)])
+                    .await?;
             }
             return Ok(vec![PplnsReward {
                 miner_id,
@@ -121,17 +126,6 @@ impl PplnsCalculator {
                 (distributable as f64 * fraction).floor() as i64
             };
 
-            if amount > 0 {
-                self.db.credit_balance(entry.miner_id, amount).await?;
-
-                info!(
-                    miner_id = entry.miner_id,
-                    amount,
-                    fraction = format!("{:.4}", fraction),
-                    "Credited PPLNS reward"
-                );
-            }
-
             distributed_total += amount;
 
             rewards.push(PplnsReward {
@@ -139,6 +133,27 @@ impl PplnsCalculator {
                 share_fraction: fraction,
                 amount_zatoshis: amount,
             });
+        }
+
+        // Commit every credit in one transaction (audit P5 + NEW-E): the
+        // per-miner block_credits ledger and the balance updates land
+        // together or not at all — no partial distributions, and orphan
+        // reversal can later debit exactly these rows.
+        let credits: Vec<(i64, i64)> = rewards
+            .iter()
+            .filter(|r| r.amount_zatoshis > 0)
+            .map(|r| (r.miner_id, r.amount_zatoshis))
+            .collect();
+        if !credits.is_empty() {
+            self.db.distribute_block_credits(block_id, &credits).await?;
+        }
+        for r in rewards.iter().filter(|r| r.amount_zatoshis > 0) {
+            info!(
+                miner_id = r.miner_id,
+                amount = r.amount_zatoshis,
+                fraction = format!("{:.4}", r.share_fraction),
+                "Credited PPLNS reward"
+            );
         }
 
         Ok(rewards)

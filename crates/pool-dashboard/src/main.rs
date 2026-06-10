@@ -874,11 +874,29 @@ async fn check_block_maturity(
             );
         } else {
             db.update_block_status(block.id, "orphaned").await?;
-            db.reverse_block_credits(block.reward).await?;
-            info!(
-                height = block.height,
-                "Block orphaned (hash mismatch, credits reversed)"
-            );
+            // Audit P5: precise reversal — debit exactly the miners credited
+            // for this block. Credits already paid out land in the
+            // orphan_clawbacks ledger (reconciler alerts on them) instead of
+            // being clawed from other miners' pending. Pre-migration-008
+            // blocks have no credit rows; fall back to the legacy
+            // proportional reversal for those.
+            match db.reverse_block_credits_precise(block.id).await? {
+                Some((reversed, clawback)) => {
+                    info!(
+                        height = block.height,
+                        reversed_zatoshis = reversed,
+                        clawback_zatoshis = clawback,
+                        "Block orphaned (precise credit reversal)"
+                    );
+                }
+                None => {
+                    db.reverse_block_credits(block.reward).await?;
+                    info!(
+                        height = block.height,
+                        "Block orphaned (legacy proportional reversal — pre-008 block)"
+                    );
+                }
+            }
         }
     }
 
