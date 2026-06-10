@@ -273,6 +273,7 @@ impl JobManager {
     /// when the template changes, or falls back to a regular poll on
     /// error so the loop never stalls.
     async fn poll_template_with_longpoll(&self, longpollid: &str) -> Result<bool, node_rpc::RpcError> {
+        let started = Instant::now();
         match self.rpc.get_block_template_longpoll(longpollid, self.longpoll.timeout).await {
             Ok(template) => {
                 // Stamp T0 = the moment zebrad released us with a new tip.
@@ -283,17 +284,31 @@ impl JobManager {
                 self.process_template(template, Some(t0)).await
             }
             Err(e) => {
-                // Longpoll failed (timeout, HTTP error, etc.) — bump the
-                // failure counters so the dashboard can render flakiness,
-                // then fall back to a normal poll so we always have a
-                // fresh template and longpollid for the next iteration.
-                self.longpoll_fail_count.fetch_add(1, Ordering::Relaxed);
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                self.last_longpoll_fail_at_ms.store(now_ms, Ordering::Relaxed);
-                warn!(error = %e, "Longpoll failed, falling back to regular poll");
+                // Distinguish the EXPECTED case — the longpoll simply held
+                // for our full client timeout because nothing changed (BIP22
+                // expects the client to re-poll after its own cap) — from a
+                // genuine fast failure (connection refused/reset, node
+                // error). The expected expiry was previously logged as a
+                // scary WARN and counted as a failure, producing tens of
+                // thousands of phantom "failures" (audit Phase E).
+                let elapsed = started.elapsed();
+                let expired_quietly =
+                    elapsed >= self.longpoll.timeout.saturating_sub(Duration::from_secs(2));
+                if expired_quietly {
+                    debug!(
+                        held_secs = elapsed.as_secs(),
+                        "Longpoll expired with no template change; re-polling"
+                    );
+                } else {
+                    self.longpoll_fail_count.fetch_add(1, Ordering::Relaxed);
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    self.last_longpoll_fail_at_ms.store(now_ms, Ordering::Relaxed);
+                    warn!(error = %e, held_ms = elapsed.as_millis() as u64,
+                          "Longpoll failed, falling back to regular poll");
+                }
                 self.poll_template().await
             }
         }

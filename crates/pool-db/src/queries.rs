@@ -978,10 +978,14 @@ impl PoolDb {
         window_size: i64,
     ) -> Result<Vec<PplnsShareEntry>, DbError> {
         let rows: Vec<SqliteRow> = sqlx::query(
+            // ORDER BY makes the iteration order deterministic (audit
+            // Finding #10): the rounding remainder always lands on the
+            // smallest contributor instead of whoever SQLite emits last.
             "SELECT w.miner_id, SUM(s.difficulty) as total_difficulty \
              FROM (SELECT * FROM shares ORDER BY id DESC LIMIT ?1) s \
              JOIN workers w ON s.worker_id = w.id \
-             GROUP BY w.miner_id",
+             GROUP BY w.miner_id \
+             ORDER BY total_difficulty DESC, w.miner_id ASC",
         )
         .bind(window_size)
         .fetch_all(&self.pool)

@@ -228,6 +228,12 @@ struct PayoutConfig {
     /// until shielding replenishes the reserve. Set to 0 to disable (default).
     #[serde(default)]
     reserve_min: f64,
+    /// Fraction of the shielded balance considered spendable when sizing a
+    /// payout round (audit Finding #8 — was a hardcoded 0.90). The margin
+    /// absorbs ZIP-317 fees and notes whose Merkle witnesses aren't built
+    /// yet ("have 0" cases) without aborting the round.
+    #[serde(default = "default_balance_margin")]
+    available_balance_margin: f64,
     /// Interval for the independent payout-reconciliation sweep (audit P4):
     /// resolves stale payout_attempts, verifies recorded payouts exist on
     /// chain, and checks the rewards-vs-balances invariant. 0 disables.
@@ -247,6 +253,9 @@ fn default_maturity() -> u64 {
 fn default_reconcile_interval() -> u64 {
     600
 }
+fn default_balance_margin() -> f64 {
+    0.90
+}
 
 impl Default for PayoutConfig {
     fn default() -> Self {
@@ -261,6 +270,7 @@ impl Default for PayoutConfig {
             interval_secs: default_payout_interval(),
             maturity_confirmations: default_maturity(),
             reserve_min: 0.0,
+            available_balance_margin: default_balance_margin(),
             reconcile_interval_secs: default_reconcile_interval(),
         }
     }
@@ -611,11 +621,12 @@ async fn main() -> Result<()> {
             None
         };
 
+        let balance_margin = config.payout.available_balance_margin.clamp(0.5, 1.0);
         let payout_task = tokio::spawn(async move {
             run_payout_loop(
                 payout_db, node_rpc, payout_wallet_rpc,
                 &pool_address, &mining_address,
-                min_payout_zatoshis, reserve_min_zatoshis,
+                min_payout_zatoshis, reserve_min_zatoshis, balance_margin,
                 maturity, interval,
                 &payout_network,
             ).await;
@@ -696,6 +707,7 @@ async fn run_payout_loop(
     mining_address: &str,
     min_payout_zatoshis: i64,
     reserve_min_zatoshis: i64,
+    balance_margin: f64,
     maturity_confirmations: u64,
     interval: Duration,
     network: &str,
@@ -745,7 +757,7 @@ async fn run_payout_loop(
         // Phase 3: Pay miners from shielded pool (respects reserve_min)
         match process_payouts(
             &db, &wallet_rpc, &node_rpc, pool_address, mining_address,
-            min_payout_zatoshis, reserve_min_zatoshis, network,
+            min_payout_zatoshis, reserve_min_zatoshis, balance_margin, network,
         ).await {
             Ok(count) => {
                 if count > 0 {
@@ -1062,6 +1074,7 @@ async fn process_payouts(
     mining_address: &str,
     min_payout_zatoshis: i64,
     reserve_min_zatoshis: i64,
+    balance_margin: f64,
     network: &str,
 ) -> anyhow::Result<usize> {
     let pending = db.get_pending_payouts(min_payout_zatoshis).await?;
@@ -1091,7 +1104,7 @@ async fn process_payouts(
     // without waiting for fresh shielding.
     let reserve_min_zec = reserve_min_zatoshis as f64 / ZATOSHIS_PER_ZEC;
     let spendable_zec = (private_balance - reserve_min_zec).max(0.0);
-    let available_zec = (spendable_zec * 0.90).max(0.0);
+    let available_zec = (spendable_zec * balance_margin).max(0.0);
 
     if available_zec < min_payout_zatoshis as f64 / ZATOSHIS_PER_ZEC {
         info!(
@@ -1104,15 +1117,25 @@ async fn process_payouts(
     let scale = if available_zec >= total_payout_zec { 1.0 } else { available_zec / total_payout_zec };
 
     let mut payout_list: Vec<(usize, i64, String)> = Vec::new();
-    let two_days_ago = Utc::now()
-        .checked_sub_signed(chrono::Duration::days(2))
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_default();
+    // Audit NEW-G: parse the DB timestamp instead of comparing formatted
+    // strings — lexicographic comparison silently misbehaves if SQLite ever
+    // stores fractional seconds or a different separator. Parse failure is
+    // treated as NOT old (safe direction: never redirect a miner's funds on
+    // a formatting accident).
+    let two_days_ago = Utc::now() - chrono::Duration::days(2);
+    let is_older_than_two_days = |created_at: &str| -> bool {
+        chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S")
+            .map(|t| t.and_utc() <= two_days_ago)
+            .unwrap_or_else(|_| {
+                warn!(created_at, "Unparseable miner created_at; treating as recent");
+                false
+            })
+    };
 
     for (i, p) in pending.iter().enumerate() {
         let pay_to = if is_valid_zcash_address(&p.address, network) {
             p.address.clone()
-        } else if p.created_at <= two_days_ago {
+        } else if is_older_than_two_days(&p.created_at) {
             warn!(
                 miner_id = p.miner_id, address = %p.address, created_at = %p.created_at,
                 amount_zec = p.amount as f64 / ZATOSHIS_PER_ZEC,
@@ -1215,8 +1238,12 @@ async fn process_payouts(
                     // the problematic entries and retry once more.
                     if retries < 2 && (msg.contains("unknown address") || msg.contains("Invalid amount") || msg.contains("Invalid parameter")) {
                         warn!(error = %msg, "z_sendmany failed, removing problematic entries and retrying");
-                        // Can't easily identify which address is bad, so halve the batch
-                        // and retry — eventually the bad one gets isolated.
+                        // Can't easily identify which address is bad, so halve the
+                        // batch and retry. Alternate which half is KEPT per retry
+                        // (audit NEW-F): always keeping the front half let one bad
+                        // entry that sorts first (largest pending) livelock its
+                        // half across every cycle. Dropped entries keep their
+                        // pending and re-enter the next 5-min cycle.
                         let half = current_list.len() / 2;
                         if half == 0 {
                             if let Some(id) = attempt_id {
@@ -1224,7 +1251,11 @@ async fn process_payouts(
                             }
                             return Err(anyhow::anyhow!("z_sendmany failed on single entry: {e}"));
                         }
-                        current_list.truncate(half);
+                        if retries % 2 == 0 {
+                            current_list.truncate(half);
+                        } else {
+                            current_list.drain(..half);
+                        }
                         retries += 1;
                         continue;
                     }
