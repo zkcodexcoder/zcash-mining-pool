@@ -45,6 +45,8 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_008).execute(&self.pool).await;
         let migration_009 = include_str!("../migrations/009_clawback_ack_maturity.sql");
         let _ = sqlx::raw_sql(migration_009).execute(&self.pool).await;
+        let migration_010 = include_str!("../migrations/010_tx_costs.sql");
+        let _ = sqlx::raw_sql(migration_010).execute(&self.pool).await;
         Ok(())
     }
 
@@ -193,8 +195,8 @@ impl PoolDb {
     /// Returns (credited_reward_zatoshis, balances_total_zatoshis, clawback_zatoshis).
     pub async fn get_accounting_invariant(&self) -> Result<(i64, i64, i64), DbError> {
         let reward: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(COALESCE(actual_reward, reward)), 0) FROM blocks \
-             WHERE status IN ('pending', 'confirmed')",
+            "SELECT COALESCE(SUM(COALESCE(actual_reward, reward) - COALESCE(costs_recovered, 0)), 0) \
+             FROM blocks WHERE status IN ('pending', 'confirmed')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -521,6 +523,27 @@ impl PoolDb {
             .bind(block_id)
             .execute(&mut *tx)
             .await?;
+        // The costs this block's distribution absorbed were real (the
+        // wallet paid them) but the covering reward is gone — re-queue
+        // them for the next block's distribution.
+        let recovered: (i64,) =
+            sqlx::query_as("SELECT COALESCE(costs_recovered, 0) FROM blocks WHERE id = ?1")
+                .bind(block_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if recovered.0 > 0 {
+            sqlx::query(
+                "INSERT INTO pool_tx_costs (kind, ref, fee) VALUES ('reorphaned', 'block:' || ?1, ?2)",
+            )
+            .bind(block_id)
+            .bind(recovered.0)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE blocks SET costs_recovered = 0 WHERE id = ?1")
+                .bind(block_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(Some((reversed, clawback)))
     }
@@ -553,6 +576,59 @@ impl PoolDb {
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected())
+    }
+
+    /// Record a pipeline tx cost (ZIP-317 fee the pool wallet paid for a
+    /// shield or payout tx). Recovered from a future block's distribution.
+    pub async fn record_tx_cost(&self, kind: &str, reference: &str, fee: i64) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO pool_tx_costs (kind, ref, fee) VALUES (?1, ?2, ?3)")
+            .bind(kind)
+            .bind(reference)
+            .bind(fee)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Consume unrecovered pipeline costs for a block's distribution, up to
+    /// `cap` zatoshis (whole rows only, oldest first). Marks the rows
+    /// recovered and stamps the total on the block. Returns the amount the
+    /// distribution should deduct. One transaction.
+    pub async fn take_costs_for_block(&self, block_id: i64, cap: i64) -> Result<i64, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<(i64, i64)> = sqlx::query(
+            "SELECT id, fee FROM pool_tx_costs WHERE recovered = 0 ORDER BY id ASC",
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|r| (r.get("id"), r.get("fee")))
+        .collect();
+
+        let mut taken: i64 = 0;
+        let mut ids: Vec<i64> = Vec::new();
+        for (id, fee) in rows {
+            if taken + fee > cap {
+                break;
+            }
+            taken += fee;
+            ids.push(id);
+        }
+        for id in &ids {
+            sqlx::query("UPDATE pool_tx_costs SET recovered = 1 WHERE id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if taken > 0 {
+            sqlx::query("UPDATE blocks SET costs_recovered = ?1 WHERE id = ?2")
+                .bind(taken)
+                .bind(block_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(taken)
     }
 
     pub async fn get_recent_blocks(&self, limit: i64) -> Result<Vec<Block>, DbError> {

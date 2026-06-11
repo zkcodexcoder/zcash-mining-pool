@@ -279,3 +279,110 @@ async fn test_clawback_acknowledgement_silences_alerts() {
     assert_eq!(n, 1);
     assert!(db.get_recent_clawbacks(24).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn test_take_costs_caps_and_stamps_block() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1tc").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+    let block_a = db
+        .record_block(400, "feedc0", 125_000_000, None, w.id, None)
+        .await
+        .unwrap();
+    let block_b = db
+        .record_block(401, "feedc1", 125_000_000, None, w.id, None)
+        .await
+        .unwrap();
+
+    db.record_tx_cost("shield", "txid-s1", 260_000).await.unwrap();
+    db.record_tx_cost("payout", "txid-p1", 30_000).await.unwrap();
+    db.record_tx_cost("shield", "txid-s2", 2_500_000).await.unwrap();
+
+    // Cap admits the first two rows (290k) but not the third (whole rows only).
+    let taken = db.take_costs_for_block(block_a, 2_500_000).await.unwrap();
+    assert_eq!(taken, 290_000);
+    let stamped: (i64,) =
+        sqlx::query_as("SELECT COALESCE(costs_recovered, 0) FROM blocks WHERE id = ?1")
+            .bind(block_a)
+            .fetch_one(db.inner())
+            .await
+            .unwrap();
+    assert_eq!(stamped.0, 290_000);
+
+    // Next block picks up the remainder; recovered rows are never re-taken.
+    let taken_b = db.take_costs_for_block(block_b, 2_500_000).await.unwrap();
+    assert_eq!(taken_b, 2_500_000);
+    let taken_again = db.take_costs_for_block(block_b, 2_500_000).await.unwrap();
+    assert_eq!(taken_again, 0, "queue drained, nothing left to take");
+}
+
+#[tokio::test]
+async fn test_orphan_requeues_recovered_costs() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1rq").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+    let block_id = db
+        .record_block(402, "feedc2", 125_000_000, Some(125_000_000), w.id, None)
+        .await
+        .unwrap();
+    db.record_tx_cost("shield", "txid-rq", 260_000).await.unwrap();
+    let taken = db.take_costs_for_block(block_id, 2_500_000).await.unwrap();
+    assert_eq!(taken, 260_000);
+    db.distribute_block_credits(block_id, &[(m.id, 123_490_000)])
+        .await
+        .unwrap();
+
+    // Orphaned: credits reverse AND the costs it absorbed go back in the
+    // queue so the next real block recovers them.
+    let outcome = db.reverse_block_credits_precise(block_id).await.unwrap();
+    assert_eq!(outcome, Some((123_490_000, 0)));
+
+    let stamped: (i64,) =
+        sqlx::query_as("SELECT COALESCE(costs_recovered, 0) FROM blocks WHERE id = ?1")
+            .bind(block_id)
+            .fetch_one(db.inner())
+            .await
+            .unwrap();
+    assert_eq!(stamped.0, 0, "orphaned block must not claim cost recovery");
+
+    let requeued: (String, i64) = sqlx::query_as(
+        "SELECT kind, fee FROM pool_tx_costs WHERE recovered = 0 AND kind = 'reorphaned'",
+    )
+    .fetch_one(db.inner())
+    .await
+    .unwrap();
+    assert_eq!(requeued.1, 260_000);
+
+    // A later block recovers the re-queued amount.
+    let block_next = db
+        .record_block(403, "feedc3", 125_000_000, None, w.id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.take_costs_for_block(block_next, 2_500_000).await.unwrap(),
+        260_000
+    );
+}
+
+#[tokio::test]
+async fn test_invariant_subtracts_costs_recovered() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1ic").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+    let block_id = db
+        .record_block(404, "feedc4", 125_000_000, Some(125_300_000), w.id, None)
+        .await
+        .unwrap();
+    db.record_tx_cost("payout", "txid-ic", 40_000).await.unwrap();
+    db.take_costs_for_block(block_id, 2_500_000).await.unwrap();
+    db.distribute_block_credits(block_id, &[(m.id, 125_260_000)])
+        .await
+        .unwrap();
+
+    let (reward, balances, clawbacks) = db.get_accounting_invariant().await.unwrap();
+    assert_eq!(reward, 125_260_000, "reward basis must be net of recovered costs");
+    assert_eq!(balances, 125_260_000);
+    assert_eq!(clawbacks, 0);
+    // With fee 0 the invariant balances exactly: reward - balances - clawbacks = 0.
+    assert_eq!(reward - balances - clawbacks, 0);
+}
