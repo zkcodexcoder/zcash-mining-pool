@@ -56,9 +56,23 @@ impl PplnsCalculator {
         block_id: i64,
         found_by_worker_id: i64,
     ) -> Result<Vec<PplnsReward>, RewardError> {
-        // Pool fee applies in both modes.
-        let distributable = ((block_reward as f64) * (1.0 - self.pool_fee)) as i64;
-        let pool_fee_amount = block_reward - distributable;
+        // Recover the pool's own tx costs (shielding + payout ZIP-317 fees)
+        // from this block's distribution before splitting. Capped at 2% of
+        // the block reward per block so a backlog of queued costs can never
+        // wipe out a distribution; the remainder rolls to the next block.
+        let cap = block_reward / 50;
+        let costs = self.db.take_costs_for_block(block_id, cap).await?;
+        if costs > 0 {
+            info!(
+                block_id,
+                costs, cap, "Recovered pool tx costs from block distribution"
+            );
+        }
+        let net_reward = block_reward - costs;
+
+        // Pool fee applies in both modes, on the cost-adjusted reward.
+        let distributable = ((net_reward as f64) * (1.0 - self.pool_fee)) as i64;
+        let pool_fee_amount = net_reward - distributable;
 
         if self.mode == RewardMode::Solo {
             let miner_id = self.db.get_miner_id_for_worker(found_by_worker_id).await?;
@@ -98,14 +112,10 @@ impl PplnsCalculator {
             return Ok(vec![]);
         }
 
-        // Pool fee (`distributable` and `pool_fee_amount` already computed above
-        // before the Solo-mode short-circuit; recompute here for clarity).
-        let distributable = ((block_reward as f64) * (1.0 - self.pool_fee)) as i64;
-        let pool_fee_amount = block_reward - distributable;
-
         info!(
             block_id,
             block_reward,
+            costs,
             pool_fee_amount,
             distributable,
             miners = shares.len(),

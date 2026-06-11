@@ -742,7 +742,7 @@ async fn run_payout_loop(
         }
 
         // Phase 2: Shield mature coinbase UTXOs (transparent -> shielded)
-        match shield_coinbase(&wallet_rpc, mining_address, pool_address).await {
+        match shield_coinbase(&db, &wallet_rpc, mining_address, pool_address).await {
             Ok(()) => {
                 consecutive_shielding_failures = 0;
                 last_shielding_error.clear();
@@ -915,7 +915,23 @@ async fn check_block_maturity(
     Ok(())
 }
 
+/// Deterministic ZIP-317 fee estimate for a coinbase-shielding tx:
+/// N transparent P2PKH inputs (~150 bytes each = 1 logical action apiece)
+/// plus 2 padded Orchard actions. Zallet computes the real fee internally
+/// and does not expose it, so we record this estimate as the pool's cost.
+fn estimate_shield_fee(utxos: u64) -> i64 {
+    5000 * (utxos as i64 + 2).max(2)
+}
+
+/// Deterministic ZIP-317 fee estimate for a payout tx: M transparent
+/// outputs (1 logical action apiece) plus ~2 padded Orchard actions for
+/// the spends/change.
+fn estimate_payout_fee(recipients: usize) -> i64 {
+    5000 * (recipients as i64 + 2).max(2)
+}
+
 async fn shield_coinbase(
+    db: &PoolDb,
     wallet_rpc: &ZcashRpcClient,
     mining_address: &str,
     pool_address: &str,
@@ -980,6 +996,9 @@ async fn shield_coinbase(
                         total_ok += utxos;
                         total_val += val;
                         info!(batch = b, txid = %txid, "Shielding batch complete");
+                        if let Err(e) = db.record_tx_cost("shield", &txid, estimate_shield_fee(utxos)).await {
+                            warn!(error = %e, txid = %txid, "Failed to record shielding tx cost");
+                        }
                     }
                     OpResult::Failed(msg) => {
                         warn!(batch = b, error = %msg, "Shielding batch failed");
@@ -997,10 +1016,13 @@ async fn shield_coinbase(
     }
 
     // Wait for any remaining queued operations.
-    for (b, op, _utxos, _val) in opids.drain(..) {
+    for (b, op, utxos, _val) in opids.drain(..) {
         match wait_for_operation(wallet_rpc, &op).await? {
             OpResult::Success(txid) => {
                 info!(batch = b, txid = %txid, "Shielding batch complete");
+                if let Err(e) = db.record_tx_cost("shield", &txid, estimate_shield_fee(utxos)).await {
+                    warn!(error = %e, txid = %txid, "Failed to record shielding tx cost");
+                }
             }
             OpResult::Failed(msg) => {
                 warn!(batch = b, error = %msg, "Shielding batch failed");
@@ -1326,6 +1348,17 @@ async fn process_payouts(
     info!(txid = %txid, "Payout transaction broadcast and visible on node");
     if let Some(id) = attempt_id {
         let _ = db.update_payout_attempt(id, "confirmed", None, Some(&txid), None).await;
+    }
+    // Record the pool's ZIP-317 cost for this payout tx so the next block's
+    // distribution recovers it. Recipients = unique addresses (z_sendmany
+    // merged duplicates the same way before broadcasting).
+    let recipients = payout_list
+        .iter()
+        .map(|(_, _, addr)| addr.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    if let Err(e) = db.record_tx_cost("payout", &txid, estimate_payout_fee(recipients)).await {
+        warn!(error = %e, txid = %txid, "Failed to record payout tx cost");
     }
 
     let mut count = 0;

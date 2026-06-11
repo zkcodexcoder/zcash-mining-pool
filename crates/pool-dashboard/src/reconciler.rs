@@ -283,7 +283,7 @@ impl Reconciler {
     /// baseline is meaningless — re-baseline silently instead of alerting
     /// on the definition jump.
     fn invariant_version(&self) -> String {
-        format!("v3-actualreward-clawbacks-fee{:.4}", self.pool_fee)
+        format!("v4-costrecovery-fee{:.4}", self.pool_fee)
     }
 
     /// Check 3: confirmed-rewards vs balances invariant. Alerts on drift
