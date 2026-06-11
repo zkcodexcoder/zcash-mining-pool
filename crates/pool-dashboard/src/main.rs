@@ -239,6 +239,13 @@ struct PayoutConfig {
     /// chain, and checks the rewards-vs-balances invariant. 0 disables.
     #[serde(default = "default_reconcile_interval")]
     reconcile_interval_secs: u64,
+    /// Faucet-style immediate payouts: skip the maturity gate and pay block
+    /// credits at find time, with the reserve underwriting orphan losses
+    /// (those clawbacks are auto-acknowledged as absorbed). Safeguarded:
+    /// only takes effect in solo mode with reserve_min > 0, and each round
+    /// only while total immature exposure stays within reserve_min.
+    #[serde(default)]
+    pay_immature: bool,
 }
 
 fn default_minimum_payout() -> f64 {
@@ -272,6 +279,7 @@ impl Default for PayoutConfig {
             reserve_min: 0.0,
             available_balance_margin: default_balance_margin(),
             reconcile_interval_secs: default_reconcile_interval(),
+            pay_immature: false,
         }
     }
 }
@@ -392,6 +400,19 @@ async fn main() -> Result<()> {
     let authoritative_tip_cache: Arc<tokio::sync::RwLock<pool_api::AuthoritativeTip>> =
         Arc::new(tokio::sync::RwLock::new(pool_api::AuthoritativeTip::default()));
 
+    // Immediate-payout (faucet) mode, with its safeguard: the knob only
+    // takes effect in solo mode with a reserve to underwrite orphan losses.
+    let pay_immature = config.payout.pay_immature
+        && config.pplns.mode.to_lowercase() == "solo"
+        && config.payout.reserve_min > 0.0;
+    if config.payout.pay_immature && !pay_immature {
+        warn!(
+            mode = %config.pplns.mode,
+            reserve_min = config.payout.reserve_min,
+            "pay_immature is set but disabled: it requires solo mode and reserve_min > 0"
+        );
+    }
+
     // Build ApiState with no live atomics (triggers DB fallback in helpers)
     let api_state: AppState = Arc::new(ApiState {
         db: db.clone(),
@@ -415,6 +436,7 @@ async fn main() -> Result<()> {
         pool_address: config.payout.pool_address.clone(),
         mining_address: config.payout.mining_address.clone(),
         min_payout_zatoshis: (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64,
+        pay_immature,
         maturity_confirmations: config.payout.maturity_confirmations,
         network_blocks_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         stats_history: pool_api::StatsHistory::new(),
@@ -601,6 +623,7 @@ async fn main() -> Result<()> {
             reserve_min_zec = config.payout.reserve_min,
             interval_secs = config.payout.interval_secs,
             maturity_confirmations = maturity,
+            pay_immature,
             "Payout loop enabled"
         );
         // Independent reconciliation sweep (audit P4). Shares the same RPC
@@ -628,7 +651,7 @@ async fn main() -> Result<()> {
                 &pool_address, &mining_address,
                 min_payout_zatoshis, reserve_min_zatoshis, balance_margin,
                 maturity, interval,
-                &payout_network,
+                &payout_network, pay_immature,
             ).await;
         });
         Some((payout_task, reconciler_handle))
@@ -711,6 +734,7 @@ async fn run_payout_loop(
     maturity_confirmations: u64,
     interval: Duration,
     network: &str,
+    pay_immature: bool,
 ) {
     info!("Payout loop started");
     // Short initial delay to let dashboard fully start before doing RPC work.
@@ -729,7 +753,7 @@ async fn run_payout_loop(
 
     loop {
         // Phase 1: Check block maturity
-        match check_block_maturity(&db, &node_rpc, maturity_confirmations).await {
+        match check_block_maturity(&db, &node_rpc, maturity_confirmations, pay_immature).await {
             Ok(()) => {
                 consecutive_maturity_failures = 0;
                 last_maturity_error.clear();
@@ -758,6 +782,7 @@ async fn run_payout_loop(
         match process_payouts(
             &db, &wallet_rpc, &node_rpc, pool_address, mining_address,
             min_payout_zatoshis, reserve_min_zatoshis, balance_margin, network,
+            pay_immature,
         ).await {
             Ok(count) => {
                 if count > 0 {
@@ -858,6 +883,7 @@ async fn check_block_maturity(
     db: &PoolDb,
     node_rpc: &ZcashRpcClient,
     maturity_confirmations: u64,
+    pay_immature: bool,
 ) -> anyhow::Result<()> {
     let current_height = node_rpc.get_block_count().await
         .map_err(|e| anyhow::anyhow!("getblockcount failed: {e}"))?;
@@ -900,6 +926,23 @@ async fn check_block_maturity(
                         clawback_zatoshis = clawback,
                         "Block orphaned (precise credit reversal)"
                     );
+                    // Immediate-payout policy: already-paid credits of an
+                    // orphan are the reserve's loss by design — record the
+                    // decision so the reconciler doesn't page the operator.
+                    if pay_immature && clawback > 0 {
+                        let n = db
+                            .acknowledge_clawbacks_for_block(
+                                block.id,
+                                "absorbed from reserve (immediate-payout policy)",
+                            )
+                            .await?;
+                        info!(
+                            height = block.height,
+                            clawback_zatoshis = clawback,
+                            rows = n,
+                            "Orphan loss absorbed from reserve (auto-acknowledged)"
+                        );
+                    }
                 }
                 None => {
                     db.reverse_block_credits(block.reward).await?;
@@ -1098,8 +1141,27 @@ async fn process_payouts(
     reserve_min_zatoshis: i64,
     balance_margin: f64,
     network: &str,
+    pay_immature: bool,
 ) -> anyhow::Result<usize> {
-    let pending = db.get_pending_payouts(min_payout_zatoshis).await?;
+    // Immediate-payout safeguard: only skip the maturity gate while the
+    // total credits on still-pending blocks (= worst-case orphan loss the
+    // reserve could be asked to absorb) fit within the reserve. Past that,
+    // fall back to mature-only for the round; exposure shrinks as blocks
+    // confirm.
+    let mut include_immature = false;
+    if pay_immature {
+        let exposure = db.get_immature_exposure().await?;
+        if exposure <= reserve_min_zatoshis {
+            include_immature = true;
+        } else {
+            info!(
+                exposure_zatoshis = exposure,
+                reserve_min_zatoshis,
+                "Immature exposure exceeds reserve — mature-only payouts this round"
+            );
+        }
+    }
+    let pending = db.get_pending_payouts(min_payout_zatoshis, include_immature).await?;
     if pending.is_empty() {
         return Ok(0);
     }

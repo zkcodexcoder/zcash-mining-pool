@@ -578,6 +578,39 @@ impl PoolDb {
         Ok(r.rows_affected())
     }
 
+    /// Acknowledge only the clawbacks of one block (immediate-payout policy:
+    /// the reserve absorbs that block's orphan loss automatically; other
+    /// blocks' clawbacks still need an operator decision).
+    pub async fn acknowledge_clawbacks_for_block(
+        &self,
+        block_id: i64,
+        note: &str,
+    ) -> Result<u64, DbError> {
+        let r = sqlx::query(
+            "UPDATE orphan_clawbacks SET acknowledged = 1, ack_note = ?1 \
+             WHERE acknowledged = 0 AND block_id = ?2",
+        )
+        .bind(note)
+        .bind(block_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Total credits sitting on still-pending (immature) blocks. Upper bound
+    /// on what the reserve could lose if every pending block orphaned after
+    /// being paid immediately — the immediate-payout safeguard compares this
+    /// against reserve_min before skipping the maturity gate.
+    pub async fn get_immature_exposure(&self) -> Result<i64, DbError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(bc.amount), 0) FROM block_credits bc \
+             JOIN blocks bl ON bc.block_id = bl.id WHERE bl.status = 'pending'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
     /// Record a pipeline tx cost (ZIP-317 fee the pool wallet paid for a
     /// shield or payout tx). Recovered from a future block's distribution.
     pub async fn record_tx_cost(&self, kind: &str, reference: &str, fee: i64) -> Result<(), DbError> {
@@ -848,8 +881,22 @@ impl PoolDb {
     /// clawbacks structurally impossible short of a >maturity-depth reorg.
     /// Credits from pre-008 blocks have no ledger rows and count as
     /// payable (those blocks are long confirmed).
-    pub async fn get_pending_payouts(&self, min_amount: i64) -> Result<Vec<PendingPayout>, DbError> {
-        let rows: Vec<SqliteRow> = sqlx::query(
+    /// With `include_immature` (faucet-style immediate payouts, underwritten
+    /// by the operator's reserve), the maturity gate is skipped and the full
+    /// pending balance is payable at find time. The caller is responsible
+    /// for the reserve safeguard (see `get_immature_exposure`).
+    pub async fn get_pending_payouts(
+        &self,
+        min_amount: i64,
+        include_immature: bool,
+    ) -> Result<Vec<PendingPayout>, DbError> {
+        let sql = if include_immature {
+            "SELECT b.miner_id, m.address, m.created_at, b.pending AS payable \
+             FROM balances b \
+             JOIN miners m ON m.id = b.miner_id \
+             WHERE b.pending >= ?1 \
+             ORDER BY payable DESC"
+        } else {
             "SELECT * FROM ( \
                  SELECT b.miner_id, m.address, m.created_at, \
                         b.pending - COALESCE(( \
@@ -860,11 +907,12 @@ impl PoolDb {
                  FROM balances b \
                  JOIN miners m ON m.id = b.miner_id \
              ) WHERE payable >= ?1 \
-             ORDER BY payable DESC",
-        )
-        .bind(min_amount)
-        .fetch_all(&self.pool)
-        .await?;
+             ORDER BY payable DESC"
+        };
+        let rows: Vec<SqliteRow> = sqlx::query(sql)
+            .bind(min_amount)
+            .fetch_all(&self.pool)
+            .await?;
 
         let entries = rows
             .iter()

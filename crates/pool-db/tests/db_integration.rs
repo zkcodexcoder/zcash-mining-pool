@@ -252,15 +252,20 @@ async fn test_immature_block_credits_not_payable() {
         .await
         .unwrap();
 
-    let payable = db.get_pending_payouts(1_000_000).await.unwrap();
+    let payable = db.get_pending_payouts(1_000_000, false).await.unwrap();
     assert!(
         payable.iter().all(|p| p.miner_id != m.id),
         "immature credits must not be payable: {payable:?}"
     );
 
+    // With pay_immature (faucet mode) the same credits ARE payable at once.
+    let payable = db.get_pending_payouts(1_000_000, true).await.unwrap();
+    let row = payable.iter().find(|p| p.miner_id == m.id).expect("immediately payable");
+    assert_eq!(row.amount, 123_750_000);
+
     // Block confirms → becomes payable in full.
     db.update_block_status(block_id, "confirmed").await.unwrap();
-    let payable = db.get_pending_payouts(1_000_000).await.unwrap();
+    let payable = db.get_pending_payouts(1_000_000, false).await.unwrap();
     let row = payable.iter().find(|p| p.miner_id == m.id).expect("now payable");
     assert_eq!(row.amount, 123_750_000);
 }
@@ -278,6 +283,41 @@ async fn test_clawback_acknowledgement_silences_alerts() {
     let n = db.acknowledge_clawbacks("absorbed from reserve per operator").await.unwrap();
     assert_eq!(n, 1);
     assert!(db.get_recent_clawbacks(24).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_immature_exposure_and_per_block_ack() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1exp").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+
+    // Two pending blocks with credits, one confirmed: exposure counts only
+    // the pending ones.
+    let b1 = db.record_block(500, "feede0", 125_000_000, None, w.id, None).await.unwrap();
+    let b2 = db.record_block(501, "feede1", 125_000_000, None, w.id, None).await.unwrap();
+    let b3 = db.record_block(502, "feede2", 125_000_000, None, w.id, None).await.unwrap();
+    db.distribute_block_credits(b1, &[(m.id, 100)]).await.unwrap();
+    db.distribute_block_credits(b2, &[(m.id, 200)]).await.unwrap();
+    db.distribute_block_credits(b3, &[(m.id, 400)]).await.unwrap();
+    db.update_block_status(b3, "confirmed").await.unwrap();
+    assert_eq!(db.get_immature_exposure().await.unwrap(), 300);
+
+    // Per-block acknowledgement only silences that block's clawbacks.
+    sqlx::query("INSERT INTO orphan_clawbacks (block_id, miner_id, amount) VALUES (?1, ?2, 100), (?3, ?2, 200)")
+        .bind(b1)
+        .bind(m.id)
+        .bind(b2)
+        .execute(db.inner())
+        .await
+        .unwrap();
+    let n = db
+        .acknowledge_clawbacks_for_block(b1, "absorbed from reserve (immediate-payout policy)")
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    let remaining = db.get_recent_clawbacks(24).await.unwrap();
+    assert_eq!(remaining.len(), 1, "b2's clawback must still alert");
+    assert_eq!(remaining[0].0, b2);
 }
 
 #[tokio::test]

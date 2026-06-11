@@ -37,6 +37,9 @@ pub struct ApiState {
     pub mining_address: Option<String>,
     /// Minimum payout in zatoshis.
     pub min_payout_zatoshis: i64,
+    /// Effective immediate-payout flag (faucet mode): when true, displayed
+    /// pending payouts skip the maturity gate, matching the payout loop.
+    pub pay_immature: bool,
     /// Maturity confirmations required.
     pub maturity_confirmations: u64,
     /// Difficulty multiplier: converts shares/sec to Sol/s.
@@ -379,7 +382,7 @@ pub async fn get_pool_stats(
     };
 
     let immature = state.db.get_immature_blocks_count().await.unwrap_or(0);
-    let pending_payout = state.db.get_pending_payouts(state.min_payout_zatoshis).await
+    let pending_payout = state.db.get_pending_payouts(state.min_payout_zatoshis, state.pay_immature).await
         .map(|v| v.len() as i64).unwrap_or(0);
 
     let (node_ok, last_template_at) = state.get_last_template_ms().await;
@@ -743,7 +746,7 @@ pub async fn trigger_payout(
     }
 
     // Phase 3: Process payouts
-    let pending = match state.db.get_pending_payouts(state.min_payout_zatoshis).await {
+    let pending = match state.db.get_pending_payouts(state.min_payout_zatoshis, state.pay_immature).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error", "message": format!("DB error: {e}")
@@ -1101,7 +1104,7 @@ pub async fn get_pending_payouts_list(
 ) -> Result<Json<Vec<PendingPayoutEntry>>, StatusCode> {
     let entries = state
         .db
-        .get_pending_payouts(state.min_payout_zatoshis)
+        .get_pending_payouts(state.min_payout_zatoshis, state.pay_immature)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
