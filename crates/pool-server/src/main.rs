@@ -529,6 +529,33 @@ async fn main() -> Result<()> {
     // process loudly; an operator (or process supervisor) can then restart.
     // Aborts via .abort() during normal shutdown cancel the future before
     // these post-await lines run, so this only fires on real failures.
+    // Stalled-validator watchdog. The return-catcher below only fires if the
+    // validator task *returns*; the 2026-07-01 wedge was a deadlock inside an
+    // event handler — the task never returned, so it went undetected for ~12h.
+    // The validator stamps a heartbeat every loop iteration (≤5s when healthy,
+    // driven by its snapshot tick even with zero miners). If the heartbeat
+    // goes stale, the loop is wedged: terminate loudly so the supervisor
+    // restarts the pool (the same remedy an operator applies by hand).
+    let validator_heartbeat = share_validator.heartbeat();
+    const VALIDATOR_STALL_SECS: i64 = 60;
+    let watchdog_handle = tokio::spawn(async move {
+        // Grace period so startup / first heartbeat isn't flagged.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let last = validator_heartbeat.load(std::sync::atomic::Ordering::Relaxed);
+            let age_ms = chrono::Utc::now().timestamp_millis() - last;
+            if age_ms > VALIDATOR_STALL_SECS * 1000 {
+                error!(
+                    stall_secs = age_ms / 1000,
+                    threshold_secs = VALIDATOR_STALL_SECS,
+                    "Share validator heartbeat is stale — validator is wedged (deadlocked), terminating so the supervisor can restart"
+                );
+                std::process::exit(3);
+            }
+        }
+    });
+
     let share_handle = tokio::spawn(async move {
         share_validator.run(event_rx).await;
         error!("Share validator exited unexpectedly — pool is useless without it, terminating");
@@ -548,6 +575,9 @@ async fn main() -> Result<()> {
         .expect("Failed to listen for ctrl+c");
     info!("Shutdown signal received, stopping services...");
 
+    // Abort the watchdog first, before the validator, so a graceful shutdown
+    // can't be misread as a stall and trigger exit(3).
+    watchdog_handle.abort();
     for h in &stratum_handles { h.abort(); }
     job_handle.abort();
     share_handle.abort();
