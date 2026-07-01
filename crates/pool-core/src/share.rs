@@ -168,6 +168,14 @@ pub struct ShareValidator {
     /// Tracks recent disconnects for rapid-reconnect difficulty escalation.
     /// Key: worker_name, Value: (disconnect_time, last_difficulty).
     recent_disconnects: RwLock<HashMap<String, (Instant, f64)>>,
+    /// Liveness heartbeat: unix-ms timestamp stamped at the top of every
+    /// `run()` loop iteration. The loop cycles at least every 5s (the snapshot
+    /// tick) even with zero miners, so a healthy validator keeps this fresh.
+    /// If an event handler deadlocks, the loop never comes back around and this
+    /// freezes — the external watchdog detects the stall and terminates the
+    /// process. Catches the *stalled* wedge that the return-only watchdog in
+    /// pool-server misses.
+    heartbeat: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl ShareValidator {
@@ -215,7 +223,17 @@ impl ShareValidator {
             rejects_other,
             session_worker_id: RwLock::new(HashMap::new()),
             recent_disconnects: RwLock::new(HashMap::new()),
+            heartbeat: Arc::new(std::sync::atomic::AtomicI64::new(
+                chrono::Utc::now().timestamp_millis(),
+            )),
         }
+    }
+
+    /// Returns a handle to the validator's liveness heartbeat (unix-ms,
+    /// updated each `run()` loop iteration). The pool-server watchdog polls
+    /// this to detect a stalled validator and terminate the process.
+    pub fn heartbeat(&self) -> Arc<std::sync::atomic::AtomicI64> {
+        Arc::clone(&self.heartbeat)
     }
 
     fn make_initial_target(&self) -> ([u8; 32], VardiffTracker) {
@@ -244,6 +262,14 @@ impl ShareValidator {
         snapshot_interval.tick().await; // consume the immediate first tick
 
         loop {
+            // Liveness heartbeat (audit: stalled-validator watchdog). Stamped
+            // once per iteration; the loop cycles at least every 5s via the
+            // snapshot tick even with no share traffic, so this stays fresh
+            // while healthy and freezes if a handler below deadlocks.
+            self.heartbeat.store(
+                chrono::Utc::now().timestamp_millis(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let event = tokio::select! {
                 ev = event_rx.recv() => match ev {
                     Some(e) => e,
