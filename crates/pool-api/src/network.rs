@@ -103,19 +103,47 @@ fn truncate_address(addr: &str) -> String {
 }
 
 /// Look up pool name by miner address, then fall back to coinbase text detection.
+///
+/// Several pools rotated payout addresses in June 2026; old addresses are kept
+/// so historical blocks stay labeled. Evidence per entry is noted inline —
+/// pools that tag their coinbase are also caught by the text fallback below,
+/// but address entries keep labels distinct (e.g. Solo vs regular).
 fn identify_pool(miner_address: &str, coinbase_text: &str) -> Option<String> {
     // Address-based lookup
     let name = match miner_address {
         "t1K79TgQbqu74d6rBmsMu2oFEXEwAmdYiT7" => Some("ViaBTC"),
         "t1ZVi2YGk98tEGYcNpXYnJFWCoLG2oYwv3J" => Some("ViaBTC"),
+        // ViaBTC's post-rotation address (first seen ~June 2026, block ~3.38M).
+        // Inferred, not self-tagged: it took over ViaBTC's ~34% share in the
+        // same window the two old addresses went quiet, matches ViaBTC's
+        // externally reported share, uses the same untagged coinbase
+        // construction, and its coinbases are swept to the shielded pool in
+        // the same batches as t1SEgZv... (the solo counterpart) below.
+        "t1MKn34KBa8Xh4g8qU8psibBXvURafphVn7" => Some("ViaBTC"),
         "t1at7nVNsv6taLRrNRvnQdtfLNRDfsGc3Ak" => Some("ViaBTC-Solo"),
+        // ViaBTC-Solo's post-rotation address: appeared as t1at7... went
+        // quiet (late June 2026), solo-sized share, swept together with
+        // ViaBTC's new address above.
+        "t1SEgZvXCu3ceE42qrq5pCeSq7HbLjX8NJv" => Some("ViaBTC-Solo"),
         "t1PEp2GJLSdhDfCKqc2J211WKDUS1NfoQNy" => Some("F2Pool"),
         "t1bnxtY7aLCjWx9Ru1YcGwRWch3eEWUFK7u" => Some("2Miners"),
+        // 2Miners' post-rotation addresses (June 2026) — verified against
+        // zec.2miners.com/api/blocks and solo-zec.2miners.com/api/blocks
+        // (mined heights match exactly). The coinbase tag would label both
+        // plain "2Miners"; the address entries keep Solo distinct.
+        "t1fu6KgYtHEXk2ZhTpM1XD7jbnSmW6wokDM" => Some("2Miners"),
         "t1LRTUjrLE2RHsS75cjCrxB7xaLTwaVkwao" => Some("2Miners-Solo"),
+        "t1Pxv9u2jWySHJPFpKimYMAtEbdHEvuYdS2" => Some("2Miners-Solo"),
         "t1L2b66MXbgpVMXDfUa94GCBFAN4dCxGohM" => Some("AntPool"),
         "t1e6hceYHkzCbwcwGZzKeMfXXW7x7gr19Cw" => Some("Kryptex"),
         // Foundry (formerly "ZEC Pool X") — same mining address, rebranded.
         "t1SqwRAAdSig6dE4EBPLonAait219VmkUjP" => Some("Foundry"),
+        // NiceHash solo — self-tagged "/NiceHash/" in coinbase.
+        "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow" => Some("NiceHash"),
+        // Still unidentified as of July 2026 (untagged, coinbase shielded
+        // immediately; no public block lists to cross-reference):
+        //   t1XQZdZMnzXBcL8yx2PR27dSNrqctgwLgux (~6%, active since ≥Aug 2025)
+        //   t1fpcZ2Dbwn4oj35oWBTUhtmUciSq7HG7LU (~2%, v4 coinbase txs)
         _ => None,
     };
     if let Some(n) = name {
