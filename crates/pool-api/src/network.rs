@@ -60,6 +60,7 @@ pub struct NetworkBlock {
     pub coinbase_hex: String,
     pub coinbase_tx_version: i32,
     pub is_zebrad: bool,
+    pub is_zakura: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -71,6 +72,7 @@ pub struct MinerDistribution {
     pub percent: f64,
     pub is_our_pool: bool,
     pub zebrad_count: u64,
+    pub zakura_count: u64,
     pub dominant_tx_version: i32,
 }
 
@@ -84,6 +86,8 @@ pub struct NetworkMiningStats {
     pub unique_miners: u64,
     pub zebrad_blocks: u64,
     pub zebrad_percent: f64,
+    pub zakura_blocks: u64,
+    pub zakura_percent: f64,
 }
 
 fn hex_to_ascii_lossy(hex: &str) -> String {
@@ -172,6 +176,13 @@ fn identify_pool(miner_address: &str, coinbase_text: &str) -> Option<String> {
 /// Detect zebrad by checking for the 🦓 emoji bytes (f09fa693) in coinbase hex.
 fn is_zebrad_block(coinbase_hex: &str) -> bool {
     coinbase_hex.contains("f09fa693")
+}
+
+/// Detect Zakura by checking for the 🌸 emoji bytes (f09f8cb8) in coinbase hex.
+/// Zakura (first seen on mainnet July 2026) embeds a cherry-blossom marker in
+/// its default coinbase the same way zebrad embeds the zebra emoji.
+fn is_zakura_block(coinbase_hex: &str) -> bool {
+    coinbase_hex.contains("f09f8cb8")
 }
 
 /// Extract coinbase info from a block JSON (verbosity=2, full tx objects inline).
@@ -318,6 +329,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
         };
         let miner_label = pool_name.clone().unwrap_or_else(|| truncate_address(&miner_address));
         let is_zebrad = is_zebrad_block(&coinbase_hex);
+        let is_zakura = is_zakura_block(&coinbase_hex);
 
         blocks.push(NetworkBlock {
             height: *height,
@@ -332,25 +344,29 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             coinbase_hex,
             coinbase_tx_version,
             is_zebrad,
+            is_zakura,
         });
     }
 
     // Build distribution.
-    // Track (block_count, zebrad_count, tx_version_counts) per address.
-    let mut addr_stats: std::collections::HashMap<String, (u64, u64, std::collections::HashMap<i32, u64>)> = std::collections::HashMap::new();
+    // Track (block_count, zebrad_count, zakura_count, tx_version_counts) per address.
+    let mut addr_stats: std::collections::HashMap<String, (u64, u64, u64, std::collections::HashMap<i32, u64>)> = std::collections::HashMap::new();
     for b in &blocks {
-        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0, std::collections::HashMap::new()));
+        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0, 0, std::collections::HashMap::new()));
         entry.0 += 1;
         if b.is_zebrad {
             entry.1 += 1;
         }
-        *entry.2.entry(b.coinbase_tx_version).or_insert(0) += 1;
+        if b.is_zakura {
+            entry.2 += 1;
+        }
+        *entry.3.entry(b.coinbase_tx_version).or_insert(0) += 1;
     }
 
     let total = blocks.len() as f64;
     let mut distribution: Vec<MinerDistribution> = addr_stats
         .into_iter()
-        .map(|(addr, (count, zcount, ver_counts))| {
+        .map(|(addr, (count, zcount, zakcount, ver_counts))| {
             let is_our_pool = !our_mining_address.is_empty() && addr == our_mining_address;
             let pool_name = if is_our_pool {
                 Some("Our Pool".to_string())
@@ -375,6 +391,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
                 },
                 is_our_pool,
                 zebrad_count: zcount,
+                zakura_count: zakcount,
                 dominant_tx_version,
             }
         })
@@ -393,6 +410,12 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     } else {
         0.0
     };
+    let zakura_blocks = blocks.iter().filter(|b| b.is_zakura).count() as u64;
+    let zakura_percent = if total > 0.0 {
+        (zakura_blocks as f64 / total) * 100.0
+    } else {
+        0.0
+    };
 
     Ok(NetworkMiningStats {
         total_blocks: blocks.len() as u64,
@@ -401,6 +424,8 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
         unique_miners: distribution.len() as u64,
         zebrad_blocks,
         zebrad_percent,
+        zakura_blocks,
+        zakura_percent,
         blocks,
         distribution,
     })
@@ -416,6 +441,8 @@ fn empty_stats() -> NetworkMiningStats {
         unique_miners: 0,
         zebrad_blocks: 0,
         zebrad_percent: 0.0,
+        zakura_blocks: 0,
+        zakura_percent: 0.0,
     }
 }
 
@@ -688,6 +715,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             line-height: 1.3;
         }
         .node-badge.zebrad { background: #1a3a1a; color: #48bb78; border: 1px solid #2d5a2d; }
+        .node-badge.zakura { background: #3a1a2e; color: #f687b3; border: 1px solid #5a2d47; }
         .node-badge.v5 { background: #3a3a1a; color: #ecc94b; border: 1px solid #5a5a2d; }
         .node-badge.v4 { background: #3a1a1a; color: #fc8181; border: 1px solid #5a2d2d; }
 
@@ -761,6 +789,10 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             <div class="label" title="Blocks mined using zebrad (detected by coinbase marker)">Zebrad Blocks</div>
             <div class="value" id="stat-zebrad">--</div>
         </div>
+        <div class="summary-cell">
+            <div class="label" title="Blocks mined using Zakura (detected by coinbase marker)">Zakura Blocks</div>
+            <div class="value" id="stat-zakura">--</div>
+        </div>
     </div>
 
     <div class="content-row">
@@ -833,7 +865,8 @@ function formatTime(ts) {
     return d.toLocaleString();
 }
 
-function nodeBadge(txVersion, isZebrad) {
+function nodeBadge(txVersion, isZebrad, isZakura) {
+    if (isZakura) return '<span class="node-badge zakura" title="\u{1F338} Running Zakura!">v' + txVersion + ' \u{1F338}</span>';
     if (isZebrad) return '<span class="node-badge zebrad" title="\u{1F993} Running ZebraD!">v' + txVersion + ' \u{1F993}</span>';
     if (txVersion === 5) return '<span class="node-badge v5" title="Running zcashd v5+ (Orchard-capable)">v5</span>';
     if (txVersion === 4) return '<span class="node-badge v4" title="Running old zcashd v4 (not Orchard-compatible)">v4</span>';
@@ -869,6 +902,7 @@ async function fetchData() {
         document.getElementById('stat-share').textContent = data.our_pool_percent.toFixed(1) + '%';
         document.getElementById('stat-unique').textContent = data.unique_miners;
         document.getElementById('stat-zebrad').textContent = data.zebrad_blocks + ' (' + data.zebrad_percent.toFixed(1) + '%)';
+        document.getElementById('stat-zakura').textContent = data.zakura_blocks + ' (' + data.zakura_percent.toFixed(1) + '%)';
 
         // Distribution table
         const distBody = document.querySelector('#dist-table tbody');
@@ -877,7 +911,7 @@ async function fetchData() {
         } else {
             distBody.innerHTML = data.distribution.map(d => {
                 const cls = d.is_our_pool ? ' class="our-pool"' : '';
-                const badge = nodeBadge(d.dominant_tx_version, d.zebrad_count > 0);
+                const badge = nodeBadge(d.dominant_tx_version, d.zebrad_count > 0, d.zakura_count > 0);
                 return '<tr' + cls + '>' +
                     '<td title="' + d.address + '">' + d.label + badge + '</td>' +
                     '<td>' + d.block_count + '</td>' +
@@ -944,7 +978,7 @@ async function fetchData() {
                 const cls = b.is_our_pool ? ' class="our-pool"' : '';
                 const hashShort = b.hash.substring(0, 16) + '...';
                 const cbShort = b.coinbase_text.length > 40 ? b.coinbase_text.substring(0, 40) + '...' : b.coinbase_text;
-                const badge = nodeBadge(b.coinbase_tx_version, b.is_zebrad);
+                const badge = nodeBadge(b.coinbase_tx_version, b.is_zebrad, b.is_zakura);
                 return '<tr' + cls + '>' +
                     '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#e0e0e0;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
                     '<td title="' + b.hash + '">' + hashShort + '</td>' +
