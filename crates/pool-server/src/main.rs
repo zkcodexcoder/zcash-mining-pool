@@ -325,12 +325,48 @@ async fn main() -> Result<()> {
     let latest_notify: Arc<tokio::sync::RwLock<Option<stratum::ServerMessage>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
+    // Parse initial pool target
+    let pool_target = pool_core::parse_target(&config.difficulty.initial_target)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Convert initial_target to a difficulty value for vardiff
+    let initial_difficulty = {
+        let target_f64 = pool_target.iter().enumerate().fold(0.0f64, |acc, (i, &b)| {
+            acc + (b as f64) * 256.0f64.powi(31 - i as i32)
+        });
+        let pow_limit: f64 = 2.0f64.powi(251) - 1.0;
+        if target_f64 > 0.0 { pow_limit / target_f64 } else { 1.0 }
+    };
+
+    let port_difficulty = config.stratum.resolved_port_difficulty();
+    if !port_difficulty.is_empty() {
+        info!(?port_difficulty, "Per-port difficulty overrides loaded");
+    }
+
     // Initialize Stratum server
     let (event_tx, event_rx) = mpsc::channel(1024);
-    let (stratum, _notify_rx) = StratumServer::new_with_latest_notify(
+    let (mut stratum, _notify_rx) = StratumServer::new_with_latest_notify(
         config.stratum.nonce1_size,
         event_tx,
         Arc::clone(&latest_notify),
+    );
+    // Announce each port's real starting difficulty at subscribe time
+    // (pre-authorize). Pool checkers like MiningRigRentals subscribe without
+    // authorizing and report whatever the first set_target says — so it must
+    // be the port's configured initial, not a placeholder. Uses the same
+    // difficulty→target conversion as the authorize-time path.
+    let subscribe_initial: HashMap<u16, (f64, String)> = port_difficulty
+        .iter()
+        .map(|(port, diff)| {
+            (*port, (*diff, pool_core::difficulty::difficulty_to_target_hex(*diff)))
+        })
+        .collect();
+    stratum.set_initial_difficulty(
+        subscribe_initial,
+        (
+            initial_difficulty,
+            pool_core::difficulty::difficulty_to_target_hex(initial_difficulty),
+        ),
     );
     let stratum = Arc::new(stratum);
 
@@ -364,19 +400,6 @@ async fn main() -> Result<()> {
     // Initialize Block Assembler
     let block_assembler = Arc::new(BlockAssembler::new(Arc::clone(&rpc)));
 
-    // Parse initial pool target
-    let pool_target = pool_core::parse_target(&config.difficulty.initial_target)
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    // Convert initial_target to a difficulty value for vardiff
-    let initial_difficulty = {
-        let target_f64 = pool_target.iter().enumerate().fold(0.0f64, |acc, (i, &b)| {
-            acc + (b as f64) * 256.0f64.powi(31 - i as i32)
-        });
-        let pow_limit: f64 = 2.0f64.powi(251) - 1.0;
-        if target_f64 > 0.0 { pow_limit / target_f64 } else { 1.0 }
-    };
-
     let vardiff_config = VardiffConfig {
         initial_difficulty,
         target_shares_per_minute: config.difficulty.target_shares_per_minute,
@@ -402,10 +425,6 @@ async fn main() -> Result<()> {
     ));
 
     // Initialize Share Validator
-    let port_difficulty = config.stratum.resolved_port_difficulty();
-    if !port_difficulty.is_empty() {
-        info!(?port_difficulty, "Per-port difficulty overrides loaded");
-    }
     // Compute difficulty_multiplier for share→Sol/s conversion
     let difficulty_multiplier = {
         let target_f64 = pool_target.iter().enumerate().fold(0.0f64, |acc, (i, &b)| {
