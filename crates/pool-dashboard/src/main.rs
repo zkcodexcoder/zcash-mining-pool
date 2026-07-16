@@ -56,6 +56,13 @@ struct AdminConfig {
     #[serde(default = "default_admin_addr")]
     listen_addr: String,
     password: String,
+    /// Separate password for the internal ops dashboard (/ops). Independent of
+    /// `password` above — neither session grants the other. Unset = /ops disabled.
+    #[serde(default)]
+    ops_password: Option<String>,
+    /// Ops dashboard upstream; defaults to the Zakura node's :9997.
+    #[serde(default)]
+    ops_upstream: Option<String>,
     #[serde(default)]
     pool_log: Option<String>,
     #[serde(default)]
@@ -564,7 +571,7 @@ async fn main() -> Result<()> {
                 }
                 zp
             };
-            let admin_state = pool_api::AdminState::with_log_paths(
+            let mut admin_state = pool_api::AdminState::with_log_paths(
                 Arc::clone(&api_state),
                 &admin_cfg.password,
                 config_view,
@@ -572,6 +579,18 @@ async fn main() -> Result<()> {
                 log_paths,
                 zallet_paths,
             );
+            // Ops dashboard gets its own password; without one the /ops routes
+            // fail closed rather than serving the view unguarded.
+            match admin_cfg.ops_password.as_deref() {
+                Some(pw) if !pw.is_empty() => {
+                    if pw == admin_cfg.password {
+                        warn!("admin.ops_password matches admin.password — set a distinct one");
+                    }
+                    admin_state = admin_state.with_ops(pw, admin_cfg.ops_upstream.as_deref());
+                    info!("Ops dashboard enabled at /ops (separate password)");
+                }
+                _ => info!("Ops dashboard disabled (no admin.ops_password set)"),
+            }
             let admin_router = pool_api::admin::build_admin_router(admin_state);
             let admin_addr = admin_cfg.listen_addr.clone();
             Some(tokio::spawn(async move {

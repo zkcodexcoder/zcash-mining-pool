@@ -1,5 +1,5 @@
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
@@ -8,6 +8,17 @@ use serde::{Deserialize, Serialize};
 use crate::handlers::AppState;
 
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
+
+/// Upstream for the internal ops dashboard (self-contained: HTML at `/`, JSON
+/// at `/api/data`). It runs on the Zakura node; ufw there allows :9997 only
+/// from this box, so it is never reachable from the internet directly — all
+/// access goes through the proxy below, which sits behind the admin session
+/// guard. The view carries operator/competitive detail (peer IPs mapped to
+/// pools), so it must stay in the protected router and unlinked publicly.
+const OPS_UPSTREAM: &str = "http://operational-host.invalid:9997";
+
+/// Request timeout for the ops proxy.
+const OPS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Serialize)]
 struct SystemStats {
@@ -129,6 +140,9 @@ fn read_system_stats() -> Option<SystemStats> {
     })
 }
 const SESSION_COOKIE_NAME: &str = "admin_session";
+/// Ops dashboard session cookie — deliberately separate from the admin session
+/// so the two surfaces have independent passwords and neither grants the other.
+const OPS_COOKIE_NAME: &str = "ops_session";
 const SESSION_MAX_AGE_SECS: i64 = 86400; // 24 hours
 
 /// Read-only snapshot of pool configuration (no secrets).
@@ -162,6 +176,9 @@ pub struct AdminState {
     pub started_at: i64,
     pub log_paths: LogPaths,
     pub zallet_paths: ZalletPaths,
+    /// Separate key for the ops dashboard session; None = ops disabled.
+    ops_signing_key: Option<[u8; 32]>,
+    ops_upstream: String,
 }
 
 /// Configurable log file paths for the admin Service Logs tab.
@@ -220,7 +237,19 @@ impl AdminState {
             started_at,
             log_paths,
             zallet_paths,
+            ops_signing_key: None,
+            ops_upstream: OPS_UPSTREAM.to_string(),
         }
+    }
+
+    /// Enable the ops dashboard with its own password (independent of admin).
+    /// Without this the /ops routes fail closed.
+    pub fn with_ops(mut self, ops_password: &str, upstream: Option<&str>) -> Self {
+        self.ops_signing_key = Some(derive_signing_key(ops_password));
+        if let Some(u) = upstream {
+            self.ops_upstream = u.trim_end_matches('/').to_string();
+        }
+        self
     }
 }
 
@@ -272,7 +301,7 @@ fn verify_session_cookie(key: &[u8; 32], cookie_value: &str) -> bool {
     (now - ts) < SESSION_MAX_AGE_SECS
 }
 
-fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
+fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all("cookie")
         .iter()
@@ -280,12 +309,12 @@ fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
         .flat_map(|s| s.split(';'))
         .find_map(|pair| {
             let pair = pair.trim();
-            if let Some(val) = pair.strip_prefix(&format!("{SESSION_COOKIE_NAME}=")) {
-                Some(val.to_string())
-            } else {
-                None
-            }
+            pair.strip_prefix(&format!("{name}=")).map(|val| val.to_string())
         })
+}
+
+fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
+    extract_cookie(headers, SESSION_COOKIE_NAME)
 }
 
 /// Auth middleware: redirects to login for pages, returns 401 for API calls.
@@ -337,12 +366,146 @@ pub fn build_admin_router(state: AdminState) -> Router {
 
     let public = Router::new()
         .route("/admin/login", get(login_page).post(handle_login))
-        .with_state(state);
+        .with_state(state.clone());
 
-    Router::new().merge(public).merge(protected)
+    // Ops dashboard: same session mechanism as admin, independent password.
+    // Login is public (unguarded); everything else sits behind ops_auth_middleware.
+    let ops_public = Router::new()
+        .route("/ops/login", get(ops_login_page).post(handle_ops_login))
+        .with_state(state.clone());
+
+    let ops = Router::new()
+        .route("/ops", get(ops_redirect))
+        .route("/ops/", get(ops_proxy_root))
+        .route("/ops/logout", post(handle_ops_logout))
+        .route("/ops/{*path}", get(ops_proxy))
+        .layer(middleware::from_fn_with_state(state.clone(), ops_auth_middleware))
+        .with_state(state.clone());
+
+    Router::new()
+        .merge(public)
+        .merge(protected)
+        .merge(ops_public)
+        .merge(ops)
 }
 
 // --- Handlers ---
+
+/// Guards the ops dashboard with its own session — same mechanism as the admin
+/// page (keyed blake2b MAC cookie) but an independent key, so the ops password
+/// is separate from the admin password and neither session grants the other.
+async fn ops_auth_middleware(
+    State(state): State<AdminState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let key = match state.ops_signing_key {
+        Some(k) => k,
+        // Not configured: fail closed rather than serving the view unguarded.
+        None => return (StatusCode::NOT_FOUND, "ops dashboard not configured").into_response(),
+    };
+
+    let authenticated = extract_cookie(request.headers(), OPS_COOKIE_NAME)
+        .as_deref()
+        .map(|c| verify_session_cookie(&key, c))
+        .unwrap_or(false);
+
+    if !authenticated {
+        return Redirect::to("/ops/login").into_response();
+    }
+
+    next.run(request).await
+}
+
+async fn ops_login_page() -> Html<&'static str> {
+    Html(OPS_LOGIN_HTML)
+}
+
+async fn handle_ops_login(State(state): State<AdminState>, Form(form): Form<LoginForm>) -> Response {
+    let key = match state.ops_signing_key {
+        Some(k) => k,
+        None => return (StatusCode::NOT_FOUND, "ops dashboard not configured").into_response(),
+    };
+    if derive_signing_key(&form.password) != key {
+        return Html(OPS_LOGIN_FAIL_HTML).into_response();
+    }
+    let cookie = make_session_cookie(&key);
+    let set_cookie = format!(
+        "{OPS_COOKIE_NAME}={cookie}; Path=/ops; HttpOnly; SameSite=Lax; Secure; Max-Age={SESSION_MAX_AGE_SECS}"
+    );
+    (
+        [(axum::http::header::SET_COOKIE, set_cookie)],
+        Redirect::to("/ops/"),
+    )
+        .into_response()
+}
+
+async fn handle_ops_logout() -> Response {
+    let clear = format!("{OPS_COOKIE_NAME}=; Path=/ops; HttpOnly; SameSite=Strict; Max-Age=0");
+    (
+        [(axum::http::header::SET_COOKIE, clear)],
+        Redirect::to("/ops/login"),
+    )
+        .into_response()
+}
+
+/// `/ops` -> `/ops/` so the dashboard's relative `api/data` fetch
+/// resolves under the proxy prefix rather than at the site root.
+async fn ops_redirect() -> Response {
+    Redirect::to("/ops/").into_response()
+}
+
+async fn ops_proxy_root(State(state): State<AdminState>) -> Response {
+    proxy_ops(&state, "").await
+}
+
+async fn ops_proxy(State(state): State<AdminState>, Path(path): Path<String>) -> Response {
+    proxy_ops(&state, &path).await
+}
+
+/// Fetch `path` from the ops dashboard upstream and relay status/body/content-type.
+/// Reached only through the protected router, so callers are already authenticated.
+async fn proxy_ops(state: &AdminState, path: &str) -> Response {
+    let url = format!("{}/{}", state.ops_upstream, path);
+
+    let client = match reqwest::Client::builder().timeout(OPS_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("ops proxy: client build failed: {e}"))
+                .into_response()
+        }
+    };
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("ops dashboard unreachable: {e}")).into_response()
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    match resp.bytes().await {
+        Ok(body) => (
+            status,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+                // Operator/competitive detail: never index or frame this view.
+                (header::X_FRAME_OPTIONS, "DENY".to_string()),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("ops dashboard read failed: {e}")).into_response(),
+    }
+}
 
 #[derive(Deserialize)]
 struct LoginForm {
@@ -859,6 +1022,69 @@ async fn api_adjust_balance(
 }
 
 // --- HTML ---
+
+const OPS_LOGIN_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>Ops Login</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.login-box { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 2rem; width: 360px; }
+.login-box h1 { color: #f687b3; font-size: 1.3rem; margin-bottom: 1.5rem; text-align: center; }
+label { display: block; font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.4rem; }
+input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }
+input[type="password"]:focus { outline: none; border-color: #f687b3; }
+button { width: 100%; padding: 0.6rem; background: #f687b3; color: #0a0e17; border: none; border-radius: 4px; font-weight: 600; font-size: 0.95rem; cursor: pointer; }
+button:hover { background: #d53f8c; }
+.err { background: #3a1a1a; border: 1px solid #5a2d2d; color: #fc8181; padding: 0.5rem; border-radius: 4px; margin-bottom: 1rem; font-size: 0.85rem; text-align: center; }
+</style>
+</head>
+<body>
+<div class="login-box">
+<h1>Zakura Ops</h1>
+<form method="POST" action="/ops/login">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autofocus required>
+<button type="submit">Sign in</button>
+</form>
+</div>
+</body>
+</html>"##;
+
+const OPS_LOGIN_FAIL_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>Ops Login</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.login-box { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 2rem; width: 360px; }
+.login-box h1 { color: #f687b3; font-size: 1.3rem; margin-bottom: 1.5rem; text-align: center; }
+label { display: block; font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.4rem; }
+input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }
+button { width: 100%; padding: 0.6rem; background: #f687b3; color: #0a0e17; border: none; border-radius: 4px; font-weight: 600; font-size: 0.95rem; cursor: pointer; }
+.err { background: #3a1a1a; border: 1px solid #5a2d2d; color: #fc8181; padding: 0.5rem; border-radius: 4px; margin-bottom: 1rem; font-size: 0.85rem; text-align: center; }
+</style>
+</head>
+<body>
+<div class="login-box">
+<h1>Zakura Ops</h1>
+<div class="err">Incorrect password</div>
+<form method="POST" action="/ops/login">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autofocus required>
+<button type="submit">Sign in</button>
+</form>
+</div>
+</body>
+</html>"##;
 
 const LOGIN_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
