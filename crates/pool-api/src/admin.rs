@@ -426,7 +426,14 @@ async fn handle_ops_login(State(state): State<AdminState>, Form(form): Form<Logi
         Some(k) => k,
         None => return (StatusCode::NOT_FOUND, "ops dashboard not configured").into_response(),
     };
-    if derive_signing_key(&form.password) != key {
+    // Either the ops password or the admin password opens this view. Accepting
+    // the admin password grants nothing new: an admin can already read
+    // ops_password in cleartext via the config view, so admin credentials
+    // already imply ops access — this just saves juggling two passwords.
+    // The session is always minted with the ops key and stays scoped to /ops,
+    // so it never works the other way round (ops password can't reach /admin).
+    let submitted = derive_signing_key(&form.password);
+    if submitted != key && submitted != state.signing_key {
         return Html(OPS_LOGIN_FAIL_HTML).into_response();
     }
     let cookie = make_session_cookie(&key);
@@ -1047,7 +1054,7 @@ button:hover { background: #d53f8c; }
 <div class="login-box">
 <h1>Zakura Ops</h1>
 <form method="POST" action="/ops/login">
-<label for="password">Password</label>
+<label for="password">Ops or admin password</label>
 <input type="password" id="password" name="password" autofocus required>
 <button type="submit">Sign in</button>
 </form>
