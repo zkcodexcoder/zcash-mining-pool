@@ -38,7 +38,20 @@ pub fn inject_coinbase_tag(
         return Err("Coinbase too short".into());
     }
 
-    // Detect version: v5 = 05000080, v4 = 04000080
+    // v6 (NU6.3/Ironwood): the ZIP-244-style digest tree changed, so hand-rolled
+    // v5 digests produce consensus-invalid blocks (verified the hard way,
+    // 2026-07-04: the network rejected every submission and the chain stalled).
+    // Delegate parsing, mutation, re-serialization and the auth digest to
+    // zebra-chain, which implements the v6 consensus rules.
+    if data[0..4] == [0x06, 0x00, 0x00, 0x80] {
+        return inject_v6_via_zebra(&data, tag, chain_history_root_hex, tx_auth_digests);
+    }
+
+    // Detect version: v6 = 06000080 (NU6.3/Ironwood), v5 = 05000080, v4 = 04000080.
+    // v6 keeps the v5 common-header layout (version, version_group_id,
+    // consensus_branch_id, lock_time, expiry) and ZIP-244-style digests, so it
+    // shares the v5 injection path.
+    // v6 never reaches here — it is dispatched to inject_v6_via_zebra above.
     let is_v5 = data[0..4] == [0x05, 0x00, 0x00, 0x80];
     let is_v4 = data[0..4] == [0x04, 0x00, 0x00, 0x80];
 
@@ -425,4 +438,92 @@ mod tests {
         bc.reverse(); // internal → RPC
         assert_eq!(hex::encode(bc), expected_blockcommitments_rpc);
     }
+}
+
+/// v6 injection via zebra-chain: append `tag` to the coinbase input's data,
+/// re-serialize, and let zebra-chain compute the consensus auth digest.
+fn inject_v6_via_zebra(
+    data: &[u8],
+    tag: &[u8],
+    chain_history_root_hex: &str,
+    tx_auth_digests: &[String],
+) -> Result<InjectionResult, String> {
+    use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
+    use zebra_chain::transaction::{AuthDigest, Transaction};
+
+    let mut tx = Transaction::zcash_deserialize(data)
+        .map_err(|e| format!("zebra-chain failed to parse v6 coinbase: {e}"))?;
+
+    {
+        let inputs = match &mut tx {
+            Transaction::V6 { inputs, .. } => inputs,
+            _ => return Err("expected a V6 transaction".into()),
+        };
+        match inputs.first_mut() {
+            Some(zebra_chain::transparent::Input::Coinbase { data, .. }) => {
+                if data.len() + tag.len() > MAX_SCRIPT_SIG_LEN - 6 {
+                    return Err(format!(
+                        "coinbase data would exceed limit: {} + {}",
+                        data.len(),
+                        tag.len()
+                    ));
+                }
+                data.extend_from_slice(tag);
+            }
+            _ => return Err("first input is not a coinbase input".into()),
+        }
+    }
+
+    let new_data = tx
+        .zcash_serialize_to_vec()
+        .map_err(|e| format!("re-serialize failed: {e}"))?;
+
+    // AuthDigest's tuple holds internal byte order, matching our merkle leaves.
+    let coinbase_auth = AuthDigest::from(&tx).0;
+
+    let block_commitments =
+        block_commitments_from_auth(coinbase_auth, tx_auth_digests, chain_history_root_hex)?;
+
+    Ok(InjectionResult {
+        new_coinbase_hex: hex::encode(&new_data),
+        new_txid: None,
+        new_block_commitments: Some(block_commitments),
+    })
+}
+
+/// hashBlockCommitments (RPC byte order) from a coinbase auth digest
+/// (internal order) + the template's other-tx auth digests and history root.
+fn block_commitments_from_auth(
+    coinbase_auth: [u8; 32],
+    tx_auth_digests: &[String],
+    chain_history_root_hex: &str,
+) -> Result<String, String> {
+    let mut leaves = Vec::with_capacity(1 + tx_auth_digests.len());
+    leaves.push(coinbase_auth);
+    for (i, ad_hex) in tx_auth_digests.iter().enumerate() {
+        let ad_bytes =
+            hex::decode(ad_hex).map_err(|e| format!("Invalid authdigest hex for tx {i}: {e}"))?;
+        if ad_bytes.len() != 32 {
+            return Err(format!("authdigest for tx {i} is {} bytes", ad_bytes.len()));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&ad_bytes);
+        arr.reverse(); // RPC order -> internal order
+        leaves.push(arr);
+    }
+    let auth_data_root = auth_data_merkle_root(&leaves);
+
+    let mut chain_history_root = hex::decode(chain_history_root_hex)
+        .map_err(|e| format!("Invalid chain_history_root hex: {e}"))?;
+    if chain_history_root.len() != 32 {
+        return Err("chain_history_root must be 32 bytes".into());
+    }
+    chain_history_root.reverse();
+
+    let mut commit_input = [0u8; 96];
+    commit_input[..32].copy_from_slice(&chain_history_root);
+    commit_input[32..64].copy_from_slice(&auth_data_root);
+    let mut block_commitments = blake2b_256(b"ZcashBlockCommit", &commit_input);
+    block_commitments.reverse();
+    Ok(hex::encode(block_commitments))
 }

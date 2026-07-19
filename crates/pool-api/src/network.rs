@@ -60,6 +60,8 @@ pub struct NetworkBlock {
     pub coinbase_hex: String,
     pub coinbase_tx_version: i32,
     pub is_zebrad: bool,
+    /// The zebra-family marker in this coinbase: "🦓", "🌸", or "".
+    pub marker: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -72,6 +74,8 @@ pub struct MinerDistribution {
     pub is_our_pool: bool,
     pub zebrad_count: u64,
     pub dominant_tx_version: i32,
+    /// Most common zebra-family marker among this miner's blocks: "🦓", "🌸", or "".
+    pub dominant_marker: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -87,11 +91,37 @@ pub struct NetworkMiningStats {
 }
 
 fn hex_to_ascii_lossy(hex: &str) -> String {
-    hex::decode(hex)
-        .unwrap_or_default()
-        .iter()
-        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
-        .collect()
+    // UTF-8-aware: renders multibyte sequences like the 🦓/🌸 coinbase markers,
+    // keeps printable ASCII (so substring pool detection still works), and
+    // shows '.' for other bytes (height push, opcodes, binary).
+    let bytes = hex::decode(hex).unwrap_or_default();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_graphic() || b == b' ' {
+            out.push(b as char);
+            i += 1;
+        } else if b >= 0xc2 {
+            // candidate UTF-8 multibyte lead; take the longest valid sequence
+            let max_len = if b >= 0xf0 { 4 } else if b >= 0xe0 { 3 } else { 2 };
+            let end = (i + max_len).min(bytes.len());
+            match std::str::from_utf8(&bytes[i..end]) {
+                Ok(s) if s.chars().next().is_some_and(|c| !c.is_control()) => {
+                    out.push_str(s);
+                    i = end;
+                }
+                _ => {
+                    out.push('.');
+                    i += 1;
+                }
+            }
+        } else {
+            out.push('.');
+            i += 1;
+        }
+    }
+    out
 }
 
 fn truncate_address(addr: &str) -> String {
@@ -141,9 +171,18 @@ fn identify_pool(miner_address: &str, coinbase_text: &str) -> Option<String> {
     None
 }
 
-/// Detect zebrad by checking for the 🦓 emoji bytes (f09fa693) in coinbase hex.
-fn is_zebrad_block(coinbase_hex: &str) -> bool {
-    coinbase_hex.contains("f09fa693")
+/// The zebra-family marker emoji carried by this coinbase: 🦓 (f09fa693,
+/// upstream Zebra), 🌸 (f09f8cb8, the valargroup ironwood/zakura fork), or
+/// both. Empty if the block wasn't built by a zebra node.
+fn zebra_marker(coinbase_hex: &str) -> String {
+    let mut m = String::new();
+    if coinbase_hex.contains("f09fa693") {
+        m.push('🦓');
+    }
+    if coinbase_hex.contains("f09f8cb8") {
+        m.push('🌸');
+    }
+    m
 }
 
 /// Extract coinbase info from a block JSON (verbosity=2, full tx objects inline).
@@ -289,7 +328,11 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             identify_pool(&miner_address, &coinbase_text)
         };
         let miner_label = pool_name.clone().unwrap_or_else(|| truncate_address(&miner_address));
-        let is_zebrad = is_zebrad_block(&coinbase_hex);
+        let marker = zebra_marker(&coinbase_hex);
+        let is_zebrad = !marker.is_empty();
+        // The marker emoji is shown as the node badge next to the miner label;
+        // strip it from the coinbase text column so it isn't displayed twice.
+        let coinbase_text = coinbase_text.replace('🦓', "").replace('🌸', "");
 
         blocks.push(NetworkBlock {
             height: *height,
@@ -304,25 +347,30 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             coinbase_hex,
             coinbase_tx_version,
             is_zebrad,
+            marker,
         });
     }
 
     // Build distribution.
-    // Track (block_count, zebrad_count, tx_version_counts) per address.
-    let mut addr_stats: std::collections::HashMap<String, (u64, u64, std::collections::HashMap<i32, u64>)> = std::collections::HashMap::new();
+    // Track (block_count, zebrad_count, tx_version_counts, marker_counts) per address.
+    #[allow(clippy::type_complexity)]
+    let mut addr_stats: std::collections::HashMap<String, (u64, u64, std::collections::HashMap<i32, u64>, std::collections::HashMap<String, u64>)> = std::collections::HashMap::new();
     for b in &blocks {
-        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0, std::collections::HashMap::new()));
+        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0, std::collections::HashMap::new(), std::collections::HashMap::new()));
         entry.0 += 1;
         if b.is_zebrad {
             entry.1 += 1;
         }
         *entry.2.entry(b.coinbase_tx_version).or_insert(0) += 1;
+        if !b.marker.is_empty() {
+            *entry.3.entry(b.marker.clone()).or_insert(0) += 1;
+        }
     }
 
     let total = blocks.len() as f64;
     let mut distribution: Vec<MinerDistribution> = addr_stats
         .into_iter()
-        .map(|(addr, (count, zcount, ver_counts))| {
+        .map(|(addr, (count, zcount, ver_counts, marker_counts))| {
             let is_our_pool = !our_mining_address.is_empty() && addr == our_mining_address;
             let pool_name = if is_our_pool {
                 Some("Our Pool".to_string())
@@ -335,6 +383,10 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
                 .max_by_key(|&(_, c)| c)
                 .map(|(v, _)| v)
                 .unwrap_or(0);
+            let dominant_marker = marker_counts.into_iter()
+                .max_by_key(|&(_, c)| c)
+                .map(|(m, _)| m)
+                .unwrap_or_default();
             MinerDistribution {
                 label,
                 address: addr,
@@ -348,6 +400,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
                 is_our_pool,
                 zebrad_count: zcount,
                 dominant_tx_version,
+                dominant_marker,
             }
         })
         .collect();
@@ -805,8 +858,13 @@ function formatTime(ts) {
     return d.toLocaleString();
 }
 
-function nodeBadge(txVersion, isZebrad) {
-    if (isZebrad) return '<span class="node-badge zebrad" title="\u{1F993} Running ZebraD!">v' + txVersion + ' \u{1F993}</span>';
+function nodeBadge(txVersion, marker) {
+    if (marker) {
+        const title = marker.includes('\u{1F338}')
+            ? '\u{1F338} Running Zakura (Ironwood Zebra)!'
+            : '\u{1F993} Running ZebraD!';
+        return '<span class="node-badge zebrad" title="' + title + '">v' + txVersion + ' ' + marker + '</span>';
+    }
     if (txVersion === 5) return '<span class="node-badge v5" title="Running zcashd v5+ (Orchard-capable)">v5</span>';
     if (txVersion === 4) return '<span class="node-badge v4" title="Running old zcashd v4 (not Orchard-compatible)">v4</span>';
     if (txVersion > 0) return '<span class="node-badge v4" title="Transaction version ' + txVersion + '">v' + txVersion + '</span>';
@@ -849,7 +907,7 @@ async function fetchData() {
         } else {
             distBody.innerHTML = data.distribution.map(d => {
                 const cls = d.is_our_pool ? ' class="our-pool"' : '';
-                const badge = nodeBadge(d.dominant_tx_version, d.zebrad_count > 0);
+                const badge = nodeBadge(d.dominant_tx_version, d.dominant_marker);
                 return '<tr' + cls + '>' +
                     '<td title="' + d.address + '">' + d.label + badge + '</td>' +
                     '<td>' + d.block_count + '</td>' +
@@ -916,7 +974,7 @@ async function fetchData() {
                 const cls = b.is_our_pool ? ' class="our-pool"' : '';
                 const hashShort = b.hash.substring(0, 16) + '...';
                 const cbShort = b.coinbase_text.length > 40 ? b.coinbase_text.substring(0, 40) + '...' : b.coinbase_text;
-                const badge = nodeBadge(b.coinbase_tx_version, b.is_zebrad);
+                const badge = nodeBadge(b.coinbase_tx_version, b.marker);
                 return '<tr' + cls + '>' +
                     '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#e0e0e0;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
                     '<td title="' + b.hash + '">' + hashShort + '</td>' +
