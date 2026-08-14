@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+/// An operator-defined miner-address -> pool-name override for the Network tab.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolLabel {
+    pub address: String,
+    pub name: String,
+    pub note: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerDiagnostics {
     pub id: i64,

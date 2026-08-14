@@ -112,7 +112,16 @@ fn truncate_address(addr: &str) -> String {
 /// so historical blocks stay labeled. Evidence per entry is noted inline —
 /// pools that tag their coinbase are also caught by the text fallback below,
 /// but address entries keep labels distinct (e.g. Solo vs regular).
-fn identify_pool(miner_address: &str, coinbase_text: &str) -> Option<String> {
+fn identify_pool(
+    miner_address: &str,
+    coinbase_text: &str,
+    overrides: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    // Operator-defined overrides (admin Labels tab) win over everything else,
+    // so a newly-spotted miner can be named without a code change or restart.
+    if let Some(name) = overrides.get(miner_address) {
+        return Some(name.clone());
+    }
     // Address-based lookup
     let name = match miner_address {
         "t1K79TgQbqu74d6rBmsMu2oFEXEwAmdYiT7" => Some("ViaBTC"),
@@ -144,6 +153,14 @@ fn identify_pool(miner_address: &str, coinbase_text: &str) -> Option<String> {
         "t1SqwRAAdSig6dE4EBPLonAait219VmkUjP" => Some("Foundry"),
         // NiceHash solo — self-tagged "/NiceHash/" in coinbase.
         "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow" => Some("NiceHash"),
+        // Mining-Dutch — untagged coinbase, but runs a Zakura node (🌸
+        // f09f8cb8 marker, first seen on our network tab July 2026). Inferred,
+        // not self-tagged: on 2026-07-17 this address's most-recent block
+        // (height 3415457) matched Mining-Dutch's last-found block reported on
+        // miningpoolstats.stream/zcash exactly — and a height has a single
+        // winner — while their listed share (~0.6%, 222 workers, ~62 MSol/s)
+        // tracks this address's block rate (~8 zakura blocks/24h).
+        "t1cQA9Rxn31tqHcgZzydrpDjgsQGmjpBgpB" => Some("Mining-Dutch"),
         // Still unidentified as of July 2026 (untagged, coinbase shielded
         // immediately; no public block lists to cross-reference):
         //   t1XQZdZMnzXBcL8yx2PR27dSNrqctgwLgux (~6%, active since ≥Aug 2025)
@@ -306,6 +323,11 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     // Sort by height descending.
     raw_blocks.sort_by(|a, b| b.0.cmp(&a.0));
 
+    // Operator-defined address->pool-name overrides (admin Labels tab). Loaded
+    // live per fetch so edits apply within the network cache window without a
+    // restart; non-fatal — on any DB error we fall back to the built-in map.
+    let label_overrides = state.db.get_pool_label_map().await.unwrap_or_default();
+
     // Extract block info, filtering by cutoff time.
     let mut blocks = Vec::with_capacity(raw_blocks.len());
     for (height, block_data) in &raw_blocks {
@@ -325,7 +347,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
         let pool_name = if is_our_pool {
             Some("Our Pool".to_string())
         } else {
-            identify_pool(&miner_address, &coinbase_text)
+            identify_pool(&miner_address, &coinbase_text, &label_overrides)
         };
         let miner_label = pool_name.clone().unwrap_or_else(|| truncate_address(&miner_address));
         let is_zebrad = is_zebrad_block(&coinbase_hex);

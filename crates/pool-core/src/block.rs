@@ -20,21 +20,10 @@ impl BlockAssembler {
             "Submitting solved block to network"
         );
 
-        // First try proposal mode for detailed validation
-        match self.rpc.validate_block_proposal(block_hex).await {
-            Ok(result) => {
-                if let Some(reject) = &result {
-                    warn!(reason = %reject, "Block proposal rejected (pre-check)");
-                } else {
-                    info!("Block proposal validated OK");
-                }
-            }
-            Err(e) => {
-                // Proposal mode may not be supported; log and continue
-                warn!(error = %e, "Block proposal validation failed (may not be supported)");
-            }
-        }
-
+        // Audit #16: the proposal-mode pre-validation that used to run here
+        // added a full node round-trip INSIDE the orphan window on every won
+        // block, its result was ignored (we submitted regardless), and its
+        // failure warn was misleading noise. submitblock validates for real.
         match self.rpc.submit_block(block_hex).await {
             Ok(result) => {
                 if let Some(reject_reason) = result {

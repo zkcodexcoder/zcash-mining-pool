@@ -426,3 +426,219 @@ async fn test_invariant_subtracts_costs_recovered() {
     // With fee 0 the invariant balances exactly: reward - balances - clawbacks = 0.
     assert_eq!(reward - balances - clawbacks, 0);
 }
+
+// ===== Audit #15: block-found durability =====
+
+#[tokio::test]
+async fn test_block_submission_breadcrumb_lifecycle() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1bc").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+
+    let id = db
+        .record_block_submission(700, "beefcrumb", w.id, 125_000_000, Some(125_100_000))
+        .await
+        .unwrap();
+    let open = db.get_open_block_submissions().await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].0, id);
+    assert_eq!(open[0].1, 700);
+    assert_eq!(open[0].5, Some(125_100_000));
+
+    db.resolve_block_submission(id, "recorded").await.unwrap();
+    assert!(db.get_open_block_submissions().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_missing_credits_query_finds_undistributed_block() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1mc").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+    let block_id = db
+        .record_block(701, "feedmc", 125_000_000, Some(125_200_000), w.id, None)
+        .await
+        .unwrap();
+
+    // Recorded but never distributed -> the sweep must find it.
+    let missing = db.get_recent_blocks_missing_credits(7).await.unwrap();
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].0, block_id);
+    assert_eq!(missing[0].2, 125_200_000, "basis = actual_reward");
+    assert_eq!(missing[0].3, w.id, "found_by worker for solo mode");
+
+    // Once distributed, it drops out.
+    db.distribute_block_credits(block_id, &[(m.id, 125_200_000)])
+        .await
+        .unwrap();
+    assert!(db.get_recent_blocks_missing_credits(7).await.unwrap().is_empty());
+}
+
+// ===== Audit #14: atomic orphan_block =====
+
+#[tokio::test]
+async fn test_orphan_block_atomic_precise() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1ob").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+    let block_id = db
+        .record_block(600, "feedob", 125_000_000, None, w.id, None)
+        .await
+        .unwrap();
+    db.distribute_block_credits(block_id, &[(m.id, 125_000_000)])
+        .await
+        .unwrap();
+
+    let outcome = db.orphan_block(block_id, 125_000_000).await.unwrap();
+    assert_eq!(outcome, Some((125_000_000, 0)));
+    // Status and reversal landed together.
+    let blocks = db.get_recent_blocks(5).await.unwrap();
+    let b = blocks.iter().find(|b| b.id == block_id).unwrap();
+    assert_eq!(b.status, "orphaned");
+    assert_eq!(db.get_or_create_balance(m.id).await.unwrap().pending, 0);
+}
+
+#[tokio::test]
+async fn test_orphan_block_legacy_fallback_pre008() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1obl").await.unwrap();
+    let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+    // Pre-008 shape: block exists, credits were applied to pending but NO
+    // block_credits rows.
+    let block_id = db
+        .record_block(601, "feedobl", 100_000_000, None, w.id, None)
+        .await
+        .unwrap();
+    db.credit_balance(m.id, 100_000_000).await.unwrap();
+
+    let outcome = db.orphan_block(block_id, 100_000_000).await.unwrap();
+    assert_eq!(outcome, None, "no credit rows -> legacy fallback");
+    let blocks = db.get_recent_blocks(5).await.unwrap();
+    let b = blocks.iter().find(|b| b.id == block_id).unwrap();
+    assert_eq!(b.status, "orphaned");
+    assert_eq!(
+        db.get_or_create_balance(m.id).await.unwrap().pending,
+        0,
+        "legacy proportional reversal ran inside the same tx"
+    );
+}
+
+// ===== Round-3 pre-debit payout saga tests =====
+
+async fn paying_of(db: &PoolDb, miner_id: i64) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT paying FROM balances WHERE miner_id = ?1")
+        .bind(miner_id)
+        .fetch_one(db.inner())
+        .await
+        .unwrap();
+    row.0
+}
+
+async fn payouts_count(db: &PoolDb) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM payouts")
+        .fetch_one(db.inner())
+        .await
+        .unwrap();
+    row.0
+}
+
+#[tokio::test]
+async fn test_reserve_then_confirm_moves_pending_to_paid() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1sc").await.unwrap();
+    db.credit_balance(m.id, 100_000_000).await.unwrap();
+    let attempt = db.create_payout_attempt(1, 60_000_000, "test").await.unwrap();
+
+    let reserved = db.reserve_payout(attempt, &[(m.id, 60_000_000)]).await.unwrap();
+    assert_eq!(reserved, vec![(m.id, 60_000_000)]);
+    // pending debited BEFORE any send; funds now sit in `paying`, not payable.
+    assert_eq!(db.get_or_create_balance(m.id).await.unwrap().pending, 40_000_000);
+    assert_eq!(paying_of(&db, m.id).await, 60_000_000);
+    assert_eq!(payouts_count(&db).await, 0);
+
+    let n = db.confirm_payout(attempt, "txconfirm").await.unwrap();
+    assert_eq!(n, 1);
+    let b = db.get_or_create_balance(m.id).await.unwrap();
+    assert_eq!(b.pending, 40_000_000);
+    assert_eq!(b.paid, 60_000_000);
+    assert_eq!(paying_of(&db, m.id).await, 0);
+    assert_eq!(payouts_count(&db).await, 1);
+    // Conserved across the whole saga: pending + paying + paid == original credit.
+    assert_eq!(b.pending + paying_of(&db, m.id).await + b.paid, 100_000_000);
+}
+
+#[tokio::test]
+async fn test_reserve_then_refund_returns_to_pending() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1sr").await.unwrap();
+    db.credit_balance(m.id, 100_000_000).await.unwrap();
+    let attempt = db.create_payout_attempt(1, 60_000_000, "test").await.unwrap();
+
+    db.reserve_payout(attempt, &[(m.id, 60_000_000)]).await.unwrap();
+    assert_eq!(paying_of(&db, m.id).await, 60_000_000);
+
+    let n = db.refund_payout(attempt).await.unwrap();
+    assert_eq!(n, 1);
+    let b = db.get_or_create_balance(m.id).await.unwrap();
+    assert_eq!(b.pending, 100_000_000, "funds returned to pending on refund");
+    assert_eq!(b.paid, 0);
+    assert_eq!(paying_of(&db, m.id).await, 0);
+    assert_eq!(payouts_count(&db).await, 0, "a refunded attempt records no payment");
+}
+
+#[tokio::test]
+async fn test_reserve_skips_insufficient_and_partial_batch() {
+    let db = setup_db().await;
+    let rich = db.get_or_create_miner("utest1rich").await.unwrap();
+    let poor = db.get_or_create_miner("utest1poor").await.unwrap();
+    db.credit_balance(rich.id, 100_000_000).await.unwrap();
+    db.credit_balance(poor.id, 10_000_000).await.unwrap();
+    let attempt = db.create_payout_attempt(2, 130_000_000, "test").await.unwrap();
+
+    // poor's pending (10M) can't cover 60M -> skipped; rich is reserved.
+    let reserved = db
+        .reserve_payout(attempt, &[(rich.id, 60_000_000), (poor.id, 60_000_000)])
+        .await
+        .unwrap();
+    assert_eq!(reserved, vec![(rich.id, 60_000_000)]);
+    assert_eq!(paying_of(&db, rich.id).await, 60_000_000);
+    assert_eq!(paying_of(&db, poor.id).await, 0);
+    assert_eq!(
+        db.get_or_create_balance(poor.id).await.unwrap().pending,
+        10_000_000,
+        "skipped miner keeps full pending"
+    );
+}
+
+#[tokio::test]
+async fn test_confirm_is_idempotent() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1idem").await.unwrap();
+    db.credit_balance(m.id, 100_000_000).await.unwrap();
+    let attempt = db.create_payout_attempt(1, 60_000_000, "test").await.unwrap();
+    db.reserve_payout(attempt, &[(m.id, 60_000_000)]).await.unwrap();
+
+    assert_eq!(db.confirm_payout(attempt, "txid1").await.unwrap(), 1);
+    // A second confirm (startup reconciliation racing the loop) must be a no-op.
+    assert_eq!(db.confirm_payout(attempt, "txid1").await.unwrap(), 0);
+    let b = db.get_or_create_balance(m.id).await.unwrap();
+    assert_eq!(b.paid, 60_000_000, "no double credit to paid");
+    assert_eq!(payouts_count(&db).await, 1, "no duplicate payout row");
+}
+
+#[tokio::test]
+async fn test_get_reserved_attempts_lifecycle() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1ra").await.unwrap();
+    db.credit_balance(m.id, 100_000_000).await.unwrap();
+    let attempt = db.create_payout_attempt(1, 60_000_000, "test").await.unwrap();
+    db.reserve_payout(attempt, &[(m.id, 60_000_000)]).await.unwrap();
+
+    let reserved = db.get_reserved_attempts(None).await.unwrap();
+    assert_eq!(reserved.len(), 1);
+    assert_eq!(reserved[0].0, attempt);
+    assert_eq!(reserved[0].4, 60_000_000, "total reserved reported");
+
+    // Once confirmed, the attempt no longer holds reserved items.
+    db.confirm_payout(attempt, "txid1").await.unwrap();
+    assert!(db.get_reserved_attempts(None).await.unwrap().is_empty());
+}

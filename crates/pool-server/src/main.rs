@@ -245,16 +245,35 @@ async fn main() -> Result<()> {
         "Configuration loaded"
     );
 
-    // Initialize database
+    // Initialize database. busy_timeout lets a writer WAIT for the WAL lock
+    // instead of instantly failing with SQLITE_BUSY — the exact failure that
+    // silently dropped block 90's reward distribution. synchronous=NORMAL is the
+    // standard safe+fast setting for a WAL pool. Set per-connection via options
+    // so every pooled connection inherits them.
+    let db_opts: sqlx::sqlite::SqliteConnectOptions = config
+        .database
+        .url
+        .parse()
+        .with_context(|| "Invalid database url")?;
+    let db_opts = db_opts
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(20));
     let db_pool = SqlitePoolOptions::new()
         .max_connections(10)
-        .connect(&config.database.url)
+        .connect_with(db_opts)
         .await
         .with_context(|| "Failed to connect to database")?;
     let db = PoolDb::new(db_pool);
     db.run_migrations()
         .await
         .with_context(|| "Failed to run migrations")?;
+    // Audit #16: refuse to start on a schema hole — migrations run
+    // best-effort, so a partially-applied one must fail LOUD here, not
+    // corrupt the money path later.
+    db.assert_critical_schema()
+        .await
+        .with_context(|| "Critical schema verification failed — refusing to start")?;
     db.set_wal_mode()
         .await
         .with_context(|| "Failed to enable WAL mode")?;
@@ -465,6 +484,11 @@ async fn main() -> Result<()> {
         Arc::clone(&rejects_duplicate),
         Arc::clone(&rejects_other),
     );
+
+    // Audit #15: settle any block whose fate a previous crash left unknown,
+    // and redistribute recent blocks whose distribution was swallowed —
+    // BEFORE serving miners, so recovery isn't racing live traffic.
+    share_validator.startup_block_sweep().await;
 
     // Write pool_started_at once, then update live stats every 5s into pool_status
     // so the standalone dashboard binary can read them.
