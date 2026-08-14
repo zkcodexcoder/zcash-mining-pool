@@ -1,6 +1,6 @@
 use axum::extract::State;
 use axum::response::{Html, Json};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
@@ -22,7 +22,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/pending-payouts", get(get_pending_payouts_list))
         .route("/api/zallet/status", get(get_zallet_status))
         .route("/api/blocks/immature", get(get_immature_blocks))
-        .route("/api/payout/trigger", post(trigger_payout))
+        // SECURITY: the public payout trigger was removed. Triggering a payout
+        // runs the full z_sendmany money pipeline (shield, real payments,
+        // orphan reversal) and had a TOCTOU double-pay window; it must be
+        // authenticated. Use the admin-gated /admin/api/payout/trigger instead.
         .route("/api/pool/stats/history", get(get_stats_history))
         .route("/api/network/blocks", get(network::get_network_blocks))
         .route("/health", get(get_health))

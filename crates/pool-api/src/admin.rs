@@ -360,6 +360,11 @@ pub fn build_admin_router(state: AdminState) -> Router {
         .route("/admin/api/repair-zallet", post(api_repair_zallet))
         .route("/admin/api/logs", get(api_service_logs))
         .route("/admin/api/miner/adjust", post(api_adjust_balance))
+        .route(
+            "/admin/api/pool-labels",
+            get(api_pool_labels_list).post(api_pool_labels_upsert),
+        )
+        .route("/admin/api/pool-labels/delete", post(api_pool_labels_delete))
         .route("/admin/logout", post(handle_logout))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone());
@@ -1028,6 +1033,70 @@ async fn api_adjust_balance(
     }
 }
 
+// --- Pool labels (Network-tab address -> pool-name overrides) ---
+
+async fn api_pool_labels_list(
+    State(state): State<AdminState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.app.db.list_pool_labels().await {
+        Ok(labels) => (StatusCode::OK, Json(serde_json::json!({ "labels": labels }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("DB error: {e}")})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct PoolLabelRequest {
+    address: String,
+    name: String,
+    #[serde(default)]
+    note: String,
+}
+
+async fn api_pool_labels_upsert(
+    State(state): State<AdminState>,
+    Json(req): Json<PoolLabelRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let address = req.address.trim();
+    let name = req.name.trim();
+    if address.is_empty() || name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "address and name are required"})),
+        );
+    }
+    match state.app.db.upsert_pool_label(address, name, req.note.trim()).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "address": address, "name": name})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("DB error: {e}")})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct PoolLabelDeleteRequest {
+    address: String,
+}
+
+async fn api_pool_labels_delete(
+    State(state): State<AdminState>,
+    Json(req): Json<PoolLabelDeleteRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.app.db.delete_pool_label(req.address.trim()).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("DB error: {e}")})),
+        ),
+    }
+}
+
 // --- HTML ---
 
 const OPS_LOGIN_HTML: &str = r##"<!DOCTYPE html>
@@ -1225,6 +1294,7 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
     <div class="tab" data-tab="payouts">Payouts</div>
     <div class="tab" data-tab="miners">Miners</div>
     <div class="tab" data-tab="health">Health</div>
+    <div class="tab" data-tab="labels">Labels</div>
 </div>
 <div class="container">
 
@@ -1321,6 +1391,30 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
     </div>
 </div>
 
+<div class="panel" id="panel-labels">
+    <div class="card">
+        <h2>Pool Labels</h2>
+        <p style="font-size:0.85rem;color:#718096;margin-bottom:1rem">Map a miner payout address to a pool name shown on the Network tab. Changes apply live within the Network tab's cache window (about 1-5 min) &mdash; no restart. Built-in labels remain the fallback for any address not listed here.</p>
+        <div style="display:flex;gap:0.6rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:1rem">
+            <div style="flex:2;min-width:280px">
+                <label style="display:block;font-size:0.75rem;color:#718096;margin-bottom:0.25rem">Payout address</label>
+                <input id="label-address" type="text" placeholder="t1..." style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#e0e0e0;font-family:monospace;font-size:0.8rem">
+            </div>
+            <div style="flex:1;min-width:140px">
+                <label style="display:block;font-size:0.75rem;color:#718096;margin-bottom:0.25rem">Pool name</label>
+                <input id="label-name" type="text" placeholder="Mining-Dutch" style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#e0e0e0;font-size:0.85rem">
+            </div>
+            <div style="flex:1;min-width:140px">
+                <label style="display:block;font-size:0.75rem;color:#718096;margin-bottom:0.25rem">Note (optional)</label>
+                <input id="label-note" type="text" placeholder="evidence / source" style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#e0e0e0;font-size:0.85rem">
+            </div>
+            <button class="btn btn-primary" onclick="saveLabel()">Save</button>
+        </div>
+        <div id="label-status" class="status-msg"></div>
+        <div id="labels-content" class="loading">Loading...</div>
+    </div>
+</div>
+
 </div>
 <script>
 // Tab switching
@@ -1354,6 +1448,87 @@ function refreshTab(tab) {
     else if (tab === 'payouts') { fetchWalletBal(); fetchImmature(); }
     else if (tab === 'miners') fetchMiners();
     else if (tab === 'health') fetchHealth();
+    else if (tab === 'labels') fetchLabels();
+}
+
+function labelStatus(msg, ok) {
+    const el = document.getElementById('label-status');
+    if (el) { el.textContent = msg; el.style.color = ok ? '#68d391' : '#fc8181'; }
+}
+
+async function fetchLabels() {
+    const box = document.getElementById('labels-content');
+    try {
+        const d = await fetchJson('/admin/api/pool-labels');
+        if (!d) return;
+        const labels = d.labels || [];
+        if (!labels.length) {
+            box.innerHTML = '<span style="color:#718096">No custom labels yet. Built-in labels still apply.</span>';
+            return;
+        }
+        let html = '<table class="kv-table" style="width:100%"><tr><th style="text-align:left">Pool name</th><th style="text-align:left">Address</th><th style="text-align:left">Note</th><th style="text-align:left">Updated</th><th></th></tr>';
+        for (const l of labels) {
+            html += '<tr>' +
+                '<td>' + esc(l.name) + '</td>' +
+                '<td style="font-family:monospace;font-size:0.75rem">' + esc(l.address) + '</td>' +
+                '<td style="color:#718096;font-size:0.8rem">' + esc(l.note || '') + '</td>' +
+                '<td style="color:#718096;font-size:0.75rem">' + esc(l.updated_at || '') + '</td>' +
+                '<td><button class="btn btn-danger btn-sm" onclick="deleteLabel(\'' + esc(l.address) + '\')">Remove</button></td>' +
+                '</tr>';
+        }
+        html += '</table>';
+        box.innerHTML = html;
+    } catch (e) {
+        box.innerHTML = '<span style="color:#fc8181">Failed to load: ' + e + '</span>';
+    }
+}
+
+function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function saveLabel() {
+    const address = (document.getElementById('label-address').value || '').trim();
+    const name = (document.getElementById('label-name').value || '').trim();
+    const note = (document.getElementById('label-note').value || '').trim();
+    if (!address || !name) { labelStatus('Address and pool name are required.', false); return; }
+    labelStatus('Saving...', true);
+    try {
+        const r = await fetch('/admin/api/pool-labels', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ address, name, note }),
+        });
+        const d = await r.json().catch(() => null);
+        if (r.ok) {
+            labelStatus('Saved ' + name + '.', true);
+            document.getElementById('label-address').value = '';
+            document.getElementById('label-name').value = '';
+            document.getElementById('label-note').value = '';
+            fetchLabels();
+        } else {
+            labelStatus('Error: ' + ((d && d.error) || r.status), false);
+        }
+    } catch (e) {
+        labelStatus('Request failed: ' + e, false);
+    }
+}
+
+async function deleteLabel(address) {
+    if (!confirm('Remove label for ' + address + '?')) return;
+    labelStatus('Removing...', true);
+    try {
+        const r = await fetch('/admin/api/pool-labels/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ address }),
+        });
+        const d = await r.json().catch(() => null);
+        if (r.ok) { labelStatus('Removed.', true); fetchLabels(); }
+        else { labelStatus('Error: ' + ((d && d.error) || r.status), false); }
+    } catch (e) {
+        labelStatus('Request failed: ' + e, false);
+    }
 }
 
 async function fetchConfig() {
@@ -1537,14 +1712,14 @@ function renderMiners(miners) {
         const ls = m.last_seen || 'never';
         html += '<tr>' +
             '<td>' + m.id + '</td>' +
-            '<td title="' + m.address + '" class="addr">' + short + '</td>' +
+            '<td title="' + esc(m.address) + '" class="addr">' + esc(short) + '</td>' +
             '<td class="gold">' + m.pending_zec.toFixed(4) + '</td>' +
             '<td>' + m.paid_zec.toFixed(4) + '</td>' +
             '<td>' + m.share_count + '</td>' +
             '<td>' + m.worker_count + '</td>' +
             '<td>' + ls + '</td>' +
             '<td><input class="adjust-input" type="number" step="0.0001" id="adj-' + m.id + '" placeholder="' + coinUnit + '">' +
-            ' <button class="btn btn-sm btn-primary" onclick="adjustBalance(\'' + m.address + '\',' + m.id + ')">Set</button></td>' +
+            ' <button class="btn btn-sm btn-primary" onclick="adjustBalance(\'' + esc(m.address) + '\',' + m.id + ')">Set</button></td>' +
             '</tr>';
     }
     html += '</tbody></table>';
@@ -1604,8 +1779,13 @@ function renderZebraCard(d) {
     // data yet, the badge falls back to "Unknown".
     let dist = null;          // signed gap: positive = we are behind lwd
     let trustable = false;
-    if (at && at.max_height != null && z.verified_height != null && at.responses_ok >= 3) {
-        dist = at.max_height - z.verified_height;
+    // Audit #20 follow-up: prefer the LIVE node height (fetched at request
+    // time) over the metrics-cache verified_height — the metrics scrape now
+    // refreshes every 5 min, so its height can be ~4 blocks stale and showed
+    // phantom "At Tip +4" deltas against the 30s-fresh lwd tip.
+    const ourHeight = (d.node_height != null) ? d.node_height : z.verified_height;
+    if (at && at.max_height != null && ourHeight != null && at.responses_ok >= 3) {
+        dist = at.max_height - ourHeight;
         trustable = true;
     }
     const nowMs = Date.now();
@@ -1639,7 +1819,7 @@ function renderZebraCard(d) {
     }
     html += '<tr><td>At Tip</td><td>' + tipBadge + '</td></tr>';
 
-    html += '<tr><td>Verified Height</td><td class="gold">' + (z.verified_height != null ? z.verified_height.toLocaleString() : '?') + '</td></tr>';
+    html += '<tr><td>Verified Height</td><td class="gold">' + (ourHeight != null ? ourHeight.toLocaleString() : '?') + '</td></tr>';
     if (z.finalized_height != null && z.verified_height != null) {
         const finDelta = z.verified_height - z.finalized_height;
         html += '<tr><td>Finalized Height</td><td>' + z.finalized_height.toLocaleString() + ' <span style="color:#718096">(' + finDelta + ' back)</span></td></tr>';

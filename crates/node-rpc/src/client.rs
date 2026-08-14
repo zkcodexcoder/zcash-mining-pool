@@ -14,6 +14,24 @@ pub enum RpcError {
     JsonRpc(JsonRpcError),
     #[error("Null result from RPC")]
     NullResult,
+    /// The node answered, but the response didn't match our expected schema.
+    /// Carries the body head so the NEXT network-upgrade schema break is
+    /// diagnosable from the log line (audit #16: the NU6.3 template break
+    /// collapsed to an information-free NullResult for a week).
+    #[error("RPC response parse error: {message}; body: {body_snippet}")]
+    Parse { message: String, body_snippet: String },
+}
+
+impl RpcError {
+    /// True only when the node itself authoritatively said "no such
+    /// transaction/item" (JSON-RPC error code -5, RPC_INVALID_ADDRESS_OR_KEY).
+    /// Transport failures (HTTP, timeouts), parse issues, and every other RPC
+    /// error mean "unknown", NOT "doesn't exist" — money-path callers
+    /// (reconciler) must never treat them as proof of absence, or a node
+    /// outage converts live payouts into refunds/failures (double-pay class).
+    pub fn is_definitely_not_found(&self) -> bool {
+        matches!(self, RpcError::JsonRpc(e) if e.code == -5)
+    }
 }
 
 /// Client for communicating with a Zcash node (zcashd or zebrad) via JSON-RPC.
@@ -81,7 +99,10 @@ impl ZcashRpcClient {
         let body = http_resp.text().await?;
 
         let resp: JsonRpcResponse<T> =
-            serde_json::from_str(&body).map_err(|_| RpcError::NullResult)?;
+            serde_json::from_str(&body).map_err(|e| RpcError::Parse {
+                message: e.to_string(),
+                body_snippet: body.chars().take(300).collect(),
+            })?;
 
         if let Some(err) = resp.error {
             return Err(RpcError::JsonRpc(err));
@@ -140,7 +161,10 @@ impl ZcashRpcClient {
         let http_resp = req.send().await?;
         let body = http_resp.text().await?;
         let resp: JsonRpcResponse<T> =
-            serde_json::from_str(&body).map_err(|_| RpcError::NullResult)?;
+            serde_json::from_str(&body).map_err(|e| RpcError::Parse {
+                message: e.to_string(),
+                body_snippet: body.chars().take(300).collect(),
+            })?;
         if let Some(err) = resp.error {
             return Err(RpcError::JsonRpc(err));
         }
@@ -168,7 +192,10 @@ impl ZcashRpcClient {
         tracing::info!(raw_response = %body, "submitblock response");
 
         let parsed: serde_json::Value =
-            serde_json::from_str(&body).map_err(|_| RpcError::NullResult)?;
+            serde_json::from_str(&body).map_err(|e| RpcError::Parse {
+                message: e.to_string(),
+                body_snippet: body.chars().take(300).collect(),
+            })?;
 
         if let Some(err) = parsed.get("error").and_then(|e| {
             if e.is_null() { None } else { Some(e.clone()) }

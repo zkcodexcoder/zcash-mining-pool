@@ -65,9 +65,18 @@ struct GraceTarget {
 /// vardiff up-ramp (~4 early-trigger steps over ~48s with the cooldown)
 /// so in-flight shares straddling any step still get credited.
 const GRACE_TARGET_HISTORY: usize = 8;
+
+/// Per-session bounded history of share fingerprints, for duplicate/replay
+/// rejection. A replayed valid share would otherwise be credited again.
+const SHARE_DEDUP_HISTORY: usize = 1024;
 /// Max age of a grace target before we stop accepting shares for it.
 /// Any miner still submitting at a target older than this is malfunctioning.
 const GRACE_TARGET_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// Audit #15: how often a cached worker's last_seen is bumped. Between
+/// touches, accepted shares cost ONE insert instead of the old five-statement
+/// resolve+touch round-trip.
+const WORKER_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Per-session state: vardiff tracker + current target + rate limiter.
 struct SessionDifficulty {
@@ -93,6 +102,9 @@ struct SessionDifficulty {
     shares_rejected_low_diff: u64,
     shares_rejected_job_not_found: u64,
     shares_rejected_other: u64,
+    /// Bounded fingerprints of recently-seen shares (job+nonce+solution) for
+    /// duplicate/replay rejection. Oldest evicted first.
+    recent_share_fps: std::collections::VecDeque<u64>,
 }
 
 /// A single difficulty adjustment event.
@@ -133,7 +145,7 @@ pub struct SessionSnapshot {
 pub struct ShareValidator {
     db: PoolDb,
     stratum: Arc<StratumServer>,
-    jobs: Arc<RwLock<HashMap<String, MiningJob>>>,
+    jobs: Arc<RwLock<HashMap<String, std::sync::Arc<MiningJob>>>>,
     block_assembler: Arc<BlockAssembler>,
     pplns: Arc<PplnsCalculator>,
     rpc: Arc<ZcashRpcClient>,
@@ -142,6 +154,9 @@ pub struct ShareValidator {
     default_target: [u8; 32],
     /// Per-session difficulty tracking, keyed by session_id.
     session_difficulty: RwLock<HashMap<String, SessionDifficulty>>,
+    /// Audit #15: (session_id, worker_name) -> (miner_id, worker_id, last
+    /// last_seen touch). Avoids 5 DB statements per accepted share.
+    worker_cache: RwLock<HashMap<(String, String), (i64, i64, std::time::Instant)>>,
     vardiff_config: VardiffConfig,
     /// Per-port initial difficulty overrides (port -> difficulty).
     port_difficulty: HashMap<u16, f64>,
@@ -182,7 +197,7 @@ impl ShareValidator {
     pub fn new(
         db: PoolDb,
         stratum: Arc<StratumServer>,
-        jobs: Arc<RwLock<HashMap<String, MiningJob>>>,
+        jobs: Arc<RwLock<HashMap<String, std::sync::Arc<MiningJob>>>>,
         block_assembler: Arc<BlockAssembler>,
         pplns: Arc<PplnsCalculator>,
         pool_target: [u8; 32],
@@ -210,6 +225,7 @@ impl ShareValidator {
             difficulty_multiplier,
             default_target: pool_target,
             session_difficulty: RwLock::new(HashMap::new()),
+            worker_cache: RwLock::new(HashMap::new()),
             vardiff_config,
             port_difficulty,
             latest_notify,
@@ -524,6 +540,7 @@ impl ShareValidator {
                             shares_rejected_low_diff: 0,
                             shares_rejected_job_not_found: 0,
                             shares_rejected_other: 0,
+                            recent_share_fps: std::collections::VecDeque::new(),
                         });
                     }
                     let difficulty = initial_diff.unwrap_or(self.vardiff_config.initial_difficulty);
@@ -718,6 +735,77 @@ impl ShareValidator {
 
     /// Compute luck for the block being found right now.
     /// Returns `Some(luck_percent)` or `None` if data is unavailable.
+    /// Audit #15 startup sweep — run once at pool start, before serving.
+    /// 1) Settles open block_submissions breadcrumbs (crash between submit
+    ///    and record): asks the chain whose block it is; records ours.
+    /// 2) Redistributes recent blocks with ZERO credit rows (the block-90
+    ///    class: recorded but distribution swallowed) — which also covers
+    ///    blocks recovered in step 1.
+    pub async fn startup_block_sweep(&self) {
+        match self.db.get_open_block_submissions().await {
+            Ok(rows) => {
+                for (id, height, hash, worker_id, reward, actual) in rows {
+                    match self
+                        .block_assembler
+                        .verify_block_inclusion(height as u64, &hash)
+                        .await
+                    {
+                        crate::block::InclusionCheck::Verified => {
+                            let recorded = match self.db.get_block_id_by_hash(&hash).await {
+                                Ok(Some(_)) => true,
+                                Ok(None) => match self
+                                    .db
+                                    .record_block(height, &hash, reward, actual, worker_id, None)
+                                    .await
+                                {
+                                    Ok(b) => {
+                                        warn!(
+                                            height,
+                                            block_id = b,
+                                            "SWEEP: recovered a won block lost before recording"
+                                        );
+                                        true
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, height, "SWEEP: failed to record recovered block");
+                                        false
+                                    }
+                                },
+                                Err(e) => {
+                                    error!(error = %e, "SWEEP: block lookup failed");
+                                    false
+                                }
+                            };
+                            if recorded {
+                                let _ = self.db.resolve_block_submission(id, "swept-recorded").await;
+                            }
+                        }
+                        crate::block::InclusionCheck::Mismatch => {
+                            let _ = self.db.resolve_block_submission(id, "swept-rejected").await;
+                            info!(height, "SWEEP: open submission not on best chain — settled as rejected");
+                        }
+                        crate::block::InclusionCheck::Unknown => {
+                            warn!(height, "SWEEP: node unreachable — leaving submission open for next start");
+                        }
+                    }
+                }
+            }
+            Err(e) => error!(error = %e, "SWEEP: open-submissions query failed"),
+        }
+
+        match self.db.get_recent_blocks_missing_credits(7).await {
+            Ok(rows) => {
+                for (block_id, height, basis, worker_id) in rows {
+                    warn!(block_id, height, "SWEEP: block has no credits — redistributing (block-90 class)");
+                    if let Err(e) = self.pplns.distribute(basis, block_id, worker_id).await {
+                        error!(error = %e, block_id, "SWEEP: redistribution failed");
+                    }
+                }
+            }
+            Err(e) => error!(error = %e, "SWEEP: missing-credits query failed"),
+        }
+    }
+
     async fn compute_block_luck(&self) -> Result<Option<f64>, String> {
         let network_hashrate = self.rpc.get_network_sol_ps(Some(120)).await
             .map_err(|e| format!("RPC error: {e}"))?;
@@ -799,12 +887,68 @@ impl ShareValidator {
                     "Bad solution size: {} (expected {})", raw.len(), RAW_SOLUTION_SIZE
                 )));
             }
-            (raw.to_vec(), solution_bytes.clone())
+            // SECURITY: rebuild the header solution canonically from the exact
+            // bytes Equihash validated. Reusing the raw miner input would let an
+            // attacker append trailing garbage (which Equihash never checks) and
+            // grind sha256d over it to forge full-difficulty pool-target shares
+            // at ~1/32D the honest cost.
+            let raw_vec = raw.to_vec();
+            let mut canonical = compact_size(RAW_SOLUTION_SIZE);
+            canonical.extend_from_slice(&raw_vec);
+            (raw_vec, canonical)
         } else {
             return Err(StratumError::other(&format!(
                 "Solution too short: {} bytes", solution_bytes.len()
             )));
         };
+
+        // Reject replays of an identical (job, nonce, solution) before the
+        // expensive Equihash check. Without this a miner can resubmit one valid
+        // share repeatedly, each credited to PPLNS, for k× reward at no extra
+        // hashrate. Fingerprint over the CANONICAL raw solution so padding
+        // variants collapse to the same key.
+        let share_fp = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            job_id.hash(&mut h);
+            nonce.hash(&mut h);
+            raw_solution.hash(&mut h);
+            h.finish()
+        };
+        {
+            let mut sessions = self.session_difficulty.write().await;
+            if let Some(sd) = sessions.get_mut(session_id) {
+                if sd.recent_share_fps.contains(&share_fp) {
+                    return Err(StratumError::duplicate_share());
+                }
+                sd.recent_share_fps.push_back(share_fp);
+                if sd.recent_share_fps.len() > SHARE_DEDUP_HISTORY {
+                    sd.recent_share_fps.pop_front();
+                }
+            }
+        }
+
+        // Audit #16: clamp miner-supplied ntime BEFORE it enters the header.
+        // A miner with a fast clock could otherwise find a "valid" block the
+        // node rejects as time-too-new — forfeiting a real block (~1.25 ZEC).
+        // Window: [template curtime, now + 90s]. Miners echo the job time or
+        // roll it slightly forward; both stay inside.
+        {
+            let miner_time = u32::from_str_radix(time, 16)
+                .map_err(|_| StratumError::other("Invalid ntime hex"))?
+                .swap_bytes();
+            let curtime = job.template.curtime as u32;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(curtime);
+            let max_ok = now.saturating_add(90);
+            if miner_time < curtime || miner_time > max_ok {
+                return Err(StratumError::other(&format!(
+                    "ntime out of range: {miner_time} not in [{curtime}, {max_ok}]"
+                )));
+            }
+        }
 
         // Build the block header input (version + prevhash + merkleroot + reserved + time + bits = 108 bytes)
         let header_input = build_header_input(&job, time)?;
@@ -816,10 +960,6 @@ impl ShareValidator {
             job_id = %job_id,
             "Verifying Equihash"
         );
-
-        // Verify the Equihash solution (n=200, k=9 for Zcash)
-        equihash::is_valid_solution(200, 9, &header_input, &nonce, &raw_solution)
-            .map_err(|e| StratumError::other(&format!("Invalid Equihash solution: {e}")))?;
 
         // Build the full serialized header for hashing AND block submission.
         // Block header = header_input(108) + nonce(32) + solution_with_compactSize(1347)
@@ -869,21 +1009,65 @@ impl ShareValidator {
             }
         };
 
+        // Audit #16: Equihash runs AFTER the cheap sha256d target gate. A
+        // low-difficulty share (the bulk of storm traffic) is rejected above
+        // without paying ~2ms of Equihash verification; every share that can
+        // be credited or become a block is still fully verified here.
+        equihash::is_valid_solution(200, 9, &header_input, &nonce, &raw_solution)
+            .map_err(|e| StratumError::other(&format!("Invalid Equihash solution: {e}")))?;
+
         // Check against the NETWORK target from the block template
         let network_target = parse_target(&job.template.target)
             .map_err(|e| StratumError::other(&format!("Bad network target: {e}")))?;
         let is_block = meets_target(&hash_bytes, &network_target);
 
-        // Parse worker name (format: "address.worker")
-        let miner_address = worker_name.split('.').next().unwrap_or(worker_name);
-        let wname = worker_name.split('.').nth(1).unwrap_or("default");
+        // DIAG (temporary): log achieved hash difficulty vs assigned to watch
+        // the current round. hash_bytes is little-endian (sha256d); reverse to
+        // match meets_target/target_to_difficulty big-endian convention.
+        {
+            let mut rev_hash = hash_bytes;
+            rev_hash.reverse();
+            let achieved_diff = target_to_difficulty(&rev_hash);
+            info!(achieved_diff, assigned_diff = difficulty, is_block, worker = %worker_name, "DIAG_ACH");
+        }
 
-        let miner = self.db.get_or_create_miner(miner_address).await
-            .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
-        let worker = self.db.get_or_create_worker(miner.id, wname).await
-            .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
+        // Resolve (miner_id, worker_id) via the per-session cache (audit #15):
+        // the old path ran get_or_create_miner + get_or_create_worker (5 DB
+        // statements incl. a last_seen UPDATE) on EVERY accepted share.
+        let cache_key = (session_id.to_string(), worker_name.to_string());
+        let cached = {
+            let c = self.worker_cache.read().await;
+            c.get(&cache_key).copied()
+        };
+        let worker_id: i64 = match cached {
+            Some((_m, w, touched)) if touched.elapsed() < WORKER_TOUCH_INTERVAL => w,
+            Some((m, w, _)) => {
+                let _ = self.db.touch_worker(w).await;
+                self.worker_cache
+                    .write()
+                    .await
+                    .insert(cache_key, (m, w, std::time::Instant::now()));
+                w
+            }
+            None => {
+                // Parse worker name (format: "address.worker")
+                let miner_address = worker_name.split('.').next().unwrap_or(worker_name);
+                let wname = worker_name.split('.').nth(1).unwrap_or("default");
+                let miner = self.db.get_or_create_miner(miner_address).await
+                    .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
+                let worker = self.db.get_or_create_worker(miner.id, wname).await
+                    .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
+                let mut c = self.worker_cache.write().await;
+                if c.len() > 4096 {
+                    // Sessions churn slowly; a rare full clear beats unbounded growth.
+                    c.clear();
+                }
+                c.insert(cache_key, (miner.id, worker.id, std::time::Instant::now()));
+                worker.id
+            }
+        };
 
-        self.db.record_share(worker.id, job_id, difficulty, is_block, session_id).await
+        self.db.record_share(worker_id, job_id, difficulty, is_block, session_id).await
             .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
 
         let mut block_height = None;
@@ -900,75 +1084,148 @@ impl ShareValidator {
             match assemble_full_block(&full_header, &job.template) {
                 Ok(full_block) => {
                     let block_hex = hex::encode(&full_block);
-                    // Write block hex to file for debugging
-                    let _ = std::fs::write("last_block.hex", &block_hex);
-                    match self.block_assembler.submit_block(&block_hex).await {
-                        Ok(_) => {
-                            let height = job.template.height as i64;
-                            let reward = compute_block_reward(height);
-                            // Audit P2: actual coinbase value = subsidy + the tx
-                            // fees this job's template collected. BIP22 reports
-                            // the coinbase "fee" as MINUS the collected fees.
-                            // Falls back to tx-fee summation, then to subsidy
-                            // only (recorded as NULL so consumers know).
-                            let collected_fees = job
-                                .template
-                                .coinbasetxn
-                                .as_ref()
-                                .and_then(|cb| cb.fee)
-                                .map(|f| -f)
-                                .unwrap_or_else(|| {
-                                    job.template.transactions.iter().map(|t| t.fee).sum()
-                                })
-                                .max(0);
-                            let actual_reward = Some(reward + collected_fees);
-                            let hash_hex = hex::encode(hash_bytes);
+                    let height = job.template.height as i64;
+                    let reward = compute_block_reward(height);
+                    // Audit P2: actual coinbase value = subsidy + the tx
+                    // fees this job's template collected. BIP22 reports
+                    // the coinbase "fee" as MINUS the collected fees.
+                    // Falls back to tx-fee summation, then to subsidy
+                    // only (recorded as NULL so consumers know).
+                    let collected_fees = job
+                        .template
+                        .coinbasetxn
+                        .as_ref()
+                        .and_then(|cb| cb.fee)
+                        .map(|f| -f)
+                        .unwrap_or_else(|| {
+                            job.template.transactions.iter().map(|t| t.fee).sum()
+                        })
+                        .max(0);
+                    let actual_reward = Some(reward + collected_fees);
+                    let hash_hex = hex::encode(hash_bytes);
 
-                            // Audit P11: submitblock success only means the block
-                            // passed validation — it can still lose the height race
-                            // or land on a side chain. Confirm it's the best block
-                            // at its height before crediting; a mismatch skipped
-                            // here avoids 100 blocks of phantom pending credits and
-                            // the imprecise reverse_block_credits claw-back.
-                            // Unknown (verify RPC failed) proceeds: the maturity
-                            // sweep re-checks the hash and orphans on mismatch.
-                            let inclusion = self
-                                .block_assembler
-                                .verify_block_inclusion(height as u64, &hash_hex)
-                                .await;
-                            if inclusion == crate::block::InclusionCheck::Mismatch {
-                                warn!(
-                                    height,
-                                    hash = %hash_hex,
-                                    "Block lost the height race; not recording or crediting"
-                                );
-                            } else {
-                                // Compute luck at discovery time
-                                let luck_percent = match self.compute_block_luck().await {
-                                    Ok(luck) => luck,
-                                    Err(e) => {
-                                        warn!(error = %e, "Failed to compute block luck");
-                                        None
-                                    }
-                                };
-
-                                match self.db.record_block(height, &hash_hex, reward, actual_reward, worker.id, luck_percent).await {
-                                    Ok(block_id) => {
-                                        let distribution_basis = actual_reward.unwrap_or(reward);
-                                        info!(height, reward, distribution_basis, block_id, "Distributing block rewards");
-                                        if let Err(e) = self.pplns.distribute(distribution_basis, block_id, worker.id).await {
-                                            error!(error = %e, "Reward distribution failed");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!(error = %e, "Failed to record block");
-                                    }
-                                }
-                                block_height = Some(height);
-                            }
-                        }
+                    // Audit #15: durable breadcrumb BEFORE submit. If we die
+                    // anywhere past this point, the startup sweep settles the
+                    // block's fate from the chain — a won block can no longer
+                    // be lost between submit and record.
+                    let crumb = match self
+                        .db
+                        .record_block_submission(height, &hash_hex, worker_id, reward, actual_reward)
+                        .await
+                    {
+                        Ok(id) => Some(id),
                         Err(e) => {
-                            error!(error = %e, "Block submission failed");
+                            // Submitting matters more than the breadcrumb.
+                            error!(error = %e, "Failed to write block_submissions breadcrumb");
+                            None
+                        }
+                    };
+
+                    // Submit FIRST — every millisecond before submitblock
+                    // widens the orphan window (audit #15: the debug file
+                    // write moved after; the redundant proposal precheck is
+                    // gone from this path).
+                    let submit_res = self.block_assembler.submit_block(&block_hex).await;
+                    let _ = std::fs::write("last_block.hex", &block_hex);
+
+                    // Timeout ≠ rejection: on a submit RPC error the node may
+                    // still have accepted the block — ask the chain before
+                    // treating it as rejected.
+                    let fate = match submit_res {
+                        Ok(_) => crate::block::InclusionCheck::Verified,
+                        Err(e) => {
+                            warn!(error = %e, height, "submitblock errored — verifying inclusion before treating as rejected");
+                            self.block_assembler
+                                .verify_block_inclusion(height as u64, &hash_hex)
+                                .await
+                        }
+                    };
+
+                    match fate {
+                        crate::block::InclusionCheck::Mismatch => {
+                            if let Some(cid) = crumb {
+                                let _ = self.db.resolve_block_submission(cid, "rejected").await;
+                            }
+                            error!(height, "Block submission rejected (not on best chain)");
+                        }
+                        crate::block::InclusionCheck::Unknown => {
+                            // Node unreachable: fate unknown. Leave the
+                            // breadcrumb OPEN — the startup sweep (or the
+                            // next one) settles it against the chain.
+                            warn!(height, "Block fate unknown (node unreachable) — breadcrumb left open for sweep");
+                        }
+                        crate::block::InclusionCheck::Verified => {
+
+                            // Luck window start must predate OUR row — grab
+                            // it now (one fast local query); the luck math
+                            // itself (node RPC) runs off-loop and updates the
+                            // row afterwards.
+                            let luck_since = self
+                                .db
+                                .get_recent_blocks(1)
+                                .await
+                                .ok()
+                                .and_then(|b| b.first().map(|x| x.created_at.clone()))
+                                .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+
+                            // Record IMMEDIATELY after chain-accept. Luck,
+                            // the P11 height-race check, and distribution all
+                            // run off the validator loop so a slow node can
+                            // never watchdog-kill us between submitblock
+                            // success and the DB row (block-90's sibling).
+                            match self.db.record_block(height, &hash_hex, reward, actual_reward, worker_id, None).await {
+                                Ok(block_id) => {
+                                    if let Some(cid) = crumb {
+                                        let _ = self.db.resolve_block_submission(cid, "recorded").await;
+                                    }
+                                    info!(height, block_id, "Block recorded — post-processing off-loop");
+                                    block_height = Some(height);
+
+                                    let db = self.db.clone();
+                                    let assembler = Arc::clone(&self.block_assembler);
+                                    let pplns = Arc::clone(&self.pplns);
+                                    let rpc = Arc::clone(&self.rpc);
+                                    let diff_mult = self.difficulty_multiplier;
+                                    let hash_task = hash_hex.clone();
+                                    let basis = actual_reward.unwrap_or(reward);
+                                    tokio::spawn(async move {
+                                        // Audit P11 (off-loop): submit-Ok only
+                                        // proves validation; confirm best-chain
+                                        // before crediting. Our row exists but
+                                        // has NO credits yet, so orphaning here
+                                        // is a plain status flip.
+                                        let inclusion = assembler
+                                            .verify_block_inclusion(height as u64, &hash_task)
+                                            .await;
+                                        if inclusion == crate::block::InclusionCheck::Mismatch {
+                                            warn!(height, hash = %hash_task, "Block lost the height race — orphaning fresh row (no credits yet)");
+                                            let _ = db.update_block_status(block_id, "orphaned").await;
+                                            return;
+                                        }
+                                        // Luck (RPC + share sum since previous block).
+                                        if let Ok(nh) = rpc.get_network_sol_ps(Some(120)).await {
+                                            if nh > 0.0 {
+                                                if let Ok(ds) = db.get_difficulty_sum_since(&luck_since).await {
+                                                    let actual_work = ds * diff_mult;
+                                                    if actual_work > 0.0 {
+                                                        let luck = (actual_work / (nh * BLOCK_TIME_SECS)) * 100.0;
+                                                        let _ = db.update_block_luck(block_id, luck).await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        info!(height, basis, block_id, "Distributing block rewards (off-loop)");
+                                        if let Err(e) = pplns.distribute(basis, block_id, worker_id).await {
+                                            error!(error = %e, block_id, "Reward distribution failed — startup sweep retries via missing-credits pass");
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    // Breadcrumb stays OPEN — the startup
+                                    // sweep records + distributes from it.
+                                    error!(error = %e, "Failed to record block — breadcrumb left open for sweep");
+                                }
+                            }
                         }
                     }
                 }
@@ -1000,7 +1257,7 @@ fn strip_compact_size(data: &[u8]) -> Result<&[u8], StratumError> {
     if data.is_empty() {
         return Err(StratumError::other("Empty solution"));
     }
-    let (prefix_len, size) = match data[0] {
+    let (prefix_len, size): (usize, usize) = match data[0] {
         0..=252 => (1, data[0] as usize),
         0xFD => {
             if data.len() < 3 { return Err(StratumError::other("Truncated compactSize")); }
@@ -1015,10 +1272,16 @@ fn strip_compact_size(data: &[u8]) -> Result<&[u8], StratumError> {
             (9, u64::from_le_bytes(data[1..9].try_into().unwrap()) as usize)
         }
     };
-    if data.len() < prefix_len + size {
-        return Err(StratumError::other("Solution shorter than declared size"));
-    }
-    Ok(&data[prefix_len..prefix_len + size])
+    // SECURITY: checked_add prevents usize overflow — a 0xFF-prefixed length near
+    // u64::MAX would otherwise wrap prefix_len+size to a tiny value, pass a naive
+    // bounds check, and panic on the out-of-range slice. That panic unwinds the
+    // single validator task; the watchdog then exit(3)s the whole pool — a
+    // one-packet, replayable denial of service.
+    let end = prefix_len
+        .checked_add(size)
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| StratumError::other("Solution shorter than declared size"))?;
+    Ok(&data[prefix_len..end])
 }
 
 fn build_header_input(job: &MiningJob, time_hex: &str) -> Result<Vec<u8>, StratumError> {
@@ -1099,14 +1362,59 @@ fn target_to_difficulty(target: &[u8; 32]) -> f64 {
 /// Post-Blossom halving interval is 1,046,400 blocks. Total subsidy starts at 12.5 ZEC
 /// and halves each interval. The miner receives 80% after NU6.
 fn compute_block_reward(height: i64) -> i64 {
-    let halving_interval: i64 = 1_046_400;
-    let initial_subsidy: i64 = 1_250_000_000; // 12.5 ZEC total subsidy
-    if height < 0 { return 0; }
-    let halvings = height / halving_interval;
-    if halvings >= 64 { return 0; }
+    // Audit #16: the old formula used the FIRST halving's height (1,046,400)
+    // as a recurring interval. That coincidentally matches the real schedule
+    // in the current era but halves ~220k blocks (~6 months) EARLY at height
+    // 4,185,600 (~mid-2028), silently under-crediting every block by 2x.
+    //
+    // Real Zcash schedule (post-Blossom 75s spacing):
+    //   [..1,046,400)          total  6.25 ZEC  (shift 1 from 12.5)
+    //   [1,046,400..2,726,400) total  3.125     (shift 2)
+    //   [2,726,400..4,406,400) total  1.5625    (shift 3)
+    //   then every 1,680,000 blocks: one more halving.
+    let initial_subsidy: i64 = 1_250_000_000; // 12.5 ZEC in zatoshis
+    if height < 0 {
+        return 0;
+    }
+    let halvings: i64 = if height < 1_046_400 {
+        1
+    } else if height < 2_726_400 {
+        2
+    } else {
+        3 + (height - 2_726_400) / 1_680_000
+    };
+    if halvings >= 64 {
+        return 0;
+    }
     let total_subsidy = initial_subsidy >> halvings;
     // Miner receives 80% of the subsidy (post-NU6)
     total_subsidy * 80 / 100
+}
+
+#[cfg(test)]
+mod reward_schedule_tests {
+    use super::compute_block_reward;
+
+    #[test]
+    fn current_era_unchanged() {
+        // Today's blocks (3.2M-3.5M era) must pay exactly what the old
+        // formula paid: 1.25 ZEC miner share.
+        for h in [3_273_381, 3_432_288, 3_446_714] {
+            assert_eq!(compute_block_reward(h), 125_000_000, "height {h}");
+        }
+    }
+
+    #[test]
+    fn old_formula_break_point_now_correct() {
+        // The old formula halved at 4,185,600 (4 x 1,046,400) — six months
+        // before the real halving at 4,406,400. Must stay 1.25 until then.
+        assert_eq!(compute_block_reward(4_185_600), 125_000_000);
+        assert_eq!(compute_block_reward(4_406_399), 125_000_000);
+        // Real third halving: miner share drops to 0.625.
+        assert_eq!(compute_block_reward(4_406_400), 62_500_000);
+        // And the one after (interval 1,680,000).
+        assert_eq!(compute_block_reward(6_086_400), 31_250_000);
+    }
 }
 
 fn compact_size(n: usize) -> Vec<u8> {
@@ -1208,12 +1516,28 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_compact_size_overflow_is_error_not_panic() {
+        // SECURITY regression: a 0xFF-prefixed length near u64::MAX must return
+        // Err (not panic via a wrapped prefix_len+size slice). This was a
+        // one-packet validator crash-loop DoS.
+        let data = vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(strip_compact_size(&data).is_err());
+        // Declared-but-absent bytes also error rather than slice OOB.
+        let short = vec![0xFD, 0x40, 0x05, 0x11, 0x22];
+        assert!(strip_compact_size(&short).is_err());
+    }
+
+    #[test]
     fn test_block_reward() {
-        // At height 1: total 12.5 ZEC, miner gets 80% = 10 ZEC
-        assert_eq!(compute_block_reward(1), 1_000_000_000);
-        // After 1st halving: total 6.25 ZEC, miner gets 5 ZEC
-        assert_eq!(compute_block_reward(1_046_400), 500_000_000);
-        // After 3rd halving (testnet current): total 1.5625, miner gets 1.25 ZEC
+        // NOTE (audit #16): the old assertions here validated the buggy
+        // interval formula against itself — e.g. claiming 6.25 total AT the
+        // first halving height, where the real chain pays 3.125. Corrected to
+        // the actual post-Blossom schedule.
+        // Pre-first-halving era (pool never mined here): total 6.25, miner 5.
+        assert_eq!(compute_block_reward(1), 500_000_000);
+        // At the first halving (1,046,400): total 3.125, miner 2.5.
+        assert_eq!(compute_block_reward(1_046_400), 250_000_000);
+        // Current era: total 1.5625, miner 1.25.
         assert_eq!(compute_block_reward(3_853_089), 125_000_000);
     }
 

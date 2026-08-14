@@ -140,8 +140,18 @@ impl StratumServer {
     pub async fn send_to_session(&self, session_id: &str, msg: ServerMessage) {
         let senders = self.session_senders.read().await;
         if let Some(tx) = senders.get(session_id) {
-            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg) {
-                warn!(%session_id, "Per-session channel full; dropping message");
+            if let Err(mpsc::error::TrySendError::Full(dropped)) = tx.try_send(msg) {
+                // Audit #16: say WHAT was dropped. A dropped SubmitResult means
+                // the miner never saw its accept-ACK and counts the share as a
+                // reject — its local stats lie about our pool.
+                let kind = match &dropped {
+                    ServerMessage::SubmitResult { .. } => "submit-ack",
+                    ServerMessage::Notify { .. } => "notify",
+                    ServerMessage::SetTarget { .. } => "set-target",
+                    ServerMessage::SetDifficulty { .. } => "set-difficulty",
+                    _ => "other",
+                };
+                warn!(%session_id, kind, "Per-session channel full; dropping message");
             }
         }
     }
@@ -391,6 +401,28 @@ impl StratumServer {
                         id,
                         authorized: false,
                         error: Some(StratumError::not_subscribed()),
+                    });
+                    return responses;
+                }
+
+                // SECURITY: validate worker_name to a safe charset before it is
+                // stored (as miners.address / workers.name) and later rendered in
+                // the admin/dashboard UI. Legit Zcash addresses and worker labels
+                // are alphanumeric with . _ - ; rejecting anything else prevents a
+                // stored-XSS payload (< > " ' & ...) reaching an operator's admin
+                // session, and blocks empty-name / junk-row / unbounded-INSERT abuse.
+                let wn_ok = !worker_name.is_empty()
+                    && worker_name.len() <= 256
+                    && worker_name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                if !wn_ok {
+                    responses.push(ServerMessage::AuthorizeResult {
+                        id,
+                        authorized: false,
+                        error: Some(StratumError::other(
+                            "Invalid worker name (allowed characters: A-Z a-z 0-9 . _ -)",
+                        )),
                     });
                     return responses;
                 }

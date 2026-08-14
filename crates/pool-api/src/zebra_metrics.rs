@@ -17,12 +17,18 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// Total request timeout. zebra 4.3.x answered in ~16ms; 4.4.1 grew the
-/// metrics payload to ~9 MB (per-peer cardinality bloat in
-/// `zebra_net_connection_state`), pushing whole-body reads to >1s. We
-/// short-circuit reading once all targets are filled, but keep a 5s ceiling
-/// in case zebra is partially unhealthy.
-const SCRAPE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total request timeout. History: zebra 4.3.x answered in ~16ms; 4.4.1 grew
+/// to ~9 MB; zakura v1.1.0 emits ~117 MB (unbounded per-connection `addr`
+/// labels, ~34k new dead series/day — task #17 tracks the node-side bug) AND
+/// emits our curated targets at the very END of the body, so early-exit can't
+/// save us: the full body must stream. 25s covers today's ~9.3s with ~2x
+/// growth headroom; MAX_SCRAPE_BYTES bounds the pathological end.
+const SCRAPE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Abort the scrape past this many body bytes with a clear error, so the
+/// node-side cardinality leak can never balloon the dashboard's work
+/// unboundedly.
+const MAX_SCRAPE_BYTES: usize = 400 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ZebraMetrics {
@@ -60,14 +66,23 @@ pub struct ZebraMetrics {
 /// `/metrics`. Operators with non-standard ports must set `[node].metrics_url`
 /// explicitly in pool.toml.
 pub fn derive_metrics_url(rpc_url: &str) -> String {
+    // Audit #20: the old string-append fallback produced double-port URLs
+    // ("http://host:18232:9999/metrics") whenever the RPC URL used a
+    // non-8232 port — reqwest then failed with an opaque "builder error"
+    // (testnet's exact symptom). Parse properly and SET the port instead.
+    if let Ok(mut url) = reqwest::Url::parse(rpc_url.trim_end_matches('/')) {
+        if url.set_port(Some(9999)).is_ok() {
+            url.set_path("/metrics");
+            return url.to_string();
+        }
+    }
+    // Unparseable input: keep a best-effort string form (still better than
+    // panicking); operators should set [node].metrics_url explicitly.
     let trimmed = rpc_url.trim_end_matches('/');
     let swapped = if trimmed.contains(":8232") {
         trimmed.replacen(":8232", ":9999", 1)
     } else {
-        // Best-effort: assume default and append the metrics port. If the
-        // operator's RPC URL doesn't contain :8232, they should set
-        // metrics_url explicitly — this fallback is just to avoid panics.
-        format!("{trimmed}:9999")
+        trimmed.to_string()
     };
     format!("{}/metrics", swapped.trim_end_matches('/'))
 }
@@ -83,8 +98,10 @@ pub async fn fetch_zebra_metrics(metrics_url: &str) -> ZebraMetrics {
 
     let mut resp = match client.get(metrics_url).send().await {
         Ok(r) if r.status().is_success() => r,
-        Ok(r) => return failed(format!("HTTP {}", r.status().as_u16()), started),
-        Err(e) => return failed(format!("request: {e}"), started),
+        Ok(r) => return failed(format!("HTTP {} from {metrics_url}", r.status().as_u16()), started),
+        // Include the URL: a malformed URL surfaces here as an opaque
+        // "builder error" otherwise (audit #20 — self-diagnosing next time).
+        Err(e) => return failed(format!("request to {metrics_url}: {e}"), started),
     };
 
     // Read body in chunks. Parse each complete line as soon as we have it
@@ -105,10 +122,19 @@ pub async fn fetch_zebra_metrics(metrics_url: &str) -> ZebraMetrics {
             Ok(Some(c)) => { bytes_read += c.len(); c }
             Ok(None) => break,
             Err(e) => {
-                m.scrape_error = Some(format!("chunk: {e}"));
+                m.scrape_error = Some(format!(
+                    "chunk after {bytes_read} bytes from {metrics_url}: {e}"
+                ));
                 break;
             }
         };
+        if bytes_read > MAX_SCRAPE_BYTES {
+            m.scrape_error = Some(format!(
+                "metrics body exceeded {} MB cap (node-side cardinality leak, see task #17)",
+                MAX_SCRAPE_BYTES / (1024 * 1024)
+            ));
+            break;
+        }
         // Treat the chunk as UTF-8 (prom text format is ASCII). Any
         // non-UTF-8 byte in the middle of a label value is exceedingly
         // rare; lossy decode just drops it.
@@ -251,7 +277,10 @@ fn parse_line(line: &str, m: &mut ZebraMetrics) {
                 m.gbt_errors_total = Some(m.gbt_errors_total.unwrap_or(0) + v);
             }
         }
-    } else if line.starts_with("zebrad_build_info{") {
+    } else if line.starts_with("zebrad_build_info{") || line.starts_with("zakura_build_info{") {
+        // zakura renamed zebrad_build_info -> zakura_build_info; without this
+        // alias `all_targets_filled` could never fire against zakura and every
+        // scrape read the full body (audit #20).
         if let Some(ver) = extract_label(line, "version") {
             m.zebra_version = Some(ver.to_string());
         }
@@ -314,6 +343,23 @@ mod tests {
             derive_metrics_url("http://node.example.com"),
             "http://node.example.com:9999/metrics"
         );
+    }
+
+    #[test]
+    fn derive_url_replaces_nonstandard_port_no_double_port() {
+        // Audit #20 regression: testnet's rpc_url has :18232; the old
+        // string-append fallback produced "http://…:18232:9999/metrics",
+        // which reqwest rejected as an opaque "builder error".
+        assert_eq!(
+            derive_metrics_url("http://operational-host.invalid:18232"),
+            "http://operational-host.invalid:9999/metrics"
+        );
+    }
+
+    #[test]
+    fn parses_zakura_build_info_alias() {
+        let m = parse_zebra_metrics("zakura_build_info{version=\"1.1.0\"} 1\n");
+        assert_eq!(m.zebra_version.as_deref(), Some("1.1.0"));
     }
 
     #[test]

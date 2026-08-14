@@ -110,7 +110,7 @@ impl Default for LongpollConfig {
 pub struct JobManager {
     rpc: Arc<ZcashRpcClient>,
     stratum: Arc<StratumServer>,
-    jobs: Arc<RwLock<HashMap<String, MiningJob>>>,
+    jobs: Arc<RwLock<HashMap<String, std::sync::Arc<MiningJob>>>>,
     job_counter: Arc<std::sync::atomic::AtomicU64>,
     last_prev_hash: Arc<RwLock<String>>,
     last_non_clean_broadcast: Arc<RwLock<std::time::Instant>>,
@@ -212,7 +212,7 @@ impl JobManager {
         Arc::clone(&self.lag_tracker)
     }
 
-    pub fn jobs(&self) -> Arc<RwLock<HashMap<String, MiningJob>>> {
+    pub fn jobs(&self) -> Arc<RwLock<HashMap<String, std::sync::Arc<MiningJob>>>> {
         Arc::clone(&self.jobs)
     }
 
@@ -387,7 +387,7 @@ impl JobManager {
         // Cache the empty job so shares submitted against it can be validated.
         {
             let mut jobs = self.jobs.write().await;
-            jobs.insert(job_id.clone(), job);
+            jobs.insert(job_id.clone(), std::sync::Arc::new(job));
         }
         {
             let mut latest = self.latest_notify.write().await;
@@ -549,7 +549,7 @@ impl JobManager {
                     }
                 }
             }
-            jobs.insert(job_id.clone(), job);
+            jobs.insert(job_id.clone(), std::sync::Arc::new(job));
         }
 
         if is_new_block {

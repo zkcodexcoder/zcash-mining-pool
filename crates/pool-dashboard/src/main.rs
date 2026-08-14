@@ -228,6 +228,11 @@ struct PayoutConfig {
     interval_secs: u64,
     #[serde(default = "default_maturity")]
     maturity_confirmations: u64,
+    /// Audit #19: auto-void payouts whose tx the node reports absent (-5)
+    /// past tx-expiry (reorged-out class). Default ON — the whole point is
+    /// no human dependency; set false to fall back to alert-only.
+    #[serde(default = "default_auto_void")]
+    auto_void_reorged: bool,
     /// Minimum shielded balance (in ZEC/TAZ) to keep as a reserve so that
     /// miners can be paid from mature funds without waiting for newly-mined
     /// coinbase to reach 100-confirmation maturity and then be shielded.
@@ -261,6 +266,10 @@ fn default_minimum_payout() -> f64 {
 fn default_payout_interval() -> u64 {
     300
 }
+fn default_auto_void() -> bool {
+    true
+}
+
 fn default_maturity() -> u64 {
     100
 }
@@ -275,6 +284,7 @@ impl Default for PayoutConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            auto_void_reorged: default_auto_void(),
             pool_address: None,
             mining_address: None,
             wallet_rpc_url: None,
@@ -340,16 +350,33 @@ async fn main() -> Result<()> {
         "Configuration loaded"
     );
 
-    // Connect to the same SQLite database (WAL mode for concurrent access)
+    // Connect to the same SQLite database (WAL mode for concurrent access).
+    // busy_timeout lets a writer WAIT for the lock instead of instantly failing
+    // with SQLITE_BUSY (the failure that silently dropped block 90's payout
+    // distribution); synchronous=NORMAL is the standard WAL setting. Per-conn.
+    let db_opts: sqlx::sqlite::SqliteConnectOptions = config
+        .database
+        .url
+        .parse()
+        .with_context(|| "Invalid database url")?;
+    let db_opts = db_opts
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(20));
     let db_pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&config.database.url)
+        .connect_with(db_opts)
         .await
         .with_context(|| "Failed to connect to database")?;
     let db = PoolDb::new(db_pool);
     db.run_migrations()
         .await
         .with_context(|| "Failed to run migrations")?;
+    // Audit #16: fail loud on schema holes rather than run the money path
+    // on top of them.
+    db.assert_critical_schema()
+        .await
+        .with_context(|| "Critical schema verification failed — refusing to start")?;
     db.set_wal_mode()
         .await
         .with_context(|| "Failed to enable WAL mode")?;
@@ -420,6 +447,31 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Wake handle for the payout loop (audit #14): the admin trigger nudges
+    // the one hardened pipeline instead of running its own copy.
+    let payout_wake = Arc::new(tokio::sync::Notify::new());
+
+    // Audit #16: shares retention. Hourly, archive+delete raw share rows
+    // older than 30 days into shares_rollup (atomic per hour, ≤200 hours per
+    // pass so the historical backlog drains over a few days without long
+    // write locks).
+    {
+        let retention_db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            loop {
+                match retention_db.rollup_and_prune_shares(30, 200).await {
+                    Ok((hours, rows)) if hours > 0 => {
+                        info!(hours, rows, "Shares retention: archived + pruned");
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "Shares retention pass failed"),
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     // Build ApiState with no live atomics (triggers DB fallback in helpers)
     let api_state: AppState = Arc::new(ApiState {
         db: db.clone(),
@@ -445,6 +497,11 @@ async fn main() -> Result<()> {
         min_payout_zatoshis: (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64,
         pay_immature,
         maturity_confirmations: config.payout.maturity_confirmations,
+        payout_wake: if config.payout.enabled {
+            Some(Arc::clone(&payout_wake))
+        } else {
+            None
+        },
         network_blocks_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         stats_history: pool_api::StatsHistory::new(),
         shares_accepted: Arc::new(std::sync::atomic::AtomicU64::new(0)), // DB fallback
@@ -472,7 +529,10 @@ async fn main() -> Result<()> {
                 let mut w = scrape_cache.write().await;
                 *w = snap;
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            // Audit #20: zakura's /metrics is ~117 MB (cardinality leak) and
+            // must be read in full — every 30s that's 2,880 pulls/day of node
+            // CPU + LAN traffic. 5 min staleness on the health panel is fine.
+            tokio::time::sleep(Duration::from_secs(300)).await;
         }
     });
 
@@ -656,7 +716,17 @@ async fn main() -> Result<()> {
                 wallet_rpc: Arc::clone(&payout_wallet_rpc),
                 interval: Duration::from_secs(reconcile_secs),
                 pool_fee: (config.pool.fee_percent / 100.0).clamp(0.0, 1.0),
+                mining_address: mining_address.clone(),
+                auto_void_reorged: config.payout.auto_void_reorged,
             };
+            // Round-3: resolve any payout reservations orphaned by a crash BEFORE
+            // the payout loop starts — confirm those whose tx reached the chain,
+            // refund those that did not. Fast recovery of in-flight `paying` funds.
+            // (No reservations -> no RPC calls, so this is a no-op on a clean boot.)
+            let startup = r.reconcile_reserved_payouts_once(None).await;
+            if !startup.alerts.is_empty() {
+                warn!(alerts = ?startup.alerts, "Startup payout-reservation reconciliation");
+            }
             Some(tokio::spawn(async move { r.run().await }))
         } else {
             info!("Reconciler disabled (reconcile_interval_secs = 0)");
@@ -664,6 +734,7 @@ async fn main() -> Result<()> {
         };
 
         let balance_margin = config.payout.available_balance_margin.clamp(0.5, 1.0);
+        let loop_wake = Arc::clone(&payout_wake);
         let payout_task = tokio::spawn(async move {
             run_payout_loop(
                 payout_db, node_rpc, payout_wallet_rpc,
@@ -671,6 +742,7 @@ async fn main() -> Result<()> {
                 min_payout_zatoshis, reserve_min_zatoshis, balance_margin,
                 maturity, interval,
                 &payout_network, pay_immature,
+                loop_wake,
             ).await;
         });
         Some((payout_task, reconciler_handle))
@@ -754,6 +826,7 @@ async fn run_payout_loop(
     interval: Duration,
     network: &str,
     pay_immature: bool,
+    wake: Arc<tokio::sync::Notify>,
 ) {
     info!("Payout loop started");
     // Short initial delay to let dashboard fully start before doing RPC work.
@@ -804,10 +877,10 @@ async fn run_payout_loop(
             pay_immature,
         ).await {
             Ok(count) => {
+                consecutive_payout_failures = 0;
+                last_payout_error.clear();
                 if count > 0 {
                     info!(payouts = count, "Payout round completed");
-                    consecutive_payout_failures = 0;
-                    last_payout_error.clear();
                 }
             }
             Err(e) => {
@@ -826,7 +899,15 @@ async fn run_payout_loop(
             },
         ).await;
 
-        tokio::time::sleep(interval).await;
+        // Sleep until the next scheduled cycle OR an admin nudge (audit #14:
+        // the manual trigger wakes this loop instead of running its own
+        // parallel pipeline).
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = wake.notified() => {
+                info!("Payout loop woken early by manual trigger");
+            }
+        }
     }
 }
 
@@ -930,14 +1011,13 @@ async fn check_block_maturity(
                 "Block confirmed (mature)"
             );
         } else {
-            db.update_block_status(block.id, "orphaned").await?;
-            // Audit P5: precise reversal — debit exactly the miners credited
-            // for this block. Credits already paid out land in the
-            // orphan_clawbacks ledger (reconciler alerts on them) instead of
-            // being clawed from other miners' pending. Pre-migration-008
-            // blocks have no credit rows; fall back to the legacy
-            // proportional reversal for those.
-            match db.reverse_block_credits_precise(block.id).await? {
+            // Audit #14: reversal and status flip commit together in ONE
+            // transaction — a crash can no longer leave an orphaned-status
+            // block whose credits were never reversed (phantom credits).
+            // Precise reversal debits exactly the credited miners; already-
+            // paid credits land in orphan_clawbacks; pre-008 blocks fall
+            // back to the legacy proportional reversal inside the same tx.
+            match db.orphan_block(block.id, block.reward).await? {
                 Some((reversed, clawback)) => {
                     info!(
                         height = block.height,
@@ -964,7 +1044,8 @@ async fn check_block_maturity(
                     }
                 }
                 None => {
-                    db.reverse_block_credits(block.reward).await?;
+                    // orphan_block already ran the legacy proportional
+                    // reversal inside the same transaction.
                     info!(
                         height = block.height,
                         "Block orphaned (legacy proportional reversal — pre-008 block)"
@@ -1269,112 +1350,85 @@ async fn process_payouts(
         .create_payout_attempt(payout_list.len() as i64, actual_total_zatoshis, "loop")
         .await
     {
-        Ok(id) => Some(id),
+        Ok(id) => id,
         Err(e) => {
-            warn!(error = %e, "Failed to create payout_attempt row, continuing");
-            None
+            // The reservation that makes a payout crash-safe is keyed to this
+            // attempt row, so without it we must not send. Retry next cycle.
+            warn!(error = %e, "Failed to create payout_attempt row; skipping payout round");
+            return Ok(0);
         }
     };
 
-    let (opid, payout_list) = {
-        let mut current_list = payout_list;
-        let mut retries = 0u32;
-        loop {
-            let mut merged: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
-            for (_, zats, addr) in &current_list {
-                *merged.entry(addr.as_str()).or_insert(0.0) += *zats as f64 / ZATOSHIS_PER_ZEC;
-            }
-            let amounts: Vec<(&str, f64)> = merged.into_iter().collect();
+    // Round-3 pre-debit saga: RESERVE funds (pending -> paying) BEFORE the send.
+    // From here a crash leaves the funds in `paying`, out of `pending`, so the
+    // payout loop cannot re-select and re-pay them; startup reconciliation
+    // resolves the in-flight attempt by checking its txid on chain.
+    let reserve_items: Vec<(i64, i64)> = payout_list
+        .iter()
+        .map(|(i, amt, _)| (pending[*i].miner_id, *amt))
+        .collect();
+    let reserved = match db.reserve_payout(attempt_id, &reserve_items).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "Payout reservation failed; nothing sent");
+            let _ = db
+                .update_payout_attempt(attempt_id, "failed", None, None, Some(&format!("reserve failed: {e}")))
+                .await;
+            return Err(anyhow::anyhow!("payout reservation failed: {e}"));
+        }
+    };
+    if reserved.is_empty() {
+        let _ = db
+            .update_payout_attempt(attempt_id, "failed", None, None, Some("no funds reserved (balances changed since selection)"))
+            .await;
+        return Ok(0);
+    }
+    // Send to exactly the miners actually reserved.
+    let reserved_ids: std::collections::HashSet<i64> = reserved.iter().map(|(m, _)| *m).collect();
+    let payout_list: Vec<(usize, i64, String)> = payout_list
+        .into_iter()
+        .filter(|(i, _, _)| reserved_ids.contains(&pending[*i].miner_id))
+        .collect();
 
-            match rpc.z_sendmany(pool_address, &amounts).await {
-                Ok(opid) => break (opid, current_list),
-                Err(e) => {
-                    let msg = format!("{e}");
-                    if retries < 2 && msg.contains("Insufficient balance") {
-                        if let Some(have_zats) = parse_have_balance(&msg) {
-                            // "have 0" with a positive z_gettotalbalance means the wallet
-                            // sees the notes but can't yet build a Merkle witness (Orchard
-                            // commitment subtree past the note hasn't filled). Resolves on
-                            // its own as more Orchard txs land — skip quietly.
-                            if have_zats == 0 && private_balance > 0.0 {
-                                info!(private_balance, "Notes present but no spendable witness yet, waiting");
-                                // Close out the attempt row — this was the one early
-                                // return that leaked attempts in 'queued', which the
-                                // reconciler then flagged as unresolvable every sweep
-                                // (first seen testnet 2026-06-10 06:45, attempt 1416).
-                                if let Some(id) = attempt_id {
-                                    let _ = db.update_payout_attempt(
-                                        id, "failed", None, None,
-                                        Some("deferred: notes present but no spendable witness yet"),
-                                    ).await;
-                                }
-                                return Ok(0);
-                            }
-                            let actual_available = have_zats as f64 * 0.95;
-                            let current_total: f64 = current_list.iter().map(|(_, z, _)| *z as f64).sum();
-                            if actual_available < min_payout_zatoshis as f64 || current_total <= 0.0 {
-                                if let Some(id) = attempt_id {
-                                    let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("Wallet balance too low: {msg}"))).await;
-                                }
-                                return Err(anyhow::anyhow!("Wallet balance too low: {msg}"));
-                            }
-                            let rescale = actual_available / current_total;
-                            info!(have_zats, rescale, retry = retries + 1, "Rescaling payouts based on actual wallet balance");
-                            current_list = current_list
-                                .into_iter()
-                                .filter_map(|(i, old_zats, addr)| {
-                                    let new_zats = (old_zats as f64 * rescale).floor() as i64;
-                                    if new_zats >= min_payout_zatoshis { Some((i, new_zats, addr)) } else { None }
-                                })
-                                .collect();
-                            if current_list.is_empty() {
-                                if let Some(id) = attempt_id {
-                                    let _ = db.update_payout_attempt(id, "failed", None, None, Some("All payouts below minimum after rescaling")).await;
-                                }
-                                return Err(anyhow::anyhow!("All payouts below minimum after rescaling"));
-                            }
-                            retries += 1;
-                            continue;
-                        }
-                    }
-                    // If the error is about a bad address or amount, try removing
-                    // the problematic entries and retry once more.
-                    if retries < 2 && (msg.contains("unknown address") || msg.contains("Invalid amount") || msg.contains("Invalid parameter")) {
-                        warn!(error = %msg, "z_sendmany failed, removing problematic entries and retrying");
-                        // Can't easily identify which address is bad, so halve the
-                        // batch and retry. Alternate which half is KEPT per retry
-                        // (audit NEW-F): always keeping the front half let one bad
-                        // entry that sorts first (largest pending) livelock its
-                        // half across every cycle. Dropped entries keep their
-                        // pending and re-enter the next 5-min cycle.
-                        let half = current_list.len() / 2;
-                        if half == 0 {
-                            if let Some(id) = attempt_id {
-                                let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("z_sendmany failed on single entry: {e}"))).await;
-                            }
-                            return Err(anyhow::anyhow!("z_sendmany failed on single entry: {e}"));
-                        }
-                        if retries % 2 == 0 {
-                            current_list.truncate(half);
-                        } else {
-                            current_list.drain(..half);
-                        }
-                        retries += 1;
-                        continue;
-                    }
-                    if let Some(id) = attempt_id {
-                        let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("z_sendmany failed: {e}"))).await;
-                    }
-                    return Err(anyhow::anyhow!("z_sendmany failed: {e}"));
-                }
+    // Merge to unique destinations in exact integer zatoshis, converting each
+    // destination total to ZEC exactly once (a single i64->ZEC conversion avoids
+    // the f64 accumulation Zallet rejected as "Invalid amount"). One send.
+    let mut merged: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+    for (_, zats, addr) in &payout_list {
+        *merged.entry(addr.as_str()).or_insert(0) += *zats;
+    }
+    let amounts: Vec<(&str, f64)> = merged
+        .into_iter()
+        .map(|(addr, zats)| (addr, zats as f64 / ZATOSHIS_PER_ZEC))
+        .collect();
+
+    let opid = match rpc.z_sendmany(pool_address, &amounts).await {
+        Ok(opid) => opid,
+        Err(e) => {
+            let msg = format!("{e}");
+            // Not enough spendable balance — including the common "have 0 while
+            // notes exist but the Orchard witness hasn't filled" case. Refund the
+            // reservation and defer; the next cycle recomputes the scale against
+            // the live balance (the rescale, one cycle later, without churn).
+            let deferred = msg.contains("Insufficient balance");
+            let _ = db.refund_payout(attempt_id).await;
+            let note = if deferred {
+                format!("deferred: insufficient spendable balance (refunded): {msg}")
+            } else {
+                format!("z_sendmany failed (refunded): {msg}")
+            };
+            let _ = db.update_payout_attempt(attempt_id, "failed", None, None, Some(&note)).await;
+            if deferred {
+                info!(error = %msg, "z_sendmany deferred; reservation refunded, retry next cycle");
+                return Ok(0);
             }
+            error!(error = %msg, "z_sendmany failed; reservation refunded");
+            return Err(anyhow::anyhow!("z_sendmany failed: {e}"));
         }
     };
 
     info!(opid = %opid, "z_sendmany submitted, waiting for completion");
-    if let Some(id) = attempt_id {
-        let _ = db.update_payout_attempt(id, "sent", Some(&opid), None, None).await;
-    }
+    let _ = db.update_payout_attempt(attempt_id, "sent", Some(&opid), None, None).await;
 
     let txid = match wait_for_operation(rpc, &opid).await {
         Ok(OpResult::Success(txid)) => {
@@ -1382,28 +1436,30 @@ async fn process_payouts(
             txid
         }
         Ok(OpResult::Failed(msg)) => {
-            if let Some(id) = attempt_id {
-                let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("z_sendmany operation failed: {msg}"))).await;
-            }
+            // Operation definitively failed: no tx exists, so refunding is safe.
+            let _ = db.refund_payout(attempt_id).await;
+            let _ = db
+                .update_payout_attempt(attempt_id, "failed", None, None, Some(&format!("z_sendmany operation failed: {msg}")))
+                .await;
             return Err(anyhow::anyhow!("z_sendmany failed: {msg}"));
         }
         Err(e) => {
-            if let Some(id) = attempt_id {
-                let _ = db.update_payout_attempt(id, "failed", None, None, Some(&format!("wait_for_operation error: {e}"))).await;
-            }
+            // Fate unknown (the tx may have broadcast). Do NOT refund; leave the
+            // reservation 'sent' for reconciliation to resolve against the chain.
+            warn!(error = %e, opid = %opid, "wait_for_operation errored; leaving reservation for reconciliation");
+            let _ = db
+                .update_payout_attempt(attempt_id, "sent", Some(&opid), None, Some(&format!("wait_for_operation error: {e}")))
+                .await;
             return Err(e);
         }
     };
 
-    // Verify the tx is actually visible on the node (mempool or chain) before
-    // recording payouts. z_getoperationstatus "success" only means Zallet
-    // finished proof generation; it does NOT guarantee broadcast or mining.
-    // Without this check, expired-unmined txs were getting recorded as paid
-    // in pool.db while the wallet kept the notes locked (ghost-lock).
-    // Retry briefly: mempool propagation can take a beat after Zallet returns.
+    // Verify the tx is actually visible on the node before finalizing. Success
+    // from z_getoperationstatus only means Zallet finished proof generation, not
+    // that the tx broadcast. Retry briefly for mempool propagation.
     let mut verify_ok = false;
     let mut last_verify_err = String::new();
-    for attempt in 0..6 {
+    for _ in 0..6 {
         match node_rpc.get_raw_transaction(&txid, 1).await {
             Ok(_) => {
                 verify_ok = true;
@@ -1412,27 +1468,27 @@ async fn process_payouts(
             Err(e) => {
                 last_verify_err = format!("{e}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                let _ = attempt;
             }
         }
     }
     if !verify_ok {
-        error!(
+        // Ambiguous: the tx might broadcast late or might have expired. Do NOT
+        // refund (a late broadcast would then double-pay) and do NOT confirm.
+        // Leave the reservation in `paying` and the attempt 'sent' with its txid;
+        // reconciliation checks the txid on chain later and confirms or refunds.
+        warn!(
             opid = %opid, txid = %txid, error = %last_verify_err,
-            "Payout tx not visible on node after retries — NOT recording as paid; will retry next cycle"
+            "Payout tx not visible yet — leaving reservation for reconciliation to resolve"
         );
-        if let Some(id) = attempt_id {
-            let _ = db.update_payout_attempt(id, "failed", None, Some(&txid), Some(&format!("tx not visible on node: {last_verify_err}"))).await;
-        }
+        let _ = db
+            .update_payout_attempt(attempt_id, "sent", None, Some(&txid), Some(&format!("tx not yet visible: {last_verify_err}")))
+            .await;
         return Ok(0);
     }
     info!(txid = %txid, "Payout transaction broadcast and visible on node");
-    if let Some(id) = attempt_id {
-        let _ = db.update_payout_attempt(id, "confirmed", None, Some(&txid), None).await;
-    }
+
     // Record the pool's ZIP-317 cost for this payout tx so the next block's
-    // distribution recovers it. Recipients = unique addresses (z_sendmany
-    // merged duplicates the same way before broadcasting).
+    // distribution recovers it. Recipients = unique destination addresses.
     let recipients = payout_list
         .iter()
         .map(|(_, _, addr)| addr.as_str())
@@ -1442,30 +1498,24 @@ async fn process_payouts(
         warn!(error = %e, txid = %txid, "Failed to record payout tx cost");
     }
 
-    let mut count = 0;
-    for (i, amt_zatoshis, pay_to) in &payout_list {
-        let p = &pending[*i];
-        if let Err(e) = db.create_payout(p.miner_id, *amt_zatoshis, &txid).await {
-            error!(miner_id = p.miner_id, error = %e, "Failed to record payout");
-        } else {
-            info!(
-                miner_id = p.miner_id, address = %p.address, pay_to = %pay_to,
-                amount_zec = *amt_zatoshis as f64 / ZATOSHIS_PER_ZEC, txid = %txid,
-                "Payout recorded"
-            );
-            count += 1;
+    // CONFIRM: atomically move the reservation paying -> paid and write the
+    // payouts rows (round-3). Idempotent, so a reconciliation re-run is harmless.
+    let count = match db.confirm_payout(attempt_id, &txid).await {
+        Ok(n) => n as usize,
+        Err(e) => {
+            // Tx is on chain but ledger finalization failed. Do NOT refund; leave
+            // the reservation 'sent' + txid for reconciliation to re-run confirm.
+            error!(error = %e, txid = %txid, "confirm_payout failed after broadcast; leaving for reconciliation");
+            let _ = db
+                .update_payout_attempt(attempt_id, "sent", None, Some(&txid), Some(&format!("confirm failed: {e}")))
+                .await;
+            return Ok(0);
         }
-    }
+    };
+    let _ = db.update_payout_attempt(attempt_id, "confirmed", None, Some(&txid), None).await;
+    info!(miners = count, txid = %txid, "Payout round completed and confirmed");
 
     Ok(count)
-}
-
-fn parse_have_balance(msg: &str) -> Option<i64> {
-    let marker = "have ";
-    let start = msg.find(marker)? + marker.len();
-    let rest = &msg[start..];
-    let end = rest.find(|c: char| !c.is_ascii_digit())?;
-    rest[..end].parse::<i64>().ok()
 }
 
 /// Validates a Zcash address for the given network using proper encoding checks.

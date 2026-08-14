@@ -11,6 +11,7 @@ tracing.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 blake2b_simd.workspace = true
+zebra-chain = { version = "11", default-features = false }
 chrono.workspace = true
 rand.workspace = true
 node-rpc = { path = "../node-rpc" }

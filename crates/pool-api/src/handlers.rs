@@ -42,6 +42,10 @@ pub struct ApiState {
     pub pay_immature: bool,
     /// Maturity confirmations required.
     pub maturity_confirmations: u64,
+    /// Wake handle for the dashboard payout loop (audit #14): the manual
+    /// trigger nudges the one hardened pipeline instead of running its own.
+    /// None when payouts are disabled in config.
+    pub payout_wake: Option<Arc<tokio::sync::Notify>>,
     /// Difficulty multiplier: converts shares/sec to Sol/s.
     /// Equal to 2^256 / share_target. For target 0800...0000 this is 32.
     pub difficulty_multiplier: f64,
@@ -575,20 +579,35 @@ pub async fn get_pool_stats_nomp(
 }
 
 async fn check_wallet_rpc(state: &ApiState) -> bool {
-    match &state.wallet_rpc {
-        Some(rpc) => {
-            // Use z_gettotalbalance as a lightweight health check -- it's wallet-specific
-            // and confirms Zallet is running and responsive. Timeout after 30s —
-            // z_gettotalbalance can take 15s+ when Zallet is scanning.
-            let fut = rpc.call_raw::<serde_json::Value>(
-                "z_gettotalbalance", serde_json::json!([0, true])
-            );
-            tokio::time::timeout(std::time::Duration::from_secs(30), fut)
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false)
+    // Audit #16: this used to issue a LIVE z_gettotalbalance (up to 30s) per
+    // anonymous request — a free wallet-exhaustion lever pointed at the same
+    // RPC the payout pipeline needs. Serve from the payout_health snapshot
+    // the dashboard's loop already writes every cycle instead; consider the
+    // wallet healthy only if the snapshot is fresh (< 15 min) AND it reported
+    // responsive.
+    if state.wallet_rpc.is_none() {
+        return false;
+    }
+    match state.db.get_pool_status("payout_health").await {
+        Ok(Some((value, _updated_at))) => {
+            match serde_json::from_str::<serde_json::Value>(&value) {
+                Ok(h) => {
+                    let responsive = h
+                        .get("wallet_responsive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let fresh = h
+                        .get("checked_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| chrono::Utc::now().signed_duration_since(t).num_minutes() < 15)
+                        .unwrap_or(false);
+                    responsive && fresh
+                }
+                Err(_) => false,
+            }
         }
-        None => false,
+        _ => false,
     }
 }
 
@@ -620,328 +639,35 @@ fn reverse_hex(hex_str: &str) -> String {
 pub async fn trigger_payout(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let wallet_rpc = match &state.wallet_rpc {
-        Some(rpc) => rpc,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "status": "error", "message": "Wallet RPC not configured"
-        }))),
-    };
-    let pool_address = match &state.pool_address {
-        Some(a) => a.clone(),
-        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "status": "error", "message": "Pool address not configured"
-        }))),
-    };
-
-    // Refuse to run if another payout (loop or manual) is in flight. The 5-min
-    // dashboard loop and the manual trigger both call z_sendmany on the same
-    // pending balances; running both in parallel guarantees a mempool double-
-    // spend rejection for whichever loses the race. Bail out cleanly instead.
-    match state.db.get_inflight_payout_attempt().await {
-        Ok(Some((id, status, source))) => {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
-                "status": "error",
-                "message": format!("another payout is in flight (attempt id={id}, status={status}, source={source}); try again in a few minutes"),
-                "inflight_attempt_id": id,
-                "inflight_status": status,
-                "inflight_source": source,
-            })));
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to check in-flight payout attempts, proceeding anyway");
-        }
-    }
-
-    // Phase 1: Check block maturity
-    let current_height = match state.rpc.get_block_count().await {
-        Ok(h) => h,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "status": "error", "message": format!("getblockcount failed: {e}")
-        }))),
-    };
-
-    let mut confirmed = 0i64;
-    let mut orphaned = 0i64;
-    if let Ok(pending_blocks) = state.db.get_pending_blocks().await {
-        for block in &pending_blocks {
-            let confs = current_height as i64 - block.height;
-            if confs < state.maturity_confirmations as i64 { continue; }
-            match state.rpc.get_block_hash(block.height as u64).await {
-                Ok(chain_hash) => {
-                    let pool_hash_reversed = reverse_hex(&block.hash);
-                    if chain_hash == pool_hash_reversed || chain_hash == block.hash {
-                        let _ = state.db.update_block_status(block.id, "confirmed").await;
-                        confirmed += 1;
-                    } else {
-                        let _ = state.db.update_block_status(block.id, "orphaned").await;
-                        let _ = state.db.reverse_block_credits(block.reward).await;
-                        orphaned += 1;
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    // Phase 2: Shield coinbase (if mining_address differs from pool_address)
-    let mut shielded = false;
-    if let Some(ref mining_addr) = state.mining_address {
-        if *mining_addr != pool_address {
-            match wallet_rpc.z_shield_coinbase(mining_addr, &pool_address, None).await {
-                Ok(result) => {
-                    let utxos = result.get("shieldingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0);
-                    if utxos > 0 {
-                        let opid = result.get("opid").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                        tracing::info!(opid = %opid, utxos = utxos, "Shielding triggered, waiting for 3 confirmations");
-                        shielded = true;
-
-                        // Wait for the shielding operation to complete
-                        let shield_ok = loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            match wallet_rpc.z_get_operation_status(&[&opid]).await {
-                                Ok(statuses) => {
-                                    if let Some(s) = statuses.first() {
-                                        match s.get("status").and_then(|v| v.as_str()).unwrap_or("") {
-                                            "success" => break true,
-                                            "failed" => {
-                                                tracing::error!("Shielding operation failed");
-                                                break false;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                Err(_) => break false,
-                            }
-                        };
-
-                        // Wait for 3 confirmations (~30-45s on testnet)
-                        if shield_ok {
-                            tracing::info!("Shielding complete, waiting for 3 confirmations");
-                            for _ in 0..60 {
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                match wallet_rpc.call_raw::<serde_json::Value>(
-                                    "z_gettotalbalance", serde_json::json!([3, true])
-                                ).await {
-                                    Ok(bal) => {
-                                        let private = bal.get("private")
-                                            .and_then(|v| v.as_str())
-                                            .and_then(|s| s.parse::<f64>().ok())
-                                            .unwrap_or(0.0);
-                                        if private > 0.0 {
-                                            tracing::info!(balance = private, "Shielded funds confirmed (3+ confs)");
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    // Phase 3: Process payouts
-    let pending = match state.db.get_pending_payouts(state.min_payout_zatoshis, state.pay_immature).await {
-        Ok(p) => p,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "status": "error", "message": format!("DB error: {e}")
-        }))),
-    };
-
-    if pending.is_empty() {
-        return (StatusCode::OK, Json(serde_json::json!({
-            "status": "ok",
-            "message": "No miners eligible for payout",
-            "blocks_confirmed": confirmed,
-            "blocks_orphaned": orphaned,
-            "shielding_triggered": shielded,
-            "payouts": 0
+    // Audit #14: this endpoint was a full parallel re-implementation of the
+    // payout pipeline (own maturity check with the LEGACY proportional orphan
+    // reversal, own shielding wait, own z_sendmany with debit-AFTER-send) that
+    // bypassed the round-3 reservation saga entirely — a crash mid-loop here
+    // re-opened the double-pay class via the admin path. It is now a nudge:
+    // wake the real dashboard payout loop, which runs the single hardened
+    // pipeline (reserve -> send -> confirm, with reconciliation).
+    if state.wallet_rpc.is_none() || state.pool_address.is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "status": "error", "message": "Payouts not configured on this dashboard"
         })));
     }
-
-    let amounts: Vec<(&str, f64)> = pending
-        .iter()
-        .map(|p| (p.address.as_str(), p.amount as f64 / ZATOSHIS_PER_ZEC_F64))
-        .collect();
-
-    let total_zatoshis: i64 = pending.iter().map(|p| p.amount).sum();
-    let attempt_id = match state
-        .db
-        .create_payout_attempt(pending.len() as i64, total_zatoshis, "manual")
-        .await
-    {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to create payout_attempt row, continuing");
-            None
+    let inflight = state.db.get_inflight_payout_attempt().await.ok().flatten();
+    match &state.payout_wake {
+        Some(wake) => {
+            wake.notify_one();
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "ok",
+                "message": "payout loop nudged; the hardened pipeline will run within seconds",
+                "inflight_attempt": inflight.map(|(id, status, source)| serde_json::json!({
+                    "id": id, "status": status, "source": source
+                })),
+            })))
         }
-    };
-
-    let opid = match wallet_rpc.z_sendmany(&pool_address, &amounts).await {
-        Ok(id) => id,
-        Err(e) => {
-            if let Some(id) = attempt_id {
-                let _ = state
-                    .db
-                    .update_payout_attempt(id, "failed", None, None, Some(&format!("z_sendmany failed: {e}")))
-                    .await;
-            }
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "status": "error",
-                "message": format!("z_sendmany failed: {e}"),
-                "blocks_confirmed": confirmed,
-                "blocks_orphaned": orphaned,
-            })));
-        }
-    };
-
-    if let Some(id) = attempt_id {
-        let _ = state.db.update_payout_attempt(id, "sent", Some(&opid), None, None).await;
-    }
-
-    // Wait for the async operation to produce a txid. Mirrors the post-shielding
-    // pattern earlier in this function: poll every 5s up to 120s.
-    let mut maybe_txid: Option<String> = None;
-    let mut op_error: Option<String> = None;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        match wallet_rpc.z_get_operation_status(&[&opid]).await {
-            Ok(statuses) => {
-                if let Some(s) = statuses.first() {
-                    let st = s.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                    if st == "success" {
-                        maybe_txid = s
-                            .get("result")
-                            .and_then(|r| r.get("txid"))
-                            .or_else(|| s.get("result").and_then(|r| r.get("txids")).and_then(|a| a.as_array()).and_then(|a| a.first()))
-                            .and_then(|t| t.as_str())
-                            .map(|t| t.to_string());
-                        break;
-                    } else if st == "failed" {
-                        op_error = Some(
-                            s.get("error")
-                                .and_then(|e| e.get("message"))
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("unknown error")
-                                .to_string(),
-                        );
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                op_error = Some(format!("z_getoperationstatus failed: {e}"));
-                break;
-            }
-        }
-    }
-
-    if let Some(err) = op_error {
-        if let Some(id) = attempt_id {
-            let _ = state
-                .db
-                .update_payout_attempt(id, "failed", None, None, Some(&format!("operation failed: {err}")))
-                .await;
-        }
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+        None => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
             "status": "error",
-            "message": format!("z_sendmany operation failed: {err}"),
-            "opid": opid,
-            "blocks_confirmed": confirmed,
-            "blocks_orphaned": orphaned,
-        })));
+            "message": "payout loop is not running (payouts disabled in config)"
+        }))),
     }
-
-    let txid = match maybe_txid {
-        Some(t) => t,
-        None => {
-            if let Some(id) = attempt_id {
-                let _ = state
-                    .db
-                    .update_payout_attempt(id, "failed", None, None, Some("timed out waiting for operation"))
-                    .await;
-            }
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "status": "error",
-                "message": "Timed out waiting for z_sendmany operation",
-                "opid": opid,
-                "blocks_confirmed": confirmed,
-                "blocks_orphaned": orphaned,
-            })));
-        }
-    };
-
-    // Verify the tx is actually visible on the node before recording payouts.
-    // Same safety check as the dashboard's process_payouts.
-    let mut verify_ok = false;
-    let mut last_verify_err = String::new();
-    for _ in 0..6 {
-        match state.rpc.get_raw_transaction(&txid, 1).await {
-            Ok(_) => {
-                verify_ok = true;
-                break;
-            }
-            Err(e) => {
-                last_verify_err = format!("{e}");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
-    }
-    if !verify_ok {
-        if let Some(id) = attempt_id {
-            let _ = state
-                .db
-                .update_payout_attempt(
-                    id,
-                    "failed",
-                    None,
-                    Some(&txid),
-                    Some(&format!("tx not visible on node: {last_verify_err}")),
-                )
-                .await;
-        }
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "status": "error",
-            "message": format!("Payout tx not visible on node: {last_verify_err}"),
-            "opid": opid,
-            "txid": txid,
-            "blocks_confirmed": confirmed,
-            "blocks_orphaned": orphaned,
-        })));
-    }
-
-    // Record each payout in pool.db so balances move from pending → paid.
-    let mut recorded = 0u32;
-    for p in &pending {
-        if let Err(e) = state.db.create_payout(p.miner_id, p.amount, &txid).await {
-            tracing::error!(miner_id = p.miner_id, error = %e, "Failed to record payout");
-        } else {
-            recorded += 1;
-        }
-    }
-
-    if let Some(id) = attempt_id {
-        let _ = state.db.update_payout_attempt(id, "confirmed", None, Some(&txid), None).await;
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "ok",
-        "message": "Payout broadcast and recorded",
-        "opid": opid,
-        "txid": txid,
-        "miners": pending.len(),
-        "recorded": recorded,
-        "total_zec": total_zatoshis as f64 / ZATOSHIS_PER_ZEC_F64,
-        "blocks_confirmed": confirmed,
-        "blocks_orphaned": orphaned,
-        "shielding_triggered": shielded,
-    })))
 }
 
 pub async fn get_miner_stats(
