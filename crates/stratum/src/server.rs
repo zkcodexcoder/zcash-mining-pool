@@ -71,6 +71,13 @@ pub struct StratumServer {
     latest_notify: Arc<RwLock<Option<ServerMessage>>>,
     /// Connection count per IP for rate limiting.
     ip_connections: Arc<std::sync::Mutex<HashMap<IpAddr, u32>>>,
+    /// Initial difficulty announced at subscribe time, keyed by listening
+    /// port, as (difficulty, target hex) pairs precomputed by the caller.
+    /// Pool checkers (e.g. MiningRigRentals) subscribe without authorizing,
+    /// so this pre-auth announcement is the only difficulty they ever see.
+    port_initial: HashMap<u16, (f64, String)>,
+    /// Announced when the connection's local port has no map entry.
+    fallback_initial: (f64, String),
 }
 
 impl StratumServer {
@@ -94,8 +101,28 @@ impl StratumServer {
             session_senders: Arc::new(RwLock::new(HashMap::new())),
             latest_notify,
             ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            port_initial: HashMap::new(),
+            fallback_initial: (
+                8192.0,
+                "000042e340f98608c00000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
         };
         (server, notify_rx)
+    }
+
+    /// Configure the subscribe-time difficulty announcement. `per_port` maps
+    /// each listening port to a (difficulty, target hex) pair; `fallback`
+    /// covers unmapped ports. The caller precomputes targets with the same
+    /// difficulty→target conversion applied after authorize, so the pre-auth
+    /// announcement matches the session's real starting difficulty.
+    pub fn set_initial_difficulty(
+        &mut self,
+        per_port: HashMap<u16, (f64, String)>,
+        fallback: (f64, String),
+    ) {
+        self.port_initial = per_port;
+        self.fallback_initial = fallback;
     }
 
     /// Broadcast a job notification to all connected miners.
@@ -113,8 +140,18 @@ impl StratumServer {
     pub async fn send_to_session(&self, session_id: &str, msg: ServerMessage) {
         let senders = self.session_senders.read().await;
         if let Some(tx) = senders.get(session_id) {
-            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg) {
-                warn!(%session_id, "Per-session channel full; dropping message");
+            if let Err(mpsc::error::TrySendError::Full(dropped)) = tx.try_send(msg) {
+                // Audit #16: say WHAT was dropped. A dropped SubmitResult means
+                // the miner never saw its accept-ACK and counts the share as a
+                // reject — its local stats lie about our pool.
+                let kind = match &dropped {
+                    ServerMessage::SubmitResult { .. } => "submit-ack",
+                    ServerMessage::Notify { .. } => "notify",
+                    ServerMessage::SetTarget { .. } => "set-target",
+                    ServerMessage::SetDifficulty { .. } => "set-difficulty",
+                    _ => "other",
+                };
+                warn!(%session_id, kind, "Per-session channel full; dropping message");
             }
         }
     }
@@ -328,14 +365,18 @@ impl StratumServer {
                         nonce_1: session.nonce_1.clone(),
                         nonce2_size: self.nonce_allocator.nonce2_size(),
                     });
-                    // Send difficulty in both formats so all miners understand it.
-                    // Pool-core will send the actual target after authorize.
-                    responses.push(ServerMessage::SetDifficulty {
-                        difficulty: 8192.0,
-                    });
-                    responses.push(ServerMessage::SetTarget {
-                        target: "000042e340f98608c00000000000000000000000000000000000000000000000".to_string(),
-                    });
+                    // Announce this port's configured starting difficulty, in
+                    // both formats so all miners understand it. Pool-core sends
+                    // the authoritative target after authorize (password d=
+                    // overrides apply there); pool checkers that never
+                    // authorize (e.g. MiningRigRentals) only ever see this one.
+                    let (difficulty, target) = self
+                        .port_initial
+                        .get(&local_port)
+                        .unwrap_or(&self.fallback_initial)
+                        .clone();
+                    responses.push(ServerMessage::SetDifficulty { difficulty });
+                    responses.push(ServerMessage::SetTarget { target });
                     let latest = self.latest_notify.read().await;
                     if let Some(ref notify) = *latest {
                         // A new subscriber has no prior work, so its first job
@@ -360,6 +401,28 @@ impl StratumServer {
                         id,
                         authorized: false,
                         error: Some(StratumError::not_subscribed()),
+                    });
+                    return responses;
+                }
+
+                // SECURITY: validate worker_name to a safe charset before it is
+                // stored (as miners.address / workers.name) and later rendered in
+                // the admin/dashboard UI. Legit Zcash addresses and worker labels
+                // are alphanumeric with . _ - ; rejecting anything else prevents a
+                // stored-XSS payload (< > " ' & ...) reaching an operator's admin
+                // session, and blocks empty-name / junk-row / unbounded-INSERT abuse.
+                let wn_ok = !worker_name.is_empty()
+                    && worker_name.len() <= 256
+                    && worker_name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                if !wn_ok {
+                    responses.push(ServerMessage::AuthorizeResult {
+                        id,
+                        authorized: false,
+                        error: Some(StratumError::other(
+                            "Invalid worker name (allowed characters: A-Z a-z 0-9 . _ -)",
+                        )),
                     });
                     return responses;
                 }
@@ -437,5 +500,67 @@ impl StratumServer {
         }
 
         responses
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::MinerSession;
+
+    fn server_with_ports() -> StratumServer {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (mut server, _notify_rx) = StratumServer::new(4, event_tx);
+        let mut per_port = HashMap::new();
+        per_port.insert(3336u16, (10_000_000.0, "aa".repeat(32)));
+        server.set_initial_difficulty(per_port, (100.0, "bb".repeat(32)));
+        server
+    }
+
+    async fn subscribe_on(server: &StratumServer, local_port: u16) -> Vec<ServerMessage> {
+        let mut session = MinerSession::new("s1".into(), "de810000".into());
+        server
+            .handle_request(
+                &mut session,
+                ClientRequest::Subscribe {
+                    id: serde_json::json!(1),
+                    user_agent: "test/1.0".into(),
+                    session_id: None,
+                    host: None,
+                    port: None,
+                },
+                "127.0.0.1:55555".parse().unwrap(),
+                local_port,
+            )
+            .await
+    }
+
+    fn announced(responses: &[ServerMessage]) -> (f64, String) {
+        let mut diff = None;
+        let mut target = None;
+        for r in responses {
+            match r {
+                ServerMessage::SetDifficulty { difficulty } => diff = Some(*difficulty),
+                ServerMessage::SetTarget { target: t } => target = Some(t.clone()),
+                _ => {}
+            }
+        }
+        (diff.expect("no set_difficulty sent"), target.expect("no set_target sent"))
+    }
+
+    #[tokio::test]
+    async fn subscribe_announces_port_initial_difficulty() {
+        let server = server_with_ports();
+        let (diff, target) = announced(&subscribe_on(&server, 3336).await);
+        assert_eq!(diff, 10_000_000.0);
+        assert_eq!(target, "aa".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn subscribe_falls_back_on_unmapped_port() {
+        let server = server_with_ports();
+        let (diff, target) = announced(&subscribe_on(&server, 1234).await);
+        assert_eq!(diff, 100.0);
+        assert_eq!(target, "bb".repeat(32));
     }
 }

@@ -7,6 +7,10 @@ use crate::models::*;
 pub enum DbError {
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    /// The payout guard matched 0 rows: the miner's pending is below the amount
+    /// (already settled). Returned instead of blindly driving pending negative.
+    #[error("Payout guard: miner {miner_id} pending < {amount} zat (already settled?), refusing to double-debit")]
+    InsufficientPending { miner_id: i64, amount: i64 },
 }
 
 /// Database access layer for the mining pool.
@@ -47,7 +51,127 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_009).execute(&self.pool).await;
         let migration_010 = include_str!("../migrations/010_tx_costs.sql");
         let _ = sqlx::raw_sql(migration_010).execute(&self.pool).await;
+        let migration_012 = include_str!("../migrations/012_payout_reservation.sql");
+        let _ = sqlx::raw_sql(migration_012).execute(&self.pool).await;
+        let migration_013 = include_str!("../migrations/013_block_submissions.sql");
+        let _ = sqlx::raw_sql(migration_013).execute(&self.pool).await;
+        let migration_014 = include_str!("../migrations/014_shares_rollup.sql");
+        let _ = sqlx::raw_sql(migration_014).execute(&self.pool).await;
         Ok(())
+    }
+
+    /// Audit #16: migrations run best-effort for idempotence, which means a
+    /// partially-applied migration could leave a schema hole the process then
+    /// runs on top of (upstream of the block-90 class). Refuse to start
+    /// instead: verify every table/column the money path depends on.
+    pub async fn assert_critical_schema(&self) -> Result<(), DbError> {
+        let tables = [
+            "miners", "workers", "shares", "blocks", "balances", "payouts",
+            "payout_attempts", "payout_items", "block_credits",
+            "orphan_clawbacks", "pool_tx_costs", "block_submissions",
+            "shares_rollup", "pool_status",
+        ];
+        for t in tables {
+            let n: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            )
+            .bind(t)
+            .fetch_one(&self.pool)
+            .await?;
+            if n.0 == 0 {
+                return Err(DbError::Sqlx(sqlx::Error::Protocol(format!(
+                    "critical table missing after migrations: {t}"
+                ))));
+            }
+        }
+        for (table, col) in [("balances", "paying"), ("blocks", "actual_reward"), ("blocks", "costs_recovered")] {
+            let n: (i64,) = sqlx::query_as(&format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"
+            ))
+            .bind(col)
+            .fetch_one(&self.pool)
+            .await?;
+            if n.0 == 0 {
+                return Err(DbError::Sqlx(sqlx::Error::Protocol(format!(
+                    "critical column missing after migrations: {table}.{col}"
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// Audit #16: aggregate full UTC hours of shares older than
+    /// `older_than_days` into `shares_rollup` and delete the raw rows — one
+    /// hour per BEGIN IMMEDIATE transaction (atomic: rollup and delete land
+    /// together), up to `max_hours` per call. Returns (hours, rows_deleted).
+    pub async fn rollup_and_prune_shares(
+        &self,
+        older_than_days: i64,
+        max_hours: i64,
+    ) -> Result<(i64, i64), DbError> {
+        let mut hours = 0i64;
+        let mut deleted = 0i64;
+        loop {
+            if hours >= max_hours {
+                break;
+            }
+            let bucket: Option<(String,)> = sqlx::query_as(
+                "SELECT strftime('%Y-%m-%d %H:00:00', created_at) AS b FROM shares \
+                 WHERE created_at < datetime('now', '-' || ?1 || ' days') \
+                 ORDER BY created_at ASC LIMIT 1",
+            )
+            .bind(older_than_days)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some((bucket,)) = bucket else { break };
+
+            let mut conn = self.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let res: Result<i64, DbError> = async {
+                let agg: (i64, f64) = sqlx::query_as(
+                    "SELECT COUNT(*), COALESCE(SUM(difficulty), 0.0) FROM shares \
+                     WHERE created_at >= ?1 AND created_at < datetime(?1, '+1 hour')",
+                )
+                .bind(&bucket)
+                .fetch_one(&mut *conn)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO shares_rollup (bucket, cnt, diff_sum) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(bucket) DO UPDATE SET cnt = excluded.cnt + shares_rollup.cnt, \
+                     diff_sum = excluded.diff_sum + shares_rollup.diff_sum",
+                )
+                .bind(&bucket)
+                .bind(agg.0)
+                .bind(agg.1)
+                .execute(&mut *conn)
+                .await?;
+                let del = sqlx::query(
+                    "DELETE FROM shares WHERE created_at >= ?1 AND created_at < datetime(?1, '+1 hour')",
+                )
+                .bind(&bucket)
+                .execute(&mut *conn)
+                .await?;
+                Ok(del.rows_affected() as i64)
+            }
+            .await;
+            match res {
+                Ok(d) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                    Ok(_) => {
+                        hours += 1;
+                        deleted += d;
+                    }
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(e.into());
+                    }
+                },
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok((hours, deleted))
     }
 
     /// Insert a new payout attempt row in 'queued' state. Returns the row id.
@@ -135,6 +259,7 @@ impl PoolDb {
              FROM payout_attempts
              WHERE status IN ('queued', 'sent')
                AND created_at < datetime('now', '-' || ?1 || ' minutes')
+               AND NOT EXISTS (SELECT 1 FROM payout_items pi WHERE pi.attempt_id = payout_attempts.id)
              ORDER BY id ASC",
         )
         .bind(stale_minutes)
@@ -200,8 +325,12 @@ impl PoolDb {
         )
         .fetch_one(&self.pool)
         .await?;
+        // Include `paying` (round-3 in-flight reservations): funds mid-payout
+        // are moved pending -> paying -> paid, so all three buckets count toward
+        // what the pool owes, or the invariant would show false drift whenever a
+        // payout is reserved-but-not-yet-confirmed.
         let balances: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(pending), 0) + COALESCE(SUM(paid), 0) FROM balances",
+            "SELECT COALESCE(SUM(pending), 0) + COALESCE(SUM(paying), 0) + COALESCE(SUM(paid), 0) FROM balances",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -374,9 +503,14 @@ impl PoolDb {
     }
 
     pub async fn get_total_shares_count(&self) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM shares")
-            .fetch_one(&self.pool)
-            .await?;
+        // Audit #16: all-time total = archived hourly rollup + remaining raw
+        // rows. Exact across retention pruning, and no all-time table scan.
+        let row: (i64,) = sqlx::query_as(
+            "SELECT (SELECT COALESCE(SUM(cnt), 0) FROM shares_rollup) + \
+                    (SELECT COUNT(*) FROM shares)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.0)
     }
 
@@ -472,11 +606,41 @@ impl PoolDb {
         &self,
         block_id: i64,
     ) -> Result<Option<(i64, i64)>, DbError> {
+        // Read-then-write: take the write lock UP FRONT with BEGIN IMMEDIATE. A
+        // plain DEFERRED tx (self.pool.begin()) reads first and pins a WAL
+        // snapshot; if the pool's block-find writer commits before our first
+        // UPDATE, the write fails with SQLITE_BUSY_SNAPSHOT — which busy_timeout
+        // does NOT retry. Holding the write lock before the first read makes the
+        // whole transaction see one consistent, exclusive snapshot.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match Self::reverse_block_credits_precise_txn(&mut *conn, block_id).await {
+            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(v),
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Body of `reverse_block_credits_precise`, run inside the BEGIN IMMEDIATE
+    /// transaction held on `conn` so reads and writes share one exclusive
+    /// snapshot (no BUSY_SNAPSHOT window between the SELECT and the UPDATEs).
+    async fn reverse_block_credits_precise_txn(
+        conn: &mut sqlx::SqliteConnection,
+        block_id: i64,
+    ) -> Result<Option<(i64, i64)>, DbError> {
         let credits: Vec<(i64, i64)> = sqlx::query(
             "SELECT miner_id, amount FROM block_credits WHERE block_id = ?1",
         )
         .bind(block_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await?
         .iter()
         .map(|r| (r.get("miner_id"), r.get("amount")))
@@ -486,14 +650,13 @@ impl PoolDb {
             return Ok(None);
         }
 
-        let mut tx = self.pool.begin().await?;
         let mut reversed: i64 = 0;
         let mut clawback: i64 = 0;
         for (miner_id, amount) in credits {
             let pending: (i64,) =
                 sqlx::query_as("SELECT COALESCE(pending, 0) FROM balances WHERE miner_id = ?1")
                     .bind(miner_id)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(&mut *conn)
                     .await?
                     .unwrap_or((0,));
             let recoverable = amount.min(pending.0).max(0);
@@ -502,7 +665,7 @@ impl PoolDb {
                 sqlx::query("UPDATE balances SET pending = pending - ?1 WHERE miner_id = ?2")
                     .bind(recoverable)
                     .bind(miner_id)
-                    .execute(&mut *tx)
+                    .execute(&mut *conn)
                     .await?;
                 reversed += recoverable;
             }
@@ -513,7 +676,7 @@ impl PoolDb {
                 .bind(block_id)
                 .bind(miner_id)
                 .bind(shortfall)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
                 clawback += shortfall;
             }
@@ -521,7 +684,7 @@ impl PoolDb {
         // Remove the credit rows so a double-reversal is impossible.
         sqlx::query("DELETE FROM block_credits WHERE block_id = ?1")
             .bind(block_id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         // The costs this block's distribution absorbed were real (the
         // wallet paid them) but the covering reward is gone — re-queue
@@ -529,7 +692,7 @@ impl PoolDb {
         let recovered: (i64,) =
             sqlx::query_as("SELECT COALESCE(costs_recovered, 0) FROM blocks WHERE id = ?1")
                 .bind(block_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut *conn)
                 .await?;
         if recovered.0 > 0 {
             sqlx::query(
@@ -537,14 +700,13 @@ impl PoolDb {
             )
             .bind(block_id)
             .bind(recovered.0)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
             sqlx::query("UPDATE blocks SET costs_recovered = 0 WHERE id = ?1")
                 .bind(block_id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
         }
-        tx.commit().await?;
         Ok(Some((reversed, clawback)))
     }
 
@@ -628,11 +790,37 @@ impl PoolDb {
     /// recovered and stamps the total on the block. Returns the amount the
     /// distribution should deduct. One transaction.
     pub async fn take_costs_for_block(&self, block_id: i64, cap: i64) -> Result<i64, DbError> {
-        let mut tx = self.pool.begin().await?;
+        // Read-then-write: BEGIN IMMEDIATE takes the write lock before the initial
+        // SELECT so a concurrent writer can't invalidate our snapshot before the
+        // UPDATEs (SQLITE_BUSY_SNAPSHOT, which busy_timeout does not retry).
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match Self::take_costs_for_block_txn(&mut *conn, block_id, cap).await {
+            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(v),
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Body of `take_costs_for_block`, run inside the BEGIN IMMEDIATE transaction
+    /// held on `conn`.
+    async fn take_costs_for_block_txn(
+        conn: &mut sqlx::SqliteConnection,
+        block_id: i64,
+        cap: i64,
+    ) -> Result<i64, DbError> {
         let rows: Vec<(i64, i64)> = sqlx::query(
             "SELECT id, fee FROM pool_tx_costs WHERE recovered = 0 ORDER BY id ASC",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?
         .iter()
         .map(|r| (r.get("id"), r.get("fee")))
@@ -650,18 +838,127 @@ impl PoolDb {
         for id in &ids {
             sqlx::query("UPDATE pool_tx_costs SET recovered = 1 WHERE id = ?1")
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
         }
         if taken > 0 {
             sqlx::query("UPDATE blocks SET costs_recovered = ?1 WHERE id = ?2")
                 .bind(taken)
                 .bind(block_id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
         }
-        tx.commit().await?;
         Ok(taken)
+    }
+
+    // -- Audit #15: block-found durability (breadcrumb + startup sweep) --
+
+    /// Durable breadcrumb written BEFORE submitblock so a crash between submit
+    /// and record_block can be recovered by the startup sweep.
+    pub async fn record_block_submission(
+        &self,
+        height: i64,
+        hash: &str,
+        worker_id: i64,
+        reward: i64,
+        actual_reward: Option<i64>,
+    ) -> Result<i64, DbError> {
+        let r = sqlx::query(
+            "INSERT INTO block_submissions (height, hash, worker_id, reward, actual_reward) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(height)
+        .bind(hash)
+        .bind(worker_id)
+        .bind(reward)
+        .bind(actual_reward)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.last_insert_rowid())
+    }
+
+    /// Settle a breadcrumb once the block's fate is known.
+    pub async fn resolve_block_submission(&self, id: i64, outcome: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE block_submissions SET resolved = 1, outcome = ?1 WHERE id = ?2")
+            .bind(outcome)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Breadcrumbs whose fate was never settled (crash between submit and
+    /// record). Returns (id, height, hash, worker_id, reward, actual_reward).
+    pub async fn get_open_block_submissions(
+        &self,
+    ) -> Result<Vec<(i64, i64, String, i64, i64, Option<i64>)>, DbError> {
+        let rows: Vec<(i64, i64, String, i64, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT id, height, hash, worker_id, reward, actual_reward \
+             FROM block_submissions WHERE resolved = 0 ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Block id for an exact stored hash, if recorded.
+    pub async fn get_block_id_by_hash(&self, hash: &str) -> Result<Option<i64>, DbError> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM blocks WHERE hash = ?1")
+            .bind(hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Recent non-orphaned blocks with ZERO credit rows — the block-90 failure
+    /// class (distribution swallowed after recording). The startup sweep
+    /// redistributes them. Recency bound keeps ancient pre-008 blocks out.
+    /// Returns (block_id, height, distribution_basis, found_by_worker_id).
+    pub async fn get_recent_blocks_missing_credits(
+        &self,
+        days: i64,
+    ) -> Result<Vec<(i64, i64, i64, i64)>, DbError> {
+        let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT b.id, b.height, COALESCE(b.actual_reward, b.reward), b.found_by \
+             FROM blocks b \
+             WHERE b.status IN ('pending', 'confirmed') \
+               AND b.created_at > datetime('now', '-' || ?1 || ' days') \
+               AND NOT EXISTS (SELECT 1 FROM block_credits bc WHERE bc.block_id = b.id) \
+             ORDER BY b.id ASC",
+        )
+        .bind(days)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Bump a worker's last_seen (audit #15: called on a ~30s cadence from the
+    /// validator's per-session cache instead of once per share).
+    pub async fn touch_worker(&self, worker_id: i64) -> Result<(), DbError> {
+        sqlx::query("UPDATE workers SET last_seen = datetime('now') WHERE id = ?1")
+            .bind(worker_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Confirmed blocks strictly above `height`, ascending, capped at `limit`.
+    /// Used by the reconciler's coinbase-output check to walk forward from its
+    /// persisted watermark. Returns (height, hash).
+    pub async fn get_confirmed_blocks_above(
+        &self,
+        height: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, String)>, DbError> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT height, hash FROM blocks WHERE status = 'confirmed' AND height > ?1 \
+             ORDER BY height ASC LIMIT ?2",
+        )
+        .bind(height)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     pub async fn get_recent_blocks(&self, limit: i64) -> Result<Vec<Block>, DbError> {
@@ -790,6 +1087,70 @@ impl PoolDb {
     }
 
     /// Reverse PPLNS credits for an orphaned block by subtracting reward from pending balances.
+    /// Atomically orphan a block: reverse its credits AND flip status to
+    /// 'orphaned' in ONE BEGIN IMMEDIATE transaction (audit #14 — the old
+    /// order, status first / reversal second as two calls, left permanent
+    /// phantom credits if the process died between them). Precise reversal
+    /// when block_credits rows exist; legacy proportional fallback for
+    /// pre-migration-008 blocks. Returns Some((reversed, clawback)) for
+    /// precise, None when the legacy fallback ran.
+    pub async fn orphan_block(
+        &self,
+        block_id: i64,
+        block_reward: i64,
+    ) -> Result<Option<(i64, i64)>, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match Self::orphan_block_txn(&mut *conn, block_id, block_reward).await {
+            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(v),
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn orphan_block_txn(
+        conn: &mut sqlx::SqliteConnection,
+        block_id: i64,
+        block_reward: i64,
+    ) -> Result<Option<(i64, i64)>, DbError> {
+        let outcome = Self::reverse_block_credits_precise_txn(&mut *conn, block_id).await?;
+        if outcome.is_none() {
+            // Pre-008 block: no credit rows. Legacy proportional reversal,
+            // inside the SAME transaction as the status flip.
+            let total_pending: (i64,) = sqlx::query_as(
+                "SELECT COALESCE(SUM(pending), 0) FROM balances WHERE pending > 0",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if total_pending.0 > 0 {
+                let reversal = block_reward.min(total_pending.0);
+                sqlx::query(
+                    "UPDATE balances SET pending = MAX(0, pending - CAST(pending * 1.0 * ?1 / ?2 AS INTEGER)) \
+                     WHERE pending > 0",
+                )
+                .bind(reversal)
+                .bind(total_pending.0)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+        sqlx::query("UPDATE blocks SET status = 'orphaned' WHERE id = ?1")
+            .bind(block_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(outcome)
+    }
+
+    /// Legacy proportional reversal (pre-008 blocks). Prefer `orphan_block`,
+    /// which wraps this logic atomically with the status flip.
     pub async fn reverse_block_credits(&self, block_reward: i64) -> Result<(), DbError> {
         // Distribute the reversal proportionally across all miners with pending balance
         let total_pending: (i64,) = sqlx::query_as(
@@ -934,24 +1295,368 @@ impl PoolDb {
         amount: i64,
         txid: &str,
     ) -> Result<i64, DbError> {
+        // Atomic + guarded. The debit runs first, guarded by `pending >= amount`
+        // so it can never drive pending negative (double-debit); the payout row
+        // is inserted in the SAME transaction so a crash between them can't leave
+        // pending un-debited (which would re-pay next round — the documented
+        // 2026-06-11 double-pay class). If the guard matches 0 rows the balance
+        // is already settled: roll back and surface InsufficientPending rather
+        // than record a phantom payout.
+        let mut tx = self.pool.begin().await?;
+
+        let debit = sqlx::query(
+            "UPDATE balances SET pending = pending - ?1, paid = paid + ?1 \
+             WHERE miner_id = ?2 AND pending >= ?1",
+        )
+        .bind(amount)
+        .bind(miner_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if debit.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Err(DbError::InsufficientPending { miner_id, amount });
+        }
+
         let result = sqlx::query(
             "INSERT INTO payouts (miner_id, txid, amount) VALUES (?1, ?2, ?3)",
         )
         .bind(miner_id)
         .bind(txid)
         .bind(amount)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "UPDATE balances SET pending = pending - ?1, paid = paid + ?1 WHERE miner_id = ?2",
-        )
-        .bind(amount)
-        .bind(miner_id)
-        .execute(&self.pool)
-        .await?;
-
+        tx.commit().await?;
         Ok(result.last_insert_rowid())
+    }
+
+    /// Audit #19: auto-void a recorded payout whose tx was reorged out and
+    /// expired (node authoritatively answered -5). Miners were never actually
+    /// paid — the wallet kept the funds — so the books are corrected: paid ->
+    /// pending per miner, payout rows deleted, matching attempt marked failed.
+    /// The next payout cycle re-pays automatically.
+    ///
+    /// Guards (conservative by construction):
+    ///  - every payout row for the txid must be older than 60 minutes (past
+    ///    tx-expiry; a merely-slow tx can never be voided) — else Ok((0,0));
+    ///  - the per-miner debit requires `paid >= amount` (never drives paid
+    ///    negative) — a guard miss rolls the whole void back.
+    /// One BEGIN IMMEDIATE transaction; idempotent (second call sees no rows).
+    /// Returns (rows_voided, zatoshis_returned_to_pending).
+    pub async fn void_reorged_payout(&self, txid: &str) -> Result<(i64, i64), DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match Self::void_reorged_payout_txn(&mut *conn, txid).await {
+            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(v),
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn void_reorged_payout_txn(
+        conn: &mut sqlx::SqliteConnection,
+        txid: &str,
+    ) -> Result<(i64, i64), DbError> {
+        // Age guard: any row younger than 60 min -> not eligible yet.
+        let fresh: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM payouts WHERE txid = ?1 \
+             AND created_at > datetime('now', '-60 minutes')",
+        )
+        .bind(txid)
+        .fetch_one(&mut *conn)
+        .await?;
+        if fresh.0 > 0 {
+            return Ok((0, 0));
+        }
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT id, miner_id, amount FROM payouts WHERE txid = ?1",
+        )
+        .bind(txid)
+        .fetch_all(&mut *conn)
+        .await?;
+        if rows.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut zats = 0i64;
+        for (_id, miner_id, amount) in &rows {
+            let upd = sqlx::query(
+                "UPDATE balances SET paid = paid - ?1, pending = pending + ?1 \
+                 WHERE miner_id = ?2 AND paid >= ?1",
+            )
+            .bind(amount)
+            .bind(miner_id)
+            .execute(&mut *conn)
+            .await?;
+            if upd.rows_affected() == 0 {
+                // paid < amount: books don't support this void — abort whole tx.
+                return Err(DbError::Sqlx(sqlx::Error::Protocol(format!(
+                    "auto-void aborted: miner {miner_id} paid < {amount} for txid {txid}"
+                ))));
+            }
+            zats += amount;
+        }
+        sqlx::query("DELETE FROM payouts WHERE txid = ?1")
+            .bind(txid)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "UPDATE payout_attempts SET status = 'failed', updated_at = datetime('now'), \
+             error_message = 'auto-void: tx reorged out and expired (-5); funds returned to pending' \
+             WHERE txid = ?1 AND status = 'confirmed'",
+        )
+        .bind(txid)
+        .execute(&mut *conn)
+        .await?;
+        Ok((rows.len() as i64, zats))
+    }
+
+    // -- Round-3 pre-debit payout saga (reserve -> confirm | refund) --
+    //
+    // Replaces the "debit in create_payout AFTER the send" flow. The payout loop
+    // RESERVES funds (pending -> paying) before z_sendmany, then CONFIRMS
+    // (paying -> paid) once the tx is on chain, or REFUNDS (paying -> pending) if
+    // it never broadcast. A crash between reserve and confirm leaves the funds in
+    // `paying` (out of `pending`), so the loop can't re-select them; startup
+    // reconciliation resolves the in-flight attempt from its on-chain txid.
+
+    /// Reserve funds for an in-flight payout: for each (miner_id, amount) move
+    /// `pending -> paying` (guarded by `pending >= amount`) and record a
+    /// payout_items row under `attempt_id`. Miners whose pending changed since
+    /// selection (guard matches 0 rows) are skipped. Returns the pairs actually
+    /// reserved so the caller sends to exactly those. One BEGIN IMMEDIATE tx.
+    pub async fn reserve_payout(
+        &self,
+        attempt_id: i64,
+        items: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match Self::reserve_payout_txn(&mut *conn, attempt_id, items).await {
+            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(v),
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn reserve_payout_txn(
+        conn: &mut sqlx::SqliteConnection,
+        attempt_id: i64,
+        items: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, DbError> {
+        let mut reserved: Vec<(i64, i64)> = Vec::new();
+        for &(miner_id, amount) in items {
+            if amount <= 0 {
+                continue;
+            }
+            let debit = sqlx::query(
+                "UPDATE balances SET pending = pending - ?1, paying = paying + ?1 \
+                 WHERE miner_id = ?2 AND pending >= ?1",
+            )
+            .bind(amount)
+            .bind(miner_id)
+            .execute(&mut *conn)
+            .await?;
+            if debit.rows_affected() == 0 {
+                // pending fell below `amount` since selection — skip rather than
+                // drive pending negative; the miner is picked up next cycle.
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO payout_items (attempt_id, miner_id, amount) VALUES (?1, ?2, ?3)",
+            )
+            .bind(attempt_id)
+            .bind(miner_id)
+            .bind(amount)
+            .execute(&mut *conn)
+            .await?;
+            reserved.push((miner_id, amount));
+        }
+        Ok(reserved)
+    }
+
+    /// Finalize a confirmed on-chain payout: for each reserved item of
+    /// `attempt_id` move `paying -> paid` and insert a `payouts` row with `txid`,
+    /// then delete the items so a re-run (startup reconciliation) is a no-op.
+    /// Returns the number of items finalized. One BEGIN IMMEDIATE tx.
+    pub async fn confirm_payout(&self, attempt_id: i64, txid: &str) -> Result<i64, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match Self::confirm_payout_txn(&mut *conn, attempt_id, txid).await {
+            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(v),
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn confirm_payout_txn(
+        conn: &mut sqlx::SqliteConnection,
+        attempt_id: i64,
+        txid: &str,
+    ) -> Result<i64, DbError> {
+        let items: Vec<(i64, i64)> = sqlx::query(
+            "SELECT miner_id, amount FROM payout_items WHERE attempt_id = ?1",
+        )
+        .bind(attempt_id)
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .map(|r| (r.get("miner_id"), r.get("amount")))
+        .collect();
+
+        let mut finalized: i64 = 0;
+        for (miner_id, amount) in &items {
+            let upd = sqlx::query(
+                "UPDATE balances SET paying = paying - ?1, paid = paid + ?1 \
+                 WHERE miner_id = ?2 AND paying >= ?1",
+            )
+            .bind(amount)
+            .bind(miner_id)
+            .execute(&mut *conn)
+            .await?;
+            if upd.rows_affected() == 0 {
+                // paying < amount: reservation already accounted for. Skip the
+                // payouts row so we never record an unbacked payment.
+                continue;
+            }
+            sqlx::query("INSERT INTO payouts (miner_id, txid, amount) VALUES (?1, ?2, ?3)")
+                .bind(miner_id)
+                .bind(txid)
+                .bind(amount)
+                .execute(&mut *conn)
+                .await?;
+            finalized += 1;
+        }
+        sqlx::query("DELETE FROM payout_items WHERE attempt_id = ?1")
+            .bind(attempt_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(finalized)
+    }
+
+    /// Refund an in-flight reservation that never reached the chain: for each
+    /// reserved item of `attempt_id` move `paying -> pending` and delete the
+    /// items. The funds return to payable and are retried next cycle. Idempotent.
+    /// Returns the number of items refunded. One BEGIN IMMEDIATE tx.
+    pub async fn refund_payout(&self, attempt_id: i64) -> Result<i64, DbError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match Self::refund_payout_txn(&mut *conn, attempt_id).await {
+            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(v),
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn refund_payout_txn(
+        conn: &mut sqlx::SqliteConnection,
+        attempt_id: i64,
+    ) -> Result<i64, DbError> {
+        let items: Vec<(i64, i64)> = sqlx::query(
+            "SELECT miner_id, amount FROM payout_items WHERE attempt_id = ?1",
+        )
+        .bind(attempt_id)
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .map(|r| (r.get("miner_id"), r.get("amount")))
+        .collect();
+
+        let mut refunded: i64 = 0;
+        for (miner_id, amount) in &items {
+            sqlx::query(
+                "UPDATE balances SET paying = paying - ?1, pending = pending + ?1 \
+                 WHERE miner_id = ?2 AND paying >= ?1",
+            )
+            .bind(amount)
+            .bind(miner_id)
+            .execute(&mut *conn)
+            .await?;
+            refunded += 1;
+        }
+        sqlx::query("DELETE FROM payout_items WHERE attempt_id = ?1")
+            .bind(attempt_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(refunded)
+    }
+
+    /// In-flight reservations awaiting resolution: payout_attempts that still
+    /// hold payout_items (funds sitting in `paying`). Startup reconciliation
+    /// (older_than_minutes = None) walks all of them; the periodic reconciler
+    /// passes a staleness so it never touches an attempt the live payout loop is
+    /// still processing. Returns (attempt_id, status, opid, txid, total_zats).
+    pub async fn get_reserved_attempts(
+        &self,
+        older_than_minutes: Option<i64>,
+    ) -> Result<Vec<(i64, String, Option<String>, Option<String>, i64, String)>, DbError> {
+        let base = "SELECT pa.id, pa.status, pa.opid, pa.txid, pa.created_at, \
+                    COALESCE(SUM(pi.amount), 0) AS total \
+             FROM payout_attempts pa \
+             JOIN payout_items pi ON pi.attempt_id = pa.id ";
+        let rows: Vec<SqliteRow> = match older_than_minutes {
+            Some(mins) => {
+                sqlx::query(&format!(
+                    "{base} WHERE pa.created_at < datetime('now', '-' || ?1 || ' minutes') \
+                     GROUP BY pa.id, pa.status, pa.opid, pa.txid, pa.created_at ORDER BY pa.id ASC"
+                ))
+                .bind(mins)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(&format!(
+                    "{base} GROUP BY pa.id, pa.status, pa.opid, pa.txid, pa.created_at ORDER BY pa.id ASC"
+                ))
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<i64, _>("id"),
+                    r.get::<String, _>("status"),
+                    r.get::<Option<String>, _>("opid"),
+                    r.get::<Option<String>, _>("txid"),
+                    r.get::<i64, _>("total"),
+                    r.get::<String, _>("created_at"),
+                )
+            })
+            .collect())
     }
 
     // -- Stats helpers --
