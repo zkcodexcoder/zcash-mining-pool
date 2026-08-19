@@ -14,6 +14,7 @@ config/zebrad.toml
 
 # Runtime logs, backups, operational artifacts
 *.log
-*.bak
+*.bak*
+*.orig
 backups/
 pool.db.*

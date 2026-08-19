@@ -107,6 +107,12 @@ if [ -n "$NR" ]; then
   report zallet_crashloop "$([ $((NR - NR0)) -lt 3 ] && echo 1 || echo 0)" \
     "zallet CRASH-LOOP: $((NR - NR0)) restarts within the hour (service still reads active between deaths)"
 fi
+# (a2) admin/ops brute-force attempts (audit #18): the dashboard logs every
+# failed login and every rate-limit rejection; alert when they appear.
+AUTH=$(tail -c 200000 "$POOL_DIR/dashboard.log" 2>/dev/null | grep -cE "login failed \(bad password\)|login rate-limited")
+report auth_bruteforce "$([ "${AUTH:-0}" = "0" ] && echo 1 || echo 0)" \
+  "admin/ops login attack: $AUTH failed/limited attempts in recent log — someone is guessing passwords"
+
 # (b) note-commitment-tree corruption signature in recent log
 TREE=$(tail -c 300000 /home/zebra/zallet.log 2>/dev/null | grep -cE "note commitment tree|Inserted root conflicts")
 report zallet_tree_corruption "$([ "${TREE:-0}" = "0" ] && echo 1 || echo 0)" \
