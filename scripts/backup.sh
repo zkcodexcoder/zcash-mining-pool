@@ -25,9 +25,15 @@ cp -f /home/zebra/.zallet-beta1/zallet.toml "$DEST/zallet-config.toml" 2>/dev/nu
 # 3. pool config (small, versionless — git-ignored on purpose).
 cp -f /home/zebra/zecminer/pool/config/pool.toml "$DEST/pool-config-$TS.toml"
 
-# 4. Rotate: keep 7 days of dated files.
+# 4. Git bundle — full repo history in the backup set. GitHub push has been
+#    broken since the account suspension (2026-07-01), so until a remote works
+#    again this is the only off-disk copy of the code history.
+git -C /home/zebra/zecminer/pool bundle create "$DEST/pool-repo-$TS.bundle" --all -q 2>/dev/null || true
+
+# 5. Rotate: keep 7 days of dated files.
 find "$DEST" -name 'pool-*.db.gz'         -mtime +7 -delete
 find "$DEST" -name 'wallet-*.db.gz'       -mtime +7 -delete
 find "$DEST" -name 'pool-config-*.toml'   -mtime +7 -delete
+find "$DEST" -name 'pool-repo-*.bundle'   -mtime +7 -delete
 
 echo "[$(date -u +%FT%TZ)] backup done: $(ls -lh $DEST/pool-$TS.db.gz $DEST/wallet-$TS.db.gz 2>/dev/null | awk '{print $5, $9}' | tr '\n' ' ')"
