@@ -258,6 +258,17 @@ struct PayoutConfig {
     /// only while total immature exposure stays within reserve_min.
     #[serde(default)]
     pay_immature: bool,
+    /// Payout coalescing (#21): skip a miner whose last payout is younger
+    /// than this, so steady earners get one batched payment instead of a
+    /// same-address tx burst every cycle. 0 disables. HOT-RELOADED: the
+    /// payout loop re-reads this from the config file every cycle.
+    #[serde(default)]
+    min_payout_interval_secs: u64,
+    /// Coalescing override (#21): a pending balance at or above this many
+    /// ZEC/TAZ is paid immediately regardless of the cooldown, so large
+    /// balances never wait on a timer. Unset = no override. HOT-RELOADED.
+    #[serde(default)]
+    coalesce_override_zec: Option<f64>,
 }
 
 fn default_minimum_payout() -> f64 {
@@ -297,6 +308,8 @@ impl Default for PayoutConfig {
             available_balance_margin: default_balance_margin(),
             reconcile_interval_secs: default_reconcile_interval(),
             pay_immature: false,
+            min_payout_interval_secs: 0,
+            coalesce_override_zec: None,
         }
     }
 }
@@ -735,6 +748,15 @@ async fn main() -> Result<()> {
 
         let balance_margin = config.payout.available_balance_margin.clamp(0.5, 1.0);
         let loop_wake = Arc::clone(&payout_wake);
+        let coalesce_fallback = (
+            config.payout.min_payout_interval_secs as i64,
+            config
+                .payout
+                .coalesce_override_zec
+                .map(|z| (z * ZATOSHIS_PER_ZEC) as i64)
+                .unwrap_or(i64::MAX),
+        );
+        let payout_config_path = config_path.clone();
         let payout_task = tokio::spawn(async move {
             run_payout_loop(
                 payout_db, node_rpc, payout_wallet_rpc,
@@ -743,6 +765,7 @@ async fn main() -> Result<()> {
                 maturity, interval,
                 &payout_network, pay_immature,
                 loop_wake,
+                payout_config_path, coalesce_fallback,
             ).await;
         });
         Some((payout_task, reconciler_handle))
@@ -813,6 +836,28 @@ const MAX_SHIELD_BATCHES_PER_CYCLE: u32 = 10;
 /// Timeout for waiting on a single async operation (shield or sendmany).
 const OP_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Re-read the coalescing knobs (#21) from the config file so they apply
+/// without a restart. Any read/parse problem falls back to the startup
+/// values — a bad config edit can never widen payouts mid-flight.
+fn reload_coalesce_knobs(config_path: &str, fallback: (i64, i64)) -> (i64, i64) {
+    let parsed = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| toml::from_str::<Config>(&s).ok());
+    match parsed {
+        Some(c) => (
+            c.payout.min_payout_interval_secs as i64,
+            c.payout
+                .coalesce_override_zec
+                .map(|z| (z * ZATOSHIS_PER_ZEC) as i64)
+                .unwrap_or(i64::MAX),
+        ),
+        None => {
+            warn!(config_path, "coalesce knob reload failed; keeping previous values");
+            fallback
+        }
+    }
+}
+
 async fn run_payout_loop(
     db: PoolDb,
     node_rpc: Arc<ZcashRpcClient>,
@@ -827,6 +872,8 @@ async fn run_payout_loop(
     network: &str,
     pay_immature: bool,
     wake: Arc<tokio::sync::Notify>,
+    config_path: String,
+    coalesce_fallback: (i64, i64),
 ) {
     info!("Payout loop started");
     // Short initial delay to let dashboard fully start before doing RPC work.
@@ -871,10 +918,12 @@ async fn run_payout_loop(
         }
 
         // Phase 3: Pay miners from shielded pool (respects reserve_min)
+        let (coalesce_cooldown, coalesce_override) =
+            reload_coalesce_knobs(&config_path, coalesce_fallback);
         match process_payouts(
             &db, &wallet_rpc, &node_rpc, pool_address, mining_address,
             min_payout_zatoshis, reserve_min_zatoshis, balance_margin, network,
-            pay_immature,
+            pay_immature, coalesce_cooldown, coalesce_override,
         ).await {
             Ok(count) => {
                 consecutive_payout_failures = 0;
@@ -1242,6 +1291,8 @@ async fn process_payouts(
     balance_margin: f64,
     network: &str,
     pay_immature: bool,
+    coalesce_cooldown_secs: i64,
+    coalesce_override_zatoshis: i64,
 ) -> anyhow::Result<usize> {
     // Immediate-payout safeguard: only skip the maturity gate while the
     // total credits on still-pending blocks (= worst-case orphan loss the
@@ -1261,7 +1312,12 @@ async fn process_payouts(
             );
         }
     }
-    let pending = db.get_pending_payouts(min_payout_zatoshis, include_immature).await?;
+    let pending = db
+        .get_pending_payouts(
+            min_payout_zatoshis, include_immature,
+            coalesce_cooldown_secs, coalesce_override_zatoshis,
+        )
+        .await?;
     if pending.is_empty() {
         return Ok(0);
     }

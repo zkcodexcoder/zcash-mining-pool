@@ -1312,32 +1312,49 @@ impl PoolDb {
     /// by the operator's reserve), the maturity gate is skipped and the full
     /// pending balance is payable at find time. The caller is responsible
     /// for the reserve safeguard (see `get_immature_exposure`).
+    /// `cooldown_secs`/`override_amount` implement payout coalescing (#21):
+    /// with a positive cooldown, a miner paid more recently than that many
+    /// seconds ago is skipped this round — unless their payable balance is
+    /// at or above `override_amount` (pass i64::MAX for "no override").
+    /// Skipped funds simply stay in `pending`; no invariant is affected.
     pub async fn get_pending_payouts(
         &self,
         min_amount: i64,
         include_immature: bool,
+        cooldown_secs: i64,
+        override_amount: i64,
     ) -> Result<Vec<PendingPayout>, DbError> {
+        let coalesce = " AND ( ?2 <= 0 OR t.payable >= ?3 OR NOT EXISTS ( \
+                 SELECT 1 FROM payouts p \
+                 WHERE p.miner_id = t.miner_id \
+                   AND p.created_at >= datetime('now', '-' || ?2 || ' seconds') \
+             )) ORDER BY t.payable DESC";
         let sql = if include_immature {
-            "SELECT b.miner_id, m.address, m.created_at, b.pending AS payable \
-             FROM balances b \
-             JOIN miners m ON m.id = b.miner_id \
-             WHERE b.pending >= ?1 \
-             ORDER BY payable DESC"
+            format!(
+                "SELECT * FROM ( \
+                     SELECT b.miner_id, m.address, m.created_at, b.pending AS payable \
+                     FROM balances b \
+                     JOIN miners m ON m.id = b.miner_id \
+                 ) AS t WHERE t.payable >= ?1{coalesce}"
+            )
         } else {
-            "SELECT * FROM ( \
-                 SELECT b.miner_id, m.address, m.created_at, \
-                        b.pending - COALESCE(( \
-                            SELECT SUM(bc.amount) FROM block_credits bc \
-                            JOIN blocks bl ON bc.block_id = bl.id \
-                            WHERE bc.miner_id = b.miner_id AND bl.status = 'pending' \
-                        ), 0) AS payable \
-                 FROM balances b \
-                 JOIN miners m ON m.id = b.miner_id \
-             ) WHERE payable >= ?1 \
-             ORDER BY payable DESC"
+            format!(
+                "SELECT * FROM ( \
+                     SELECT b.miner_id, m.address, m.created_at, \
+                            b.pending - COALESCE(( \
+                                SELECT SUM(bc.amount) FROM block_credits bc \
+                                JOIN blocks bl ON bc.block_id = bl.id \
+                                WHERE bc.miner_id = b.miner_id AND bl.status = 'pending' \
+                            ), 0) AS payable \
+                     FROM balances b \
+                     JOIN miners m ON m.id = b.miner_id \
+                 ) AS t WHERE t.payable >= ?1{coalesce}"
+            )
         };
-        let rows: Vec<SqliteRow> = sqlx::query(sql)
+        let rows: Vec<SqliteRow> = sqlx::query(&sql)
             .bind(min_amount)
+            .bind(cooldown_secs)
+            .bind(override_amount)
             .fetch_all(&self.pool)
             .await?;
 

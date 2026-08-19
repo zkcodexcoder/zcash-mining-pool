@@ -252,22 +252,69 @@ async fn test_immature_block_credits_not_payable() {
         .await
         .unwrap();
 
-    let payable = db.get_pending_payouts(1_000_000, false).await.unwrap();
+    let payable = db.get_pending_payouts(1_000_000, false, 0, i64::MAX).await.unwrap();
     assert!(
         payable.iter().all(|p| p.miner_id != m.id),
         "immature credits must not be payable: {payable:?}"
     );
 
     // With pay_immature (faucet mode) the same credits ARE payable at once.
-    let payable = db.get_pending_payouts(1_000_000, true).await.unwrap();
+    let payable = db.get_pending_payouts(1_000_000, true, 0, i64::MAX).await.unwrap();
     let row = payable.iter().find(|p| p.miner_id == m.id).expect("immediately payable");
     assert_eq!(row.amount, 123_750_000);
 
     // Block confirms → becomes payable in full.
     db.update_block_status(block_id, "confirmed").await.unwrap();
-    let payable = db.get_pending_payouts(1_000_000, false).await.unwrap();
+    let payable = db.get_pending_payouts(1_000_000, false, 0, i64::MAX).await.unwrap();
     let row = payable.iter().find(|p| p.miner_id == m.id).expect("now payable");
     assert_eq!(row.amount, 123_750_000);
+}
+
+#[tokio::test]
+async fn test_payout_coalescing_cooldown_and_override() {
+    let db = setup_db().await;
+    let recent = db.get_or_create_miner("utest1recent").await.unwrap();
+    let quiet = db.get_or_create_miner("utest1quiet").await.unwrap();
+    db.credit_balance(recent.id, 50_000_000).await.unwrap();
+    db.credit_balance(quiet.id, 50_000_000).await.unwrap();
+
+    // `recent` was just paid; `quiet` has no payout history.
+    db.credit_balance(recent.id, 10_000_000).await.unwrap();
+    db.create_payout(recent.id, 10_000_000, "aa11").await.unwrap();
+
+    // Cooldown off: both payable.
+    let p = db.get_pending_payouts(1_000_000, false, 0, i64::MAX).await.unwrap();
+    assert!(p.iter().any(|x| x.miner_id == recent.id));
+    assert!(p.iter().any(|x| x.miner_id == quiet.id));
+
+    // 30-min cooldown: the just-paid miner is skipped, the quiet one is not.
+    let p = db.get_pending_payouts(1_000_000, false, 1800, i64::MAX).await.unwrap();
+    assert!(
+        p.iter().all(|x| x.miner_id != recent.id),
+        "recently-paid miner must be coalesced: {p:?}"
+    );
+    assert!(p.iter().any(|x| x.miner_id == quiet.id));
+
+    // Override at/below the pending balance beats the cooldown.
+    let p = db.get_pending_payouts(1_000_000, false, 1800, 50_000_000).await.unwrap();
+    assert!(
+        p.iter().any(|x| x.miner_id == recent.id && x.amount == 50_000_000),
+        "override must bypass cooldown: {p:?}"
+    );
+
+    // Cooldown shorter than the payout's age no longer blocks (age > 0s is
+    // untestable without clock control, so assert the boundary via a payout
+    // stamped in the past).
+    sqlx::query("UPDATE payouts SET created_at = datetime('now','-3600 seconds') WHERE miner_id = ?1")
+        .bind(recent.id)
+        .execute(db.inner())
+        .await
+        .unwrap();
+    let p = db.get_pending_payouts(1_000_000, false, 1800, i64::MAX).await.unwrap();
+    assert!(
+        p.iter().any(|x| x.miner_id == recent.id),
+        "hour-old payout must not block a 30-min cooldown: {p:?}"
+    );
 }
 
 #[tokio::test]
