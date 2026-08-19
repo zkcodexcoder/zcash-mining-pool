@@ -91,11 +91,37 @@ pub struct NetworkMiningStats {
 }
 
 fn hex_to_ascii_lossy(hex: &str) -> String {
-    hex::decode(hex)
-        .unwrap_or_default()
-        .iter()
-        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
-        .collect()
+    // UTF-8-aware: renders multibyte sequences like the 🦓/🌸 coinbase markers,
+    // keeps printable ASCII (so substring pool detection still works), and
+    // shows '.' for other bytes (height push, opcodes, binary).
+    let bytes = hex::decode(hex).unwrap_or_default();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_graphic() || b == b' ' {
+            out.push(b as char);
+            i += 1;
+        } else if b >= 0xc2 {
+            // candidate UTF-8 multibyte lead; take the longest valid sequence
+            let max_len = if b >= 0xf0 { 4 } else if b >= 0xe0 { 3 } else { 2 };
+            let end = (i + max_len).min(bytes.len());
+            match std::str::from_utf8(&bytes[i..end]) {
+                Ok(s) if s.chars().next().is_some_and(|c| !c.is_control()) => {
+                    out.push_str(s);
+                    i = end;
+                }
+                _ => {
+                    out.push('.');
+                    i += 1;
+                }
+            }
+        } else {
+            out.push('.');
+            i += 1;
+        }
+    }
+    out
 }
 
 fn truncate_address(addr: &str) -> String {

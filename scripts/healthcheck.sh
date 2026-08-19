@@ -91,11 +91,72 @@ for a in out[:5]: print(a[:400])
 PY
 fi
 
-# --- testnet reachability (light) ---
-TN_OK=$(ssh -i /home/zebra/.ssh/zebra_host -o BatchMode=yes -o ConnectTimeout=8 zec@operational-host.invalid \
-  'systemctl is-active zcash-pool' 2>/dev/null)
-report testnet "$([ "$TN_OK" = "active" ] && echo 1 || echo 0)" \
-  "testnet pool unreachable or inactive ($TN_OK)"
+LOAD5=$(cut -d' ' -f2 /proc/loadavg)
+report load_pool_box "$(awk -v l="$LOAD5" 'BEGIN{print (l<6.0)?1:0}')" \
+  "pool box load5 is $LOAD5 (sustained high CPU)"
+
+# --- mainnet node .76 (RPC direct + one ssh probe) ---
+# EOS fuse of the RUNNING zakurad binary: v1.2.0 (cutover 2026-08-16) panics at
+# ~3,495,707 (~Sept 25). Re-bump at every rebuild/cutover (task #17 treadmill).
+EOS_PANIC_HEIGHT=3495707
+H76=$(curl -s --max-time 8 --data-binary '{"jsonrpc":"1.0","id":"hc","method":"getblockcount","params":[]}' \
+  -H 'content-type:text/plain;' http://operational-host.invalid:8232/ 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"])' 2>/dev/null)
+report node76_rpc "$([ -n "$H76" ] && echo 1 || echo 0)" "mainnet node .76 RPC not answering (pool cannot get work)"
+EOS_DAYS=""
+if [ -n "$H76" ]; then
+  # height-stall: alert if tip unchanged for 30 min (~24 expected blocks)
+  if [ -f "$STATE/node76_height" ]; then read -r LH LT < "$STATE/node76_height"; else LH=0; LT=$NOW; fi
+  if [ "$H76" != "$LH" ]; then echo "$H76 $NOW" > "$STATE/node76_height"; LT=$NOW; fi
+  report node76_stall "$([ $((NOW - LT)) -lt 1800 ] && echo 1 || echo 0)" \
+    "mainnet node tip stuck at $H76 for $(( (NOW-LT)/60 )) min (sync stalled?)"
+  EOS_DAYS=$(( (EOS_PANIC_HEIGHT - H76) / 1152 ))
+  report node76_eos "$([ "$EOS_DAYS" -ge 10 ] && echo 1 || echo 0)" \
+    "zakurad EOS panic in ~${EOS_DAYS} days (height $H76 / $EOS_PANIC_HEIGHT) — cutover NOW (task #17)"
+fi
+N76=$(ssh -i /home/zebra/.ssh/zebra_host -o BatchMode=yes -o ConnectTimeout=8 zebra@operational-host.invalid \
+  'pgrep -x zakurad >/dev/null && echo up || echo down; df --output=pcent / | tail -1 | tr -dc 0-9; echo; cut -d" " -f2 /proc/loadavg' 2>/dev/null)
+if [ -n "$N76" ]; then
+  report node76_ssh 1 "" "✅ recovered: node76_ssh"
+  report node76_zakurad "$([ "$(echo "$N76" | sed -n 1p)" = up ] && echo 1 || echo 0)" "zakurad process DOWN on .76"
+  report node76_disk "$([ "$(echo "$N76" | sed -n 2p)" -lt 90 ] 2>/dev/null && echo 1 || echo 0)" "disk at $(echo "$N76" | sed -n 2p)% on .76"
+  report node76_load "$(awk -v l="$(echo "$N76" | sed -n 3p)" 'BEGIN{print (l<6.0)?1:0}')" "node .76 load5 is $(echo "$N76" | sed -n 3p)"
+else
+  report node76_ssh 0 "mainnet node box .76 unreachable over SSH"
+fi
+
+# --- testnet pool box (one ssh probe: services + disk) ---
+TN=$(ssh -i /home/zebra/.ssh/zebra_host -o BatchMode=yes -o ConnectTimeout=8 zec@operational-host.invalid \
+  'systemctl is-active zcash-pool zcash-dashboard zallet | tr "\n" " "; echo; df --output=pcent / | tail -1 | tr -dc 0-9' 2>/dev/null)
+if [ -n "$TN" ]; then
+  report testnet_ssh 1 "" "✅ recovered: testnet_ssh"
+  TSVC=$(echo "$TN" | sed -n 1p)
+  report testnet "$([ "$TSVC" = "active active active " ] && echo 1 || echo 0)" \
+    "[testnet] services not all active (pool/dashboard/zallet = $TSVC)"
+  report testnet_disk "$([ "$(echo "$TN" | sed -n 2p)" -lt 90 ] 2>/dev/null && echo 1 || echo 0)" "[testnet] disk at $(echo "$TN" | sed -n 2p)%"
+else
+  report testnet_ssh 0 "[testnet] pool box unreachable over SSH"
+fi
+
+# --- testnet node .75 (one ssh probe: process + local RPC height + disk) ---
+N75=$(ssh -i /home/zebra/.ssh/zebra_host -o BatchMode=yes -o ConnectTimeout=8 zebra@operational-host.invalid \
+  'pgrep -x zakurad >/dev/null && echo up || echo down
+   curl -s --max-time 5 --data-binary "{\"jsonrpc\":\"1.0\",\"id\":\"hc\",\"method\":\"getblockcount\",\"params\":[]}" -H "content-type:text/plain;" http://127.0.0.1:18232/ | python3 -c "import sys,json;print(json.load(sys.stdin)[\"result\"])" 2>/dev/null
+   df --output=pcent / | tail -1 | tr -dc 0-9' 2>/dev/null)
+if [ -n "$N75" ]; then
+  report node75_ssh 1 "" "✅ recovered: node75_ssh"
+  report node75_zakurad "$([ "$(echo "$N75" | sed -n 1p)" = up ] && echo 1 || echo 0)" "[testnet] zakurad process DOWN on .75"
+  H75=$(echo "$N75" | sed -n 2p)
+  report node75_rpc "$([ -n "$H75" ] && echo 1 || echo 0)" "[testnet] node .75 RPC not answering"
+  if [ -n "$H75" ]; then
+    if [ -f "$STATE/node75_height" ]; then read -r LH75 LT75 < "$STATE/node75_height"; else LH75=0; LT75=$NOW; fi
+    if [ "$H75" != "$LH75" ]; then echo "$H75 $NOW" > "$STATE/node75_height"; LT75=$NOW; fi
+    report node75_stall "$([ $((NOW - LT75)) -lt 1800 ] && echo 1 || echo 0)" \
+      "[testnet] node tip stuck at $H75 for $(( (NOW-LT75)/60 )) min"
+  fi
+  report node75_disk "$([ "$(echo "$N75" | sed -n 3p)" -lt 90 ] 2>/dev/null && echo 1 || echo 0)" "[testnet] disk at $(echo "$N75" | sed -n 3p)% on .75"
+else
+  report node75_ssh 0 "[testnet] node box .75 unreachable over SSH"
+fi
 
 # --- daily heartbeat 09:00-09:04 UTC ---
 H=$(date -u +%H%M)
@@ -105,5 +166,5 @@ if [ "$H" -ge 0900 ] && [ "$H" -le 0904 ] && [ ! -f "$STATE/hb_$(date -u +%F)" ]
   BLOCKS=$(sq "SELECT COUNT(*) FROM blocks WHERE created_at >= datetime('now','-1 day');")
   PAID=$(sq "SELECT printf('%.4f', COALESCE(SUM(amount),0)/1e8) FROM payouts WHERE created_at >= datetime('now','-1 day');")
   PEND=$(sq "SELECT printf('%.4f', COALESCE(SUM(pending),0)/1e8) FROM balances;")
-  send "💓 daily: all monitored checks green. 24h: blocks=$BLOCKS paid=${PAID} ZEC, pending=${PEND} ZEC, template ${AGE}s, shares10m=$SH"
+  send "💓 daily: all monitored checks green. 24h: blocks=$BLOCKS paid=${PAID} ZEC, pending=${PEND} ZEC, template ${AGE}s, shares10m=$SH. mainnet h=${H76:-?} (EOS in ~${EOS_DAYS:-?}d), testnet h=${H75:-?}"
 fi
