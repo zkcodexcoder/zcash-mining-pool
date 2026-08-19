@@ -95,6 +95,36 @@ LOAD5=$(cut -d' ' -f2 /proc/loadavg)
 report load_pool_box "$(awk -v l="$LOAD5" 'BEGIN{print (l<6.0)?1:0}')" \
   "pool box load5 is $LOAD5 (sustained high CPU)"
 
+# --- zallet failure modes (2026-08-19: testnet crash-looped 24x before a
+# payout finally surfaced it; `is-active` misses loops because systemd
+# revives the service in seconds) ---
+# (a) crash-loop: NRestarts delta >= 3 within an hour
+NR=$(systemctl show zallet -p NRestarts --value 2>/dev/null)
+if [ -n "$NR" ]; then
+  if [ -f "$STATE/zallet_nr_window" ]; then read -r NR0 NRT < "$STATE/zallet_nr_window"; else NR0=$NR; NRT=$NOW; fi
+  if [ $((NOW - NRT)) -ge 3600 ]; then echo "$NR $NOW" > "$STATE/zallet_nr_window"; NR0=$NR; fi
+  [ ! -f "$STATE/zallet_nr_window" ] && echo "$NR $NOW" > "$STATE/zallet_nr_window"
+  report zallet_crashloop "$([ $((NR - NR0)) -lt 3 ] && echo 1 || echo 0)" \
+    "zallet CRASH-LOOP: $((NR - NR0)) restarts within the hour (service still reads active between deaths)"
+fi
+# (b) note-commitment-tree corruption signature in recent log
+TREE=$(tail -c 300000 /home/zebra/zallet.log 2>/dev/null | grep -cE "note commitment tree|Inserted root conflicts")
+report zallet_tree_corruption "$([ "${TREE:-0}" = "0" ] && echo 1 || echo 0)" \
+  "zallet NOTE-TREE CORRUPTION in log ($TREE hits) — payouts/shielding will fail 'have 0'; fix: stop zallet, 'zallet repair truncate-wallet <min-allowed-height>', start"
+# (c) wallet spendability/health as the dashboard sees it
+PH=$(sq "SELECT value FROM pool_status WHERE key='payout_health';")
+if [ -n "$PH" ]; then
+  PHBAD=$(echo "$PH" | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+resp = d.get("wallet_responsive", True)
+fails = max(d.get("consecutive_payout_failures", 0), d.get("consecutive_shielding_failures", 0))
+print("bad" if (not resp or fails >= 3) else "ok")' 2>/dev/null)
+  report zallet_payout_health "$([ "$PHBAD" != "bad" ] && echo 1 || echo 0)" \
+    "payout pipeline unhealthy: wallet unresponsive or >=3 consecutive payout/shielding failures (see admin health page)"
+fi
+
 # --- mainnet node .76 (RPC direct + one ssh probe) ---
 # EOS fuse of the RUNNING zakurad binary: v1.2.0 (cutover 2026-08-16) panics at
 # ~3,495,707 (~Sept 25). Re-bump at every rebuild/cutover (task #17 treadmill).
@@ -124,15 +154,29 @@ else
   report node76_ssh 0 "mainnet node box .76 unreachable over SSH"
 fi
 
-# --- testnet pool box (one ssh probe: services + disk) ---
+# --- testnet pool box (one ssh probe: services + disk + zallet failure modes) ---
 TN=$(ssh -i /home/zebra/.ssh/zebra_host -o BatchMode=yes -o ConnectTimeout=8 zec@operational-host.invalid \
-  'systemctl is-active zcash-pool zcash-dashboard zallet | tr "\n" " "; echo; df --output=pcent / | tail -1 | tr -dc 0-9' 2>/dev/null)
+  'systemctl is-active zcash-pool zcash-dashboard zallet | tr "\n" " "; echo
+   df --output=pcent / | tail -1 | tr -dc 0-9; echo
+   systemctl show zallet -p NRestarts --value
+   tail -c 300000 ~/zallet.log 2>/dev/null | grep -cE "note commitment tree|Inserted root conflicts"' 2>/dev/null)
 if [ -n "$TN" ]; then
   report testnet_ssh 1 "" "✅ recovered: testnet_ssh"
   TSVC=$(echo "$TN" | sed -n 1p)
   report testnet "$([ "$TSVC" = "active active active " ] && echo 1 || echo 0)" \
     "[testnet] services not all active (pool/dashboard/zallet = $TSVC)"
   report testnet_disk "$([ "$(echo "$TN" | sed -n 2p)" -lt 90 ] 2>/dev/null && echo 1 || echo 0)" "[testnet] disk at $(echo "$TN" | sed -n 2p)%"
+  TNNR=$(echo "$TN" | sed -n 3p)
+  if [ -n "$TNNR" ]; then
+    if [ -f "$STATE/tn_zallet_nr_window" ]; then read -r TNNR0 TNNRT < "$STATE/tn_zallet_nr_window"; else TNNR0=$TNNR; TNNRT=$NOW; fi
+    if [ $((NOW - TNNRT)) -ge 3600 ]; then echo "$TNNR $NOW" > "$STATE/tn_zallet_nr_window"; TNNR0=$TNNR; fi
+    [ ! -f "$STATE/tn_zallet_nr_window" ] && echo "$TNNR $NOW" > "$STATE/tn_zallet_nr_window"
+    report tn_zallet_crashloop "$([ $((TNNR - TNNR0)) -lt 3 ] && echo 1 || echo 0)" \
+      "[testnet] zallet CRASH-LOOP: $((TNNR - TNNR0)) restarts within the hour"
+  fi
+  TNTREE=$(echo "$TN" | sed -n 4p)
+  report tn_zallet_tree_corruption "$([ "${TNTREE:-0}" = "0" ] && echo 1 || echo 0)" \
+    "[testnet] zallet NOTE-TREE CORRUPTION in log ($TNTREE hits) — fix: 'zallet repair truncate-wallet <min-allowed-height>'"
 else
   report testnet_ssh 0 "[testnet] pool box unreachable over SSH"
 fi
