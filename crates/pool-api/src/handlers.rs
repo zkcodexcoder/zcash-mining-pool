@@ -386,7 +386,7 @@ pub async fn get_pool_stats(
     };
 
     let immature = state.db.get_immature_blocks_count().await.unwrap_or(0);
-    let pending_payout = state.db.get_pending_payouts(state.min_payout_zatoshis, state.pay_immature).await
+    let pending_payout = state.db.get_pending_payouts(state.min_payout_zatoshis, state.pay_immature, 0, i64::MAX).await
         .map(|v| v.len() as i64).unwrap_or(0);
 
     let (node_ok, last_template_at) = state.get_last_template_ms().await;
@@ -830,7 +830,7 @@ pub async fn get_pending_payouts_list(
 ) -> Result<Json<Vec<PendingPayoutEntry>>, StatusCode> {
     let entries = state
         .db
-        .get_pending_payouts(state.min_payout_zatoshis, state.pay_immature)
+        .get_pending_payouts(state.min_payout_zatoshis, state.pay_immature, 0, i64::MAX)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
