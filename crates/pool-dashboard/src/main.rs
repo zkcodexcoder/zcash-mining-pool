@@ -1649,3 +1649,184 @@ fn is_valid_zcash_address(addr: &str, network: &str) -> bool {
 
     false
 }
+
+/// Money-path lifecycle suite (audit #18): walk real funds through the full
+/// found -> credited -> matured -> reserved -> sent -> confirmed pipeline and
+/// its failure branches, asserting EXACT zatoshi conservation at every step
+/// (operator policy: perfect accounting, no tolerance margins).
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::reconciler::tests::{mock_rpc, setup_db};
+    use std::collections::HashMap;
+
+    const MINER_ADDR: &str = "tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd"; // valid testnet t-addr
+    const TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const REWARD: i64 = 123_750_000;
+
+    async fn sums(pool: &sqlx::SqlitePool) -> (i64, i64, i64, i64) {
+        let b: (i64, i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(pending),0), COALESCE(SUM(paying),0), COALESCE(SUM(paid),0) FROM balances",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let p: (i64,) = sqlx::query_as("SELECT COALESCE(SUM(amount),0) FROM payouts")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        (b.0, b.1, b.2, p.0)
+    }
+
+    fn happy_wallet() -> HashMap<&'static str, serde_json::Value> {
+        HashMap::from([
+            ("z_gettotalbalance", serde_json::json!({"private": "100.0", "total": "100.0"})),
+            ("z_sendmany", serde_json::json!("opid-lifecycle")),
+            (
+                "z_getoperationstatus",
+                serde_json::json!([{"status": "success", "result": {"txid": TXID}}]),
+            ),
+        ])
+    }
+
+    fn node_with_tx() -> HashMap<&'static str, serde_json::Value> {
+        HashMap::from([("getrawtransaction", serde_json::json!({"txid": TXID, "height": 10}))])
+    }
+
+    /// Credit a confirmed block to a fresh miner; returns (miner_id, block_id).
+    async fn credited_block(db: &PoolDb, height: i64) -> (i64, i64) {
+        let m = db.get_or_create_miner(MINER_ADDR).await.unwrap();
+        let w = db.get_or_create_worker(m.id, "rig").await.unwrap();
+        let block_id = db
+            .record_block(height, &format!("hash{height}"), REWARD, Some(REWARD), w.id, None)
+            .await
+            .unwrap();
+        db.distribute_block_credits(block_id, &[(m.id, REWARD)]).await.unwrap();
+        db.update_block_status(block_id, "confirmed").await.unwrap();
+        (m.id, block_id)
+    }
+
+    async fn run_payouts(db: &PoolDb, wallet_url: &str, node_url: &str) -> anyhow::Result<usize> {
+        let wallet = ZcashRpcClient::new(wallet_url);
+        let node = ZcashRpcClient::new(node_url);
+        process_payouts(
+            db, &wallet, &node, "upooladdr", "tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd",
+            1_000_000, 0, 1.0, "testnet", false, 0, i64::MAX,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn happy_path_exact_conservation() {
+        let (db, pool) = setup_db().await;
+        let (_m, _b) = credited_block(&db, 100).await;
+        assert_eq!(sums(&pool).await, (REWARD, 0, 0, 0), "credit lands in pending exactly");
+
+        let wallet_url = mock_rpc(happy_wallet()).await;
+        let node_url = mock_rpc(node_with_tx()).await;
+        let n = run_payouts(&db, &wallet_url, &node_url).await.unwrap();
+        assert_eq!(n, 1, "one miner paid");
+
+        assert_eq!(
+            sums(&pool).await,
+            (0, 0, REWARD, REWARD),
+            "payout must move the exact credit pending -> paid, payouts row equal"
+        );
+        let (st, leak): (String, i64) = (
+            sqlx::query_scalar("SELECT status FROM payout_attempts ORDER BY id DESC LIMIT 1")
+                .fetch_one(&pool).await.unwrap(),
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM payout_items pi JOIN payout_attempts pa ON pa.id=pi.attempt_id \
+                 WHERE pa.status IN ('confirmed','failed')",
+            )
+            .fetch_one(&pool).await.unwrap(),
+        );
+        assert_eq!(st, "confirmed");
+        assert_eq!(leak, 0, "no reservation items may survive a settled attempt");
+
+        let (reward, balances, clawbacks) = db.get_accounting_invariant().await.unwrap();
+        assert_eq!(reward, balances + clawbacks - 0, "invariant holds exactly");
+    }
+
+    #[tokio::test]
+    async fn orphan_after_credit_reverses_exactly() {
+        let (db, pool) = setup_db().await;
+        let (_m, block_id) = credited_block(&db, 200).await;
+        assert_eq!(sums(&pool).await, (REWARD, 0, 0, 0));
+
+        db.orphan_block(block_id, REWARD).await.unwrap();
+        assert_eq!(
+            sums(&pool).await,
+            (0, 0, 0, 0),
+            "orphan must claw back the exact credit, no residue in any bucket"
+        );
+        let st: String = sqlx::query_scalar("SELECT status FROM blocks WHERE id = ?1")
+            .bind(block_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(st, "orphaned");
+    }
+
+    #[tokio::test]
+    async fn crash_mid_saga_refunds_then_pays_exactly_once() {
+        let (db, pool) = setup_db().await;
+        let (m, _b) = credited_block(&db, 300).await;
+
+        // Reserve as the payout loop would, then "crash" before z_sendmany.
+        let attempt = db.create_payout_attempt(1, REWARD, "loop").await.unwrap();
+        let reserved = db.reserve_payout(attempt, &[(m, REWARD)]).await.unwrap();
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(sums(&pool).await, (0, REWARD, 0, 0), "reservation moves pending -> paying");
+
+        // Recovery: reconciliation refunds the expired, never-sent reservation.
+        sqlx::query("UPDATE payout_attempts SET created_at = datetime('now','-2 hours') WHERE id = ?1")
+            .bind(attempt).execute(&pool).await.unwrap();
+        let node_url = mock_rpc(HashMap::new()).await;
+        let wallet_url = mock_rpc(HashMap::new()).await;
+        let r = crate::reconciler::tests::reconciler(db.clone(), &node_url, &wallet_url);
+        r.reconcile_reserved_payouts_once(None).await;
+        assert_eq!(sums(&pool).await, (REWARD, 0, 0, 0), "refund restores pending exactly");
+
+        // Next round pays for real — total paid must equal the single credit.
+        let wallet_url = mock_rpc(happy_wallet()).await;
+        let node_url = mock_rpc(node_with_tx()).await;
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            run_payouts(&db, &wallet_url, &node_url),
+        )
+        .await
+        .expect("payout round timed out")
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            sums(&pool).await,
+            (0, 0, REWARD, REWARD),
+            "crash + recovery must pay exactly once, never twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorged_payout_voids_and_repays_exactly() {
+        let (db, pool) = setup_db().await;
+        credited_block(&db, 400).await;
+        let wallet_url = mock_rpc(happy_wallet()).await;
+        let node_url = mock_rpc(node_with_tx()).await;
+        run_payouts(&db, &wallet_url, &node_url).await.unwrap();
+        assert_eq!(sums(&pool).await, (0, 0, REWARD, REWARD));
+
+        // The payout tx later reorgs out. Age the row past the 60-min guard,
+        // then void: paid must return to pending, the payouts row must go.
+        sqlx::query("UPDATE payouts SET created_at = datetime('now','-2 hours')")
+            .execute(&pool).await.unwrap();
+        db.void_reorged_payout(TXID).await.unwrap();
+        assert_eq!(
+            sums(&pool).await,
+            (REWARD, 0, 0, 0),
+            "void must restore the exact amount to pending and remove the payouts row"
+        );
+
+        // Re-pay: end state identical to a single clean payout.
+        let wallet_url = mock_rpc(happy_wallet()).await;
+        let node_url = mock_rpc(node_with_tx()).await;
+        run_payouts(&db, &wallet_url, &node_url).await.unwrap();
+        assert_eq!(sums(&pool).await, (0, 0, REWARD, REWARD), "reorg + repay conserves exactly");
+    }
+}

@@ -179,6 +179,41 @@ pub struct AdminState {
     /// Separate key for the ops dashboard session; None = ops disabled.
     ops_signing_key: Option<[u8; 32]>,
     ops_upstream: String,
+    /// Shared brute-force limiter for the admin and ops logins (audit #18).
+    login_limiter: std::sync::Arc<std::sync::Mutex<LoginLimiter>>,
+}
+
+/// Sliding-window login rate limit: after LOGIN_FAIL_MAX failed attempts
+/// within LOGIN_FAIL_WINDOW, every login (even with the right password) gets
+/// 429 until failures age out. Global rather than per-IP: the admin listener
+/// sits behind a proxy where client IPs are spoofable headers, and the only
+/// legitimate users are the two operators — a global lockout can't be used
+/// to lock *out* an attacker-chosen victim, only to slow everyone to a pace
+/// where brute force is hopeless (5 guesses / 15 min).
+const LOGIN_FAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(900);
+const LOGIN_FAIL_MAX: usize = 5;
+
+#[derive(Default)]
+struct LoginLimiter {
+    failures: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl LoginLimiter {
+    fn locked(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        while self
+            .failures
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > LOGIN_FAIL_WINDOW)
+        {
+            self.failures.pop_front();
+        }
+        self.failures.len() >= LOGIN_FAIL_MAX
+    }
+
+    fn record_failure(&mut self) {
+        self.failures.push_back(std::time::Instant::now());
+    }
 }
 
 /// Configurable log file paths for the admin Service Logs tab.
@@ -239,6 +274,7 @@ impl AdminState {
             zallet_paths,
             ops_signing_key: None,
             ops_upstream: OPS_UPSTREAM.to_string(),
+            login_limiter: std::sync::Arc::default(),
         }
     }
 
@@ -437,8 +473,14 @@ async fn handle_ops_login(State(state): State<AdminState>, Form(form): Form<Logi
     // already imply ops access — this just saves juggling two passwords.
     // The session is always minted with the ops key and stays scoped to /ops,
     // so it never works the other way round (ops password can't reach /admin).
+    if state.login_limiter.lock().unwrap().locked() {
+        tracing::warn!("ops login rate-limited (too many failed attempts)");
+        return (StatusCode::TOO_MANY_REQUESTS, Html(LOGIN_RATE_LIMITED_HTML)).into_response();
+    }
     let submitted = derive_signing_key(&form.password);
     if submitted != key && submitted != state.signing_key {
+        state.login_limiter.lock().unwrap().record_failure();
+        tracing::warn!("ops login failed (bad password)");
         return Html(OPS_LOGIN_FAIL_HTML).into_response();
     }
     let cookie = make_session_cookie(&key);
@@ -532,9 +574,15 @@ async fn handle_login(
     State(state): State<AdminState>,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    if state.login_limiter.lock().unwrap().locked() {
+        tracing::warn!("admin login rate-limited (too many failed attempts)");
+        return (StatusCode::TOO_MANY_REQUESTS, Html(LOGIN_RATE_LIMITED_HTML)).into_response();
+    }
     // Verify password by deriving key and comparing
     let submitted_key = derive_signing_key(&form.password);
     if submitted_key != state.signing_key {
+        state.login_limiter.lock().unwrap().record_failure();
+        tracing::warn!("admin login failed (bad password)");
         return Html(LOGIN_FAIL_HTML).into_response();
     }
 
@@ -1130,6 +1178,36 @@ button:hover { background: #d53f8c; }
 </div>
 </body>
 </html>"##;
+
+const LOGIN_RATE_LIMITED_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Too many attempts</title>
+<style>body{font-family:system-ui;background:#0f1115;color:#e6e6e6;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{text-align:center}</style>
+</head>
+<body><div><h2>Too many failed attempts</h2><p>Login is locked for a while. Try again later.</p></div></body>
+</html>"##;
+
+#[cfg(test)]
+mod login_limiter_tests {
+    use super::*;
+
+    #[test]
+    fn locks_after_max_failures_and_expires() {
+        let mut l = LoginLimiter::default();
+        assert!(!l.locked());
+        for _ in 0..LOGIN_FAIL_MAX {
+            assert!(!l.locked(), "must accept attempts until the cap");
+            l.record_failure();
+        }
+        assert!(l.locked(), "cap reached -> locked");
+        // Age the failures past the window; lock must clear.
+        let old = std::time::Instant::now() - LOGIN_FAIL_WINDOW - std::time::Duration::from_secs(1);
+        for t in l.failures.iter_mut() {
+            *t = old;
+        }
+        assert!(!l.locked(), "expired failures must unlock");
+    }
+}
 
 const OPS_LOGIN_FAIL_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
