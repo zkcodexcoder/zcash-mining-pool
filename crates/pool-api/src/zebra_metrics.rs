@@ -328,8 +328,8 @@ mod tests {
     #[test]
     fn derive_url_swaps_default_port() {
         assert_eq!(
-            derive_metrics_url("http://operational-host.invalid:8232"),
-            "http://operational-host.invalid:9999/metrics"
+            derive_metrics_url("http://mainnet-node.example:8232"),
+            "http://mainnet-node.example:9999/metrics"
         );
         assert_eq!(
             derive_metrics_url("http://localhost:8232/"),
@@ -351,8 +351,8 @@ mod tests {
         // string-append fallback produced "http://…:18232:9999/metrics",
         // which reqwest rejected as an opaque "builder error".
         assert_eq!(
-            derive_metrics_url("http://operational-host.invalid:18232"),
-            "http://operational-host.invalid:9999/metrics"
+            derive_metrics_url("http://testnet-node.example:18232"),
+            "http://testnet-node.example:9999/metrics"
         );
     }
 

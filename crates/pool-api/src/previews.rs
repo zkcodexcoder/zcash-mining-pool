@@ -127,7 +127,7 @@ tr:hover td{background:rgba(57,255,20,0.03)}
   <div style="display:flex;align-items:center;gap:14px">
     <div class="status"><span class="dot"></span><span id="f-status">Online</span></div>
     <div class="nav">
-      <a href="http://operational-host.invalid:3000" target="_blank" rel="noopener">Mine</a>
+      <a href="/" target="_blank" rel="noopener">Mine</a>
       <a href="/zallet">Wallet</a>
       <a href="/previews">Themes</a><a href="/">V1</a>
     </div>
@@ -341,7 +341,7 @@ tr:hover td{background:rgba(0,229,255,0.02)}
   <div style="display:flex;align-items:center;gap:14px">
     <div class="status"><span class="dot"></span><span id="f-status">Connected</span></div>
     <div class="nav">
-      <a href="http://operational-host.invalid:3000" target="_blank" rel="noopener">Mine</a>
+      <a href="/" target="_blank" rel="noopener">Mine</a>
       <a href="/zallet">Wallet</a>
       <a href="/previews">Themes</a><a href="/">V1</a>
     </div>
@@ -508,7 +508,7 @@ tr:hover td{background:rgba(255,230,0,0.02)}
     <div class="sub">Zcash &middot; Equihash(200,9) &middot; PPLNS</div>
   </div>
   <div class="nav">
-    <a href="http://operational-host.invalid:3000" target="_blank" rel="noopener">Mine</a>
+    <a href="/" target="_blank" rel="noopener">Mine</a>
     <a href="/zallet">Wallet</a>
     <a href="/previews">Themes</a><a href="/">V1</a>
   </div>
@@ -655,7 +655,7 @@ tr:hover td{color:#8899aa}
 <div class="top">
   <h1><span>TAZ</span> Mining Pool</h1>
   <div class="nav">
-    <a href="http://operational-host.invalid:3000" target="_blank" rel="noopener">Mine</a>
+    <a href="/" target="_blank" rel="noopener">Mine</a>
     <a href="/zallet">Wallet</a>
     <a href="/previews">Themes</a><a href="/">V1</a>
   </div>
@@ -859,7 +859,7 @@ tr:hover td{background:rgba(0,229,255,0.02)}
   <div style="display:flex;align-items:center;gap:14px">
     <div class="status"><span class="dot"></span><span id="f-status">Online</span></div>
     <div class="nav">
-      <a href="http://operational-host.invalid:3000" target="_blank" rel="noopener">Mine</a>
+      <a href="/" target="_blank" rel="noopener">Mine</a>
       <a href="/zallet">Wallet</a>
       <a href="/previews">Themes</a><a href="/">V1</a>
     </div>

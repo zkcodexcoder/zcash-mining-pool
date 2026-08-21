@@ -60,7 +60,8 @@ struct AdminConfig {
     /// `password` above — neither session grants the other. Unset = /ops disabled.
     #[serde(default)]
     ops_password: Option<String>,
-    /// Ops dashboard upstream; defaults to the Zakura node's :9997.
+    /// Ops dashboard upstream. Required when `ops_password` is set; keeping it
+    /// in deployment configuration avoids publishing infrastructure addresses.
     #[serde(default)]
     ops_upstream: Option<String>,
     #[serde(default)]
@@ -654,13 +655,19 @@ async fn main() -> Result<()> {
             );
             // Ops dashboard gets its own password; without one the /ops routes
             // fail closed rather than serving the view unguarded.
-            match admin_cfg.ops_password.as_deref() {
-                Some(pw) if !pw.is_empty() => {
+            match (
+                admin_cfg.ops_password.as_deref().map(str::trim),
+                admin_cfg.ops_upstream.as_deref().map(str::trim),
+            ) {
+                (Some(pw), Some(upstream)) if !pw.is_empty() && !upstream.is_empty() => {
                     if pw == admin_cfg.password {
                         warn!("admin.ops_password matches admin.password — set a distinct one");
                     }
-                    admin_state = admin_state.with_ops(pw, admin_cfg.ops_upstream.as_deref());
+                    admin_state = admin_state.with_ops(pw, upstream);
                     info!("Ops dashboard enabled at /ops (separate password)");
+                }
+                (Some(pw), _) if !pw.is_empty() => {
+                    warn!("Ops dashboard disabled (admin.ops_upstream is required)");
                 }
                 _ => info!("Ops dashboard disabled (no admin.ops_password set)"),
             }

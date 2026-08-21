@@ -9,14 +9,6 @@ use crate::handlers::AppState;
 
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
 
-/// Upstream for the internal ops dashboard (self-contained: HTML at `/`, JSON
-/// at `/api/data`). It runs on the Zakura node; ufw there allows :9997 only
-/// from this box, so it is never reachable from the internet directly — all
-/// access goes through the proxy below, which sits behind the admin session
-/// guard. The view carries operator/competitive detail (peer IPs mapped to
-/// pools), so it must stay in the protected router and unlinked publicly.
-const OPS_UPSTREAM: &str = "http://operational-host.invalid:9997";
-
 /// Request timeout for the ops proxy.
 const OPS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -273,18 +265,16 @@ impl AdminState {
             log_paths,
             zallet_paths,
             ops_signing_key: None,
-            ops_upstream: OPS_UPSTREAM.to_string(),
+            ops_upstream: String::new(),
             login_limiter: std::sync::Arc::default(),
         }
     }
 
     /// Enable the ops dashboard with its own password (independent of admin).
     /// Without this the /ops routes fail closed.
-    pub fn with_ops(mut self, ops_password: &str, upstream: Option<&str>) -> Self {
+    pub fn with_ops(mut self, ops_password: &str, upstream: &str) -> Self {
         self.ops_signing_key = Some(derive_signing_key(ops_password));
-        if let Some(u) = upstream {
-            self.ops_upstream = u.trim_end_matches('/').to_string();
-        }
+        self.ops_upstream = upstream.trim().trim_end_matches('/').to_string();
         self
     }
 }

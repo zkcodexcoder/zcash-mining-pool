@@ -86,7 +86,7 @@ These are real and verified, but deploying them blind could *cause* the very dou
 ## 🔴 USER ACTION REQUIRED (I'm blocked or it's node-ops)
 1. **Firewall the node RPC (live internet exposure).** Port 8232 on .76 is open to Anywhere with `invalidateblock`/`reconsiderblock` ungated — anyone can reorg your node and poison your templates. The classifier blocked me from running `ufw` on the node. Run on .76:
    ```
-   sudo ufw allow from operational-host.invalid to any port 8232 proto tcp
+   sudo ufw allow from "$MAINNET_POOL_ADDRESS" to any port 8232 proto tcp
    # verify the pool still reaches the node, then:
    sudo ufw delete allow 8232/tcp
    ```

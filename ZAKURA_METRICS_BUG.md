@@ -40,8 +40,8 @@ dead-to-live ratio.
 Network metrics are labeled by remote socket address **including the ephemeral port**:
 
 ```
-zcash_net_out_bytes_total{addr="operational-host.invalid:57306"} 148
-zcash_net_out_bytes_total{addr="operational-host.invalid:40056"} 7607
+zcash_net_out_bytes_total{addr="<peer-address>:57306"} 148
+zcash_net_out_bytes_total{addr="<peer-address>:40056"} 7607
 ```
 
 Every reconnection (and every inbound scanner hitting the open P2P port) mints a new

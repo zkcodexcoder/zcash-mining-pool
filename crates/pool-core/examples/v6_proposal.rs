@@ -32,7 +32,9 @@ fn varint(n: usize) -> Vec<u8> {
 
 #[tokio::main]
 async fn main() {
-    let rpc = node_rpc::ZcashRpcClient::new("http://operational-host.invalid:18232");
+    let rpc_url = std::env::var("ZCASH_RPC_URL")
+        .unwrap_or_else(|_| "http://localhost:18232".to_string());
+    let rpc = node_rpc::ZcashRpcClient::new(&rpc_url);
     let tpl: serde_json::Value = rpc
         .call_raw(
             "getblocktemplate",

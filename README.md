@@ -210,10 +210,9 @@ The `network` setting controls address validation prefixes, currency symbol (TAZ
 | `http://HOST:9091/admin` | Admin panel (password-protected) |
 | `stratum+tcp://HOST:3333` | Stratum mining |
 
-## Server
+## Deployment
 
-- **Host:** `operational-host.invalid`
-- **Dashboard:** http://operational-host.invalid:8080
-- **Stratum:** `operational-host.invalid:3333`
-- **Zebrad:** `operational-host.invalid:18232` (remote)
-- **Zallet RPC:** `127.0.0.1:28232` (local)
+Live infrastructure addresses are intentionally excluded from this public
+repository. Configure the dashboard, Stratum listener, node RPC, and wallet RPC
+through the untracked deployment configuration. Public clients should use the
+pool's DNS name rather than a server address.

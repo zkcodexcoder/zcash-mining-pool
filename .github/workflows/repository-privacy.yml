@@ -1,0 +1,17 @@
+name: Repository privacy
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-operational-ip-literals:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check for operational IP addresses
+        run: python3 scripts/check_no_operational_ips.py
