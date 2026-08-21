@@ -25,9 +25,9 @@ cp -f /home/zebra/.zallet-beta1/zallet.toml "$DEST/zallet-config.toml" 2>/dev/nu
 # 3. pool config (small, versionless — git-ignored on purpose).
 cp -f /home/zebra/zecminer/pool/config/pool.toml "$DEST/pool-config-$TS.toml"
 
-# 4. Git bundle — full repo history in the backup set. GitHub push has been
-#    broken since the account suspension (2026-07-01), so until a remote works
-#    again this is the only off-disk copy of the code history.
+# 4. Git bundle — full repo history in the backup set. GitHub (zkcodexcoder)
+#    has been pushable since 2026-08-21; the bundle stays as cheap redundancy
+#    (it also captures unpushed local work).
 git -C /home/zebra/zecminer/pool bundle create "$DEST/pool-repo-$TS.bundle" --all -q 2>/dev/null || true
 
 # 5. Rotate: keep 7 days of dated files.
