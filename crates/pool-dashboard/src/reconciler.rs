@@ -262,22 +262,24 @@ impl Reconciler {
                 self.refund_reservation(id, total_zec, "operation failed", summary)
                     .await;
             } else if opid.is_none() {
-                if status == "sent" {
-                    // 'sent' with no opid = z_sendmany itself failed on
-                    // TRANSPORT (fate unknown — the wallet may have queued and
-                    // broadcast the tx even though we never saw a response).
+                if status == "sent" || status == "submitting" {
+                    // 'submitting'/'sent' with no opid = z_sendmany was (or may
+                    // have been) called and we never recorded an opid: transport
+                    // failure, or a crash between Zallet accepting and our
+                    // 'sent' write. Fate unknown — the wallet may have queued
+                    // and broadcast the tx even though we never saw a response.
                     // Never auto-refund: park the funds in `paying` and page
                     // the operator, exactly like the opid-lost case below.
                     summary.alerts.push(format!(
-                        "UNRESOLVABLE reservation {id} ({total_zec:.4} coins): z_sendmany fate \
-                         unknown (transport failure, no opid). Funds parked in `paying`. Check \
-                         the wallet's recent transactions for a matching send before refunding \
-                         manually."
+                        "UNRESOLVABLE reservation {id} ({total_zec:.4} coins, status {status}): \
+                         z_sendmany fate unknown (no opid recorded). Funds parked in `paying`. \
+                         Check the wallet's recent transactions for a matching send before \
+                         refunding manually."
                     ));
                 } else if older_than(&created_at, RESERVATION_REFUND_MINUTES) {
-                    // Still 'queued': the loop crashed BEFORE z_sendmany was
-                    // called, so nothing was submitted. Safe to refund once
-                    // past expiry.
+                    // Still 'queued': the loop crashed BEFORE the durable
+                    // 'submitting' write that precedes z_sendmany, so nothing
+                    // was submitted. Safe to refund once past expiry.
                     self.refund_reservation(id, total_zec, "never submitted (no opid) past expiry", summary)
                         .await;
                 } else {
@@ -733,22 +735,33 @@ pub(crate) mod tests {
     /// Mock JSON-RPC server: answers each method from a canned response map.
     /// Unknown methods get a JSON-RPC error (matching a node that doesn't
     /// know the tx / op).
+    /// Sentinel result value: the mock answers that method with a non-JSON
+    /// 502 — a transport-class failure as the RPC client sees it (same error
+    /// class as a timeout or connection reset, i.e. NOT a JsonRpc response).
+    pub(crate) const TRANSPORT_FAIL: &str = "__TRANSPORT_FAIL__";
+
     pub(crate) async fn mock_rpc(responses: HashMap<&'static str, serde_json::Value>) -> String {
         let state = Arc::new(responses);
         async fn handler(
             State(state): State<Arc<HashMap<&'static str, serde_json::Value>>>,
             Json(req): Json<serde_json::Value>,
-        ) -> Json<serde_json::Value> {
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
             let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
             let id = req.get("id").cloned().unwrap_or(serde_json::json!(1));
             match state.get(method) {
+                Some(v) if v.as_str() == Some(TRANSPORT_FAIL) => {
+                    (axum::http::StatusCode::BAD_GATEWAY, "upstream connection reset").into_response()
+                }
                 Some(result) => Json(serde_json::json!({
                     "jsonrpc": "2.0", "id": id, "result": result, "error": null
-                })),
+                }))
+                .into_response(),
                 None => Json(serde_json::json!({
                     "jsonrpc": "2.0", "id": id, "result": null,
                     "error": {"code": -5, "message": "No such mempool or main chain transaction"}
-                })),
+                }))
+                .into_response(),
             }
         }
         let app = Router::new().route("/", post(handler)).with_state(state);
