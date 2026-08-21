@@ -318,6 +318,42 @@ async fn test_payout_coalescing_cooldown_and_override() {
 }
 
 #[tokio::test]
+async fn test_confirm_and_refund_roll_back_on_zero_row_transition() {
+    let db = setup_db().await;
+    let m = db.get_or_create_miner("utest1zerorow").await.unwrap();
+    db.credit_balance(m.id, 50_000_000).await.unwrap();
+    let attempt = db.create_payout_attempt(1, 50_000_000, "loop").await.unwrap();
+    db.reserve_payout(attempt, &[(m.id, 50_000_000)]).await.unwrap();
+
+    // Corrupt the state: drain `paying` behind the reservation's back.
+    sqlx::query("UPDATE balances SET paying = 0 WHERE miner_id = ?1")
+        .bind(m.id)
+        .execute(db.inner())
+        .await
+        .unwrap();
+
+    // Confirm must refuse and keep the reservation items as evidence.
+    let err = db.confirm_payout(attempt, "cc11").await;
+    assert!(err.is_err(), "confirm must not settle an uncovered item");
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payout_items WHERE attempt_id = ?1")
+        .bind(attempt).fetch_one(db.inner()).await.unwrap();
+    assert_eq!(items, 1, "items must survive a rolled-back confirm");
+    let payouts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payouts WHERE miner_id = ?1")
+        .bind(m.id).fetch_one(db.inner()).await.unwrap();
+    assert_eq!(payouts, 0, "no payout row may be recorded");
+
+    // Refund must refuse identically.
+    let err = db.refund_payout(attempt).await;
+    assert!(err.is_err(), "refund must not credit pending it never debited from paying");
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payout_items WHERE attempt_id = ?1")
+        .bind(attempt).fetch_one(db.inner()).await.unwrap();
+    assert_eq!(items, 1, "items must survive a rolled-back refund");
+    let pending: i64 = sqlx::query_scalar("SELECT pending FROM balances WHERE miner_id = ?1")
+        .bind(m.id).fetch_one(db.inner()).await.unwrap();
+    assert_eq!(pending, 0, "pending must not be inflated by a failed refund");
+}
+
+#[tokio::test]
 async fn test_clawback_acknowledgement_silences_alerts() {
     let db = setup_db().await;
     let m = db.get_or_create_miner("utest1ack").await.unwrap();

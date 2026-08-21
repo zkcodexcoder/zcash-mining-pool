@@ -1622,9 +1622,17 @@ impl PoolDb {
             .execute(&mut *conn)
             .await?;
             if upd.rows_affected() == 0 {
-                // paying < amount: reservation already accounted for. Skip the
-                // payouts row so we never record an unbacked payment.
-                continue;
+                // paying < amount. Within this design that state is unreachable
+                // (reserve guards pending>=amt; only confirm/refund consume
+                // paying, both all-or-nothing; a completed prior confirm deleted
+                // the items so a re-run sees none) — so it can only mean external
+                // corruption. Perfect-accounting policy: refuse to settle
+                // anything and roll the whole confirm back, preserving the
+                // reservation as evidence, rather than silently absorbing it.
+                return Err(DbError::Sqlx(sqlx::Error::Protocol(format!(
+                    "confirm_payout attempt {attempt_id}: miner {miner_id} has paying < {amount} \
+                     zatoshis — refusing to settle; investigate before retry"
+                ))));
             }
             sqlx::query("INSERT INTO payouts (miner_id, txid, amount) VALUES (?1, ?2, ?3)")
                 .bind(miner_id)
@@ -1679,7 +1687,7 @@ impl PoolDb {
 
         let mut refunded: i64 = 0;
         for (miner_id, amount) in &items {
-            sqlx::query(
+            let upd = sqlx::query(
                 "UPDATE balances SET paying = paying - ?1, pending = pending + ?1 \
                  WHERE miner_id = ?2 AND paying >= ?1",
             )
@@ -1687,6 +1695,16 @@ impl PoolDb {
             .bind(miner_id)
             .execute(&mut *conn)
             .await?;
+            if upd.rows_affected() == 0 {
+                // Same reasoning as confirm_payout_txn: a reservation item whose
+                // paying can't cover it means external corruption. Roll the whole
+                // refund back and keep the items as evidence — never delete a
+                // reservation record whose funds didn't actually move.
+                return Err(DbError::Sqlx(sqlx::Error::Protocol(format!(
+                    "refund_payout attempt {attempt_id}: miner {miner_id} has paying < {amount} \
+                     zatoshis — refusing to refund; investigate before retry"
+                ))));
+            }
             refunded += 1;
         }
         sqlx::query("DELETE FROM payout_items WHERE attempt_id = ?1")
