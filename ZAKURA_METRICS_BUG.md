@@ -1,7 +1,10 @@
 # Unbounded per-connection label cardinality in network metrics makes `/metrics` unserveable
 
 **Affected:** zakurad v1.1.0 (`1.1.0+g5ca43629306d`); still present in v1.1.1 (no metrics
-changes in the diff). Mainnet, publicly reachable P2P (8233/tcp + 8234 v2).
+changes in the diff) **and confirmed live in v1.2.0** (`1.2.0+g4f2189a`): after only
+2.8 days of uptime, `/metrics` is already 91.5 MB / 1,121,361 lines with 353,571
+`zcash_net_{in,out}_bytes_total` series — roughly double v1.1.0's daily series growth.
+Mainnet, publicly reachable P2P (8233/tcp + 8234 v2).
 
 ## Symptom
 
