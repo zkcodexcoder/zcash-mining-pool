@@ -268,7 +268,7 @@ impl PoolDb {
     ) -> Result<Option<(i64, String, String)>, DbError> {
         let row = sqlx::query(
             "SELECT id, status, source FROM payout_attempts
-             WHERE status IN ('queued', 'sent')
+             WHERE status IN ('queued', 'submitting', 'sent')
                AND created_at > datetime('now', '-5 minutes')
              ORDER BY id DESC LIMIT 1",
         )
@@ -323,7 +323,7 @@ impl PoolDb {
         let rows: Vec<SqliteRow> = sqlx::query(
             "SELECT id, status, opid, txid, total_zatoshis, created_at
              FROM payout_attempts
-             WHERE status IN ('queued', 'sent')
+             WHERE status IN ('queued', 'submitting', 'sent')
                AND created_at < datetime('now', '-' || ?1 || ' minutes')
                AND NOT EXISTS (SELECT 1 FROM payout_items pi WHERE pi.attempt_id = payout_attempts.id)
              ORDER BY id ASC",

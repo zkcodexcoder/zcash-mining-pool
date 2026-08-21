@@ -1458,6 +1458,23 @@ async fn process_payouts(
         .map(|(addr, zats)| (addr, zats as f64 / ZATOSHIS_PER_ZEC))
         .collect();
 
+    // Durably mark the attempt 'submitting' BEFORE the send. Without this, a
+    // crash (or a failed status write) between Zallet accepting the request
+    // and our 'sent' write leaves 'queued' + no opid — which the reconciler
+    // reads as "never submitted" and expiry-refunds, while the tx may still
+    // broadcast (external review 2026-08-21). 'submitting'/'sent' with no opid
+    // are parked as fate-unknown instead. Fail CLOSED if the write fails:
+    // nothing has been sent yet, so refunding is safe.
+    if let Err(e) = db.update_payout_attempt(attempt_id, "submitting", None, None, None).await {
+        error!(error = %e, "could not durably mark attempt submitting; refunding (nothing sent)");
+        let _ = db.refund_payout(attempt_id).await;
+        let _ = db
+            .update_payout_attempt(attempt_id, "failed", None, None,
+                Some(&format!("could not mark submitting (refunded, nothing sent): {e}")))
+            .await;
+        return Err(anyhow::anyhow!("could not mark attempt submitting: {e}"));
+    }
+
     let opid = match rpc.z_sendmany(pool_address, &amounts).await {
         Ok(opid) => opid,
         Err(e) => {
@@ -1503,7 +1520,11 @@ async fn process_payouts(
     };
 
     info!(opid = %opid, "z_sendmany submitted, waiting for completion");
-    let _ = db.update_payout_attempt(attempt_id, "sent", Some(&opid), None, None).await;
+    if let Err(e) = db.update_payout_attempt(attempt_id, "sent", Some(&opid), None, None).await {
+        // Keep going with the opid in hand; if we crash before confirm, the
+        // attempt is still 'submitting' (no opid) and the reconciler parks it.
+        warn!(error = %e, opid = %opid, "failed to record opid on attempt; continuing (reconciler parks on crash)");
+    }
 
     let txid = match wait_for_operation(rpc, &opid).await {
         Ok(OpResult::Success(txid)) => {
@@ -1823,66 +1844,93 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn sendmany_transport_error_never_refunds() {
+    async fn sendmany_definite_failure_refunds() {
+        // Wallet answers the balance check; the harness answers the unknown
+        // z_sendmany with a JSON-RPC -5 error response = definite failure.
         let (db, pool) = setup_db().await;
-        let (_m, _b) = credited_block(&db, 500).await;
-
-        // Wallet answers the balance check, then z_sendmany hits a dead
-        // endpoint? We can't split one mock URL, so instead: mock returns
-        // balance but NOT z_sendmany — the harness answers unknown methods
-        // with a JSON-RPC -5 error, which is a definite failure. To simulate
-        // TRANSPORT failure we point the wallet at a closed port entirely and
-        // accept that the round fails at the balance check... so instead
-        // verify the DEFINITE-failure path refunds (regression guard) and the
-        // transport discriminator via the reconciler park test below.
+        credited_block(&db, 500).await;
         let wallet = HashMap::from([(
             "z_gettotalbalance",
             serde_json::json!({"private": "100.0", "total": "100.0"}),
         )]);
         let wallet_url = mock_rpc(wallet).await;
         let node_url = mock_rpc(node_with_tx()).await;
-        let res = run_payouts(&db, &wallet_url, &node_url).await;
-        assert!(res.is_err(), "definite z_sendmany failure errors the round");
-        assert_eq!(
-            sums(&pool).await,
-            (REWARD, 0, 0, 0),
-            "JSON-RPC error response -> refunded to pending exactly"
-        );
+        assert!(run_payouts(&db, &wallet_url, &node_url).await.is_err());
+        assert_eq!(sums(&pool).await, (REWARD, 0, 0, 0), "JSON-RPC error -> refunded exactly");
         let st: String = sqlx::query_scalar("SELECT status FROM payout_attempts ORDER BY id DESC LIMIT 1")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(st, "failed");
     }
 
     #[tokio::test]
-    async fn sent_no_opid_reservation_parks_never_refunds() {
-        // The state fix 1 leaves behind: attempt 'sent', no opid, funds in
-        // `paying`. The reconciler must PARK it (alert) — never refund, even
-        // ancient.
+    async fn sendmany_transport_failure_parks_never_refunds() {
+        // GENUINE transport-class failure on z_sendmany: the mock returns a
+        // non-JSON 502 for that method (the client surfaces it as a
+        // non-JsonRpc RpcError, same class as a timeout/reset). The send may
+        // or may not have been accepted — funds must stay parked in paying.
+        let (db, pool) = setup_db().await;
+        credited_block(&db, 510).await;
+        let wallet = HashMap::from([
+            ("z_gettotalbalance", serde_json::json!({"private": "100.0", "total": "100.0"})),
+            ("z_sendmany", serde_json::json!(crate::reconciler::tests::TRANSPORT_FAIL)),
+        ]);
+        let wallet_url = mock_rpc(wallet).await;
+        let node_url = mock_rpc(node_with_tx()).await;
+        assert!(run_payouts(&db, &wallet_url, &node_url).await.is_err());
+        assert_eq!(
+            sums(&pool).await,
+            (0, REWARD, 0, 0),
+            "transport failure must NOT refund: funds stay in paying"
+        );
+        let (st, opid): (String, Option<String>) =
+            sqlx::query_as("SELECT status, opid FROM payout_attempts ORDER BY id DESC LIMIT 1")
+                .fetch_one(&pool).await.unwrap();
+        assert_eq!(st, "sent");
+        assert!(opid.is_none());
+
+        // And the reconciler, even long after expiry, parks rather than refunds.
+        sqlx::query("UPDATE payout_attempts SET created_at = datetime('now','-6 hours')")
+            .execute(&pool).await.unwrap();
+        let r = crate::reconciler::tests::reconciler(db.clone(), &node_url, &wallet_url);
+        let summary = r.reconcile_reserved_payouts_once(None).await;
+        assert_eq!(sums(&pool).await, (0, REWARD, 0, 0), "still parked after reconciliation");
+        assert!(summary.alerts.iter().any(|a| a.contains("UNRESOLVABLE")), "{:?}", summary.alerts);
+    }
+
+    #[tokio::test]
+    async fn submitting_no_opid_reservation_parks_never_refunds() {
+        // The crash window: attempt durably 'submitting', z_sendmany may have
+        // been accepted, process died before recording the opid. Park forever.
         let (db, pool) = setup_db().await;
         let (m, _b) = credited_block(&db, 600).await;
         let attempt = db.create_payout_attempt(1, REWARD, "loop").await.unwrap();
         db.reserve_payout(attempt, &[(m, REWARD)]).await.unwrap();
-        db.update_payout_attempt(attempt, "sent", None, None, Some("z_sendmany fate unknown, NOT refunded: transport"))
-            .await
-            .unwrap();
+        db.update_payout_attempt(attempt, "submitting", None, None, None).await.unwrap();
         sqlx::query("UPDATE payout_attempts SET created_at = datetime('now','-6 hours') WHERE id = ?1")
             .bind(attempt).execute(&pool).await.unwrap();
-
         let node_url = mock_rpc(HashMap::new()).await;
         let wallet_url = mock_rpc(HashMap::new()).await;
         let r = crate::reconciler::tests::reconciler(db.clone(), &node_url, &wallet_url);
         let summary = r.reconcile_reserved_payouts_once(None).await;
+        assert_eq!(sums(&pool).await, (0, REWARD, 0, 0), "submitting/no-opid must stay parked");
+        assert!(summary.alerts.iter().any(|a| a.contains("UNRESOLVABLE")), "{:?}", summary.alerts);
+    }
 
-        assert_eq!(
-            sums(&pool).await,
-            (0, REWARD, 0, 0),
-            "fate-unknown reservation must stay parked in paying"
-        );
-        assert!(
-            summary.alerts.iter().any(|a| a.contains("UNRESOLVABLE")),
-            "operator must be paged: {:?}",
-            summary.alerts
-        );
+    #[tokio::test]
+    async fn queued_no_opid_reservation_still_refunds_at_expiry() {
+        // Crash BEFORE the 'submitting' write: nothing could have been sent.
+        // The expiry refund must keep working (regression guard for fix 1).
+        let (db, pool) = setup_db().await;
+        let (m, _b) = credited_block(&db, 610).await;
+        let attempt = db.create_payout_attempt(1, REWARD, "loop").await.unwrap();
+        db.reserve_payout(attempt, &[(m, REWARD)]).await.unwrap();
+        sqlx::query("UPDATE payout_attempts SET created_at = datetime('now','-6 hours') WHERE id = ?1")
+            .bind(attempt).execute(&pool).await.unwrap();
+        let node_url = mock_rpc(HashMap::new()).await;
+        let wallet_url = mock_rpc(HashMap::new()).await;
+        let r = crate::reconciler::tests::reconciler(db.clone(), &node_url, &wallet_url);
+        r.reconcile_reserved_payouts_once(None).await;
+        assert_eq!(sums(&pool).await, (REWARD, 0, 0, 0), "queued/no-opid past expiry -> refunded exactly");
     }
 
     #[tokio::test]

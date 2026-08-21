@@ -354,6 +354,38 @@ async fn test_confirm_and_refund_roll_back_on_zero_row_transition() {
 }
 
 #[tokio::test]
+async fn test_confirm_rollback_undoes_earlier_good_item_when_later_item_corrupt() {
+    let db = setup_db().await;
+    let good = db.get_or_create_miner("utest1good").await.unwrap();
+    let bad = db.get_or_create_miner("utest1bad").await.unwrap();
+    db.credit_balance(good.id, 30_000_000).await.unwrap();
+    db.credit_balance(bad.id, 20_000_000).await.unwrap();
+    let attempt = db.create_payout_attempt(2, 50_000_000, "loop").await.unwrap();
+    db.reserve_payout(attempt, &[(good.id, 30_000_000), (bad.id, 20_000_000)]).await.unwrap();
+    // Corrupt only the SECOND item's backing.
+    sqlx::query("UPDATE balances SET paying = 0 WHERE miner_id = ?1")
+        .bind(bad.id).execute(db.inner()).await.unwrap();
+
+    assert!(db.confirm_payout(attempt, "dd22").await.is_err());
+    // The first (valid) item must have been rolled back too: nothing paid,
+    // its paying intact, both items still present, zero payouts rows.
+    let (paying, paid): (i64, i64) = sqlx::query_as("SELECT paying, paid FROM balances WHERE miner_id = ?1")
+        .bind(good.id).fetch_one(db.inner()).await.unwrap();
+    assert_eq!((paying, paid), (30_000_000, 0), "earlier good item must be fully rolled back");
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payout_items WHERE attempt_id = ?1")
+        .bind(attempt).fetch_one(db.inner()).await.unwrap();
+    assert_eq!(items, 2);
+    let payouts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payouts").fetch_one(db.inner()).await.unwrap();
+    assert_eq!(payouts, 0);
+
+    // Same for refund: the good item's pending must not have been credited.
+    assert!(db.refund_payout(attempt).await.is_err());
+    let (pending, paying): (i64, i64) = sqlx::query_as("SELECT pending, paying FROM balances WHERE miner_id = ?1")
+        .bind(good.id).fetch_one(db.inner()).await.unwrap();
+    assert_eq!((pending, paying), (0, 30_000_000), "refund rollback must undo the earlier good item");
+}
+
+#[tokio::test]
 async fn test_clawback_acknowledgement_silences_alerts() {
     let db = setup_db().await;
     let m = db.get_or_create_miner("utest1ack").await.unwrap();
