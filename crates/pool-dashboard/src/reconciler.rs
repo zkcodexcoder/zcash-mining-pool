@@ -166,7 +166,7 @@ impl Reconciler {
                 return;
             }
         };
-        for (id, _status, opid, txid, total_zats, created_at) in reserved {
+        for (id, status, opid, txid, total_zats, created_at) in reserved {
             let total_zec = total_zats as f64 / ZATOSHIS_PER_ZEC;
 
             // Learn the txid: recorded on the attempt, or resolved via the opid.
@@ -262,9 +262,22 @@ impl Reconciler {
                 self.refund_reservation(id, total_zec, "operation failed", summary)
                     .await;
             } else if opid.is_none() {
-                // No opid was ever recorded: z_sendmany never returned, so
-                // nothing was submitted. Safe to refund once past expiry.
-                if older_than(&created_at, RESERVATION_REFUND_MINUTES) {
+                if status == "sent" {
+                    // 'sent' with no opid = z_sendmany itself failed on
+                    // TRANSPORT (fate unknown — the wallet may have queued and
+                    // broadcast the tx even though we never saw a response).
+                    // Never auto-refund: park the funds in `paying` and page
+                    // the operator, exactly like the opid-lost case below.
+                    summary.alerts.push(format!(
+                        "UNRESOLVABLE reservation {id} ({total_zec:.4} coins): z_sendmany fate \
+                         unknown (transport failure, no opid). Funds parked in `paying`. Check \
+                         the wallet's recent transactions for a matching send before refunding \
+                         manually."
+                    ));
+                } else if older_than(&created_at, RESERVATION_REFUND_MINUTES) {
+                    // Still 'queued': the loop crashed BEFORE z_sendmany was
+                    // called, so nothing was submitted. Safe to refund once
+                    // past expiry.
                     self.refund_reservation(id, total_zec, "never submitted (no opid) past expiry", summary)
                         .await;
                 } else {
