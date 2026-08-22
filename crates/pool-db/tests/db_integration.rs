@@ -39,6 +39,29 @@ async fn test_worker_create_and_list() {
 }
 
 #[tokio::test]
+async fn test_stale_workers_hidden_from_miner_view() {
+    let db = setup_db().await;
+    let miner = db.get_or_create_miner("t1StaleMiner").await.unwrap();
+    let fresh = db.get_or_create_worker(miner.id, "active-rig").await.unwrap();
+    let stale = db.get_or_create_worker(miner.id, "retired-rig").await.unwrap();
+    // Age one worker past the 7-day dashboard cutoff; keep one just inside it.
+    sqlx::query("UPDATE workers SET last_seen = datetime('now', '-8 days') WHERE id = ?1")
+        .bind(stale.id)
+        .execute(db.inner())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workers SET last_seen = datetime('now', '-6 days') WHERE id = ?1")
+        .bind(fresh.id)
+        .execute(db.inner())
+        .await
+        .unwrap();
+
+    let workers = db.get_workers_for_miner(miner.id).await.unwrap();
+    assert_eq!(workers.len(), 1, "only the active worker should be listed: {workers:?}");
+    assert_eq!(workers[0].name, "active-rig");
+}
+
+#[tokio::test]
 async fn test_share_recording() {
     let db = setup_db().await;
 

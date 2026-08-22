@@ -519,9 +519,13 @@ impl PoolDb {
         Ok(row.get::<i64, _>("miner_id"))
     }
 
+    /// Workers for the public miner dashboard. Hides workers idle for over a
+    /// week — long-gone rigs otherwise clutter the table forever (the admin
+    /// diagnostics view intentionally still returns everything).
     pub async fn get_workers_for_miner(&self, miner_id: i64) -> Result<Vec<Worker>, DbError> {
         let workers: Vec<Worker> = sqlx::query_as(
-            "SELECT id, miner_id, name, last_seen, last_difficulty FROM workers WHERE miner_id = ?1",
+            "SELECT id, miner_id, name, last_seen, last_difficulty FROM workers \
+             WHERE miner_id = ?1 AND last_seen >= datetime('now', '-7 days')",
         )
         .bind(miner_id)
         .fetch_all(&self.pool)
