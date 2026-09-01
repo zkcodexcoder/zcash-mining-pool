@@ -133,9 +133,9 @@ print("bad" if (not resp or fails >= 3) else "ok")' 2>/dev/null)
 fi
 
 # --- mainnet node .76 (RPC direct + one ssh probe) ---
-# EOS fuse of the RUNNING zakurad binary: v1.2.0 (cutover 2026-08-16) panics at
-# ~3,495,707 (~Sept 25). Re-bump at every rebuild/cutover (task #17 treadmill).
-EOS_PANIC_HEIGHT=3495707
+# EOS fuse of the RUNNING zakurad binary: v1.3.0 (upgraded 2026-09-01 by Codex)
+# panics at ~3,511,707 (~Oct 9). Re-bump at every rebuild/cutover (task #17).
+EOS_PANIC_HEIGHT=3511707
 H76=$(curl -s --max-time 8 --data-binary '{"jsonrpc":"1.0","id":"hc","method":"getblockcount","params":[]}' \
   -H 'content-type:text/plain;' http://38.190.136.76:8232/ 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"])' 2>/dev/null)
 report node76_rpc "$([ -n "$H76" ] && echo 1 || echo 0)" "mainnet node .76 RPC not answering (pool cannot get work)"
