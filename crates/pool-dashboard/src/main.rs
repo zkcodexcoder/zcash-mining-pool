@@ -982,17 +982,10 @@ async fn write_payout_health(
     reserve_min_zatoshis: i64,
     failures: PhaseFailures<'_>,
 ) -> anyhow::Result<()> {
-    // Check transparent balance (unshielded funds)
-    let (transparent_zec, private_zec) = match wallet_rpc.call_raw::<serde_json::Value>(
-        "z_gettotalbalance", serde_json::json!([1, true])
-    ).await {
-        Ok(bal) => {
-            let t = bal.get("transparent").and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let p = bal.get("private").and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            (t, p)
-        }
+    // Check transparent balance (unshielded funds). Dialect-neutral: works
+    // against zallet (z_gettotalbalance) and zecd (getbalances).
+    let (transparent_zec, private_zec) = match wallet_rpc.wallet_balances(1).await {
+        Ok(b) => (b.transparent, b.spendable),
         Err(_) => (0.0, 0.0),
     };
 
@@ -1000,10 +993,8 @@ async fn write_payout_health(
     // If transparent balance > 0 and we have mature blocks, shielding might be stuck.
     let shielding_stuck = transparent_zec > 0.01;
 
-    // Check for Zallet sync issues by attempting a simple RPC
-    let wallet_responsive = wallet_rpc.call_raw::<serde_json::Value>(
-        "z_gettotalbalance", serde_json::json!([0, true])
-    ).await.is_ok();
+    // Check for wallet sync issues by attempting a simple RPC
+    let wallet_responsive = wallet_rpc.wallet_balances(0).await.is_ok();
 
     let reserve_min_zec = reserve_min_zatoshis as f64 / ZATOSHIS_PER_ZEC;
     let spendable_zec = (private_zec - reserve_min_zec).max(0.0);
@@ -1157,6 +1148,8 @@ async fn shield_coinbase(
                 if msg.contains("No spendable transparent outputs")
                     || msg.contains("Insufficient")
                     || msg.contains("No funds")
+                    // zecd's "nothing mature to shield" (-6) benign case.
+                    || msg.contains("Could not find any coinbase funds")
                 {
                     break;
                 }
@@ -1164,12 +1157,23 @@ async fn shield_coinbase(
             }
         };
 
-        let shielding_utxos = result.get("shieldingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0);
+        // zecd dialect: the response carries only `opid` — one sweep of ALL
+        // mature coinbase per call, no batching fields. Treat that as a single
+        // full batch (counts unknown → 1/0) and stop after it.
+        let zecd_dialect = result.get("shieldingUTXOs").is_none();
+        let shielding_utxos = result
+            .get("shieldingUTXOs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(if zecd_dialect { 1 } else { 0 });
         let shielding_value = result.get("shieldingValue").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let remaining_utxos = result.get("remainingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0);
+        let remaining_utxos = if zecd_dialect {
+            0
+        } else {
+            result.get("remainingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0)
+        };
         let opid = result.get("opid").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-        if shielding_utxos == 0 {
+        if shielding_utxos == 0 || opid == "unknown" {
             break;
         }
 
@@ -1332,15 +1336,12 @@ async fn process_payouts(
     let total_payout_zatoshis: i64 = pending.iter().map(|p| p.amount).sum();
     let total_payout_zec = total_payout_zatoshis as f64 / ZATOSHIS_PER_ZEC;
 
-    let private_balance = match rpc.call_raw::<serde_json::Value>(
-        "z_gettotalbalance", serde_json::json!([3, true])
-    ).await {
-        Ok(bal) => {
-            bal.get("private")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0)
-        }
+    // Spendable-balance gate for the round. Dialect-neutral: zallet answers
+    // z_gettotalbalance(minconf 3); zecd answers via getbalances, whose
+    // `mine.trusted` applies its ZIP-315 confirmations policy (config
+    // `trusted_confirmations`, which we set to 3 to match).
+    let private_balance = match rpc.wallet_balances(3).await {
+        Ok(b) => b.spendable,
         Err(e) => {
             return Err(anyhow::anyhow!("Failed to check wallet balance: {e}"));
         }
@@ -1793,6 +1794,36 @@ mod lifecycle_tests {
 
         let (reward, balances, clawbacks) = db.get_accounting_invariant().await.unwrap();
         assert_eq!(reward, balances + clawbacks - 0, "invariant holds exactly");
+    }
+
+    /// Same happy path, but the wallet speaks the zecd dialect: no
+    /// z_gettotalbalance (mock returns -5 -> fallback to getbalances with
+    /// numeric fields). Proves the payout pipeline is wallet-agnostic.
+    #[tokio::test]
+    async fn happy_path_zecd_dialect_exact_conservation() {
+        let (db, pool) = setup_db().await;
+        credited_block(&db, 150).await;
+
+        let wallet_url = mock_rpc(HashMap::from([
+            (
+                "getbalances",
+                serde_json::json!({"mine": {"trusted": 100.0, "untrusted_pending": 0.0, "immature": 0.0, "coinbase": 0.0}}),
+            ),
+            ("z_sendmany", serde_json::json!("opid-zecd")),
+            (
+                "z_getoperationstatus",
+                serde_json::json!([{"status": "success", "result": {"txid": TXID}}]),
+            ),
+        ]))
+        .await;
+        let node_url = mock_rpc(node_with_tx()).await;
+        let n = run_payouts(&db, &wallet_url, &node_url).await.unwrap();
+        assert_eq!(n, 1, "zecd-dialect payout must complete");
+        assert_eq!(
+            sums(&pool).await,
+            (0, 0, REWARD, REWARD),
+            "zecd dialect must conserve exactly like zallet"
+        );
     }
 
     #[tokio::test]

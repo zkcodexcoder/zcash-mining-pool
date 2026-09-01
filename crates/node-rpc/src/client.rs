@@ -277,14 +277,28 @@ impl ZcashRpcClient {
         limit: Option<u32>,
     ) -> Result<serde_json::Value, RpcError> {
         let lim = limit.unwrap_or(0); // 0 = no limit, shield all mature coinbase UTXOs
-        self.call("z_shieldcoinbase", serde_json::json!([
+        match self.call("z_shieldcoinbase", serde_json::json!([
             from_address,
             to_address,
             null,               // fee (default ZIP 317)
             lim,                // limit UTXOs per tx
             null,               // memo
             "AllowRevealedSenders"
-        ])).await
+        ])).await {
+            Ok(v) => Ok(v),
+            // zecd rejects the extended zcashd parameter list (it sweeps all
+            // mature coinbase in one op, ZIP-317 fee always); retry minimal
+            // (from, to). A real failure (e.g. -6 nothing-to-shield) surfaces
+            // from this second call with its proper error.
+            Err(RpcError::JsonRpc(_)) => {
+                self.call(
+                    "z_shieldcoinbase",
+                    serde_json::json!([from_address, to_address]),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Send ZEC from `from_address` to multiple recipients.
@@ -331,4 +345,64 @@ impl ZcashRpcClient {
         )
         .await
     }
+
+    /// Wallet balances in a dialect-neutral form: (transparent+shielded spendable,
+    /// pending, immature) in ZEC as f64. Probes `z_gettotalbalance` (zallet/zcashd
+    /// dialect: string fields, minconf param) first, falling back to `getbalances`
+    /// (zecd/Bitcoin-Core dialect: numeric `mine.*` fields, ZIP-315 confirmations
+    /// policy). Both payout-wallet dialects thus work with no config switch.
+    pub async fn wallet_balances(&self, minconf: u32) -> Result<WalletBalances, RpcError> {
+        match self
+            .call::<serde_json::Value>("z_gettotalbalance", serde_json::json!([minconf, true]))
+            .await
+        {
+            Ok(v) => {
+                let s = |k: &str| {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .and_then(|x| x.parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                };
+                Ok(WalletBalances {
+                    spendable: s("private"),
+                    transparent: s("transparent"),
+                    pending: 0.0,
+                    immature: 0.0,
+                })
+            }
+            // Method not found (-32601) or zcashd's unknown-method (-32602/-1):
+            // assume the getbalances dialect.
+            Err(RpcError::JsonRpc(_)) => {
+                let v = self
+                    .call::<serde_json::Value>("getbalances", serde_json::json!([]))
+                    .await?;
+                let mine = v.get("mine").cloned().unwrap_or_default();
+                let n = |k: &str| mine.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                Ok(WalletBalances {
+                    spendable: n("trusted"),
+                    transparent: n("coinbase"),
+                    pending: n("untrusted_pending"),
+                    immature: n("immature"),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Dialect-neutral wallet balance snapshot (ZEC as f64), from either
+/// `z_gettotalbalance` (zallet) or `getbalances` (zecd).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalletBalances {
+    /// Spendable shielded balance (zallet: `private` at the given minconf;
+    /// zecd: `mine.trusted` under its ZIP-315 confirmations policy).
+    pub spendable: f64,
+    /// Transparent funds (zallet: `transparent`; zecd: `mine.coinbase`, the
+    /// mature-coinbase-awaiting-shielding portion relevant to the pool).
+    pub transparent: f64,
+    /// Incoming below the confirmations policy (zecd only; zallet folds this
+    /// into the minconf semantics).
+    pub pending: f64,
+    /// Immature coinbase (zecd only).
+    pub immature: f64,
 }
