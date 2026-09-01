@@ -873,16 +873,14 @@ pub async fn get_zallet_status(
     };
 
     if let Some(ref wallet) = state.wallet_rpc {
-        match wallet.z_get_total_balance().await {
-            Ok(v) => {
+        match wallet.wallet_balances(0).await {
+            Ok(b) => {
                 status.rpc_ok = true;
-                if let Some(obj) = v.as_object() {
-                    status.balance = Some(ZalletBalance {
-                        transparent: obj.get("transparent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                        private: obj.get("private").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                        total: obj.get("total").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                    });
-                }
+                status.balance = Some(ZalletBalance {
+                    transparent: format!("{:.8}", b.transparent),
+                    private: format!("{:.8}", b.spendable),
+                    total: format!("{:.8}", b.transparent + b.spendable + b.pending + b.immature),
+                });
             }
             Err(e) => status.error = Some(format!("RPC error: {e}")),
         }

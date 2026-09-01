@@ -811,26 +811,29 @@ async fn api_health(
 
     let (wallet_ok, wallet_balance, wallet_version) = match &state.app.wallet_rpc {
         Some(rpc) => {
-            let bal_fut = rpc.call_raw::<serde_json::Value>(
-                "z_gettotalbalance",
-                serde_json::json!([0, true]),
-            );
-            let ver_fut = rpc.call_raw::<serde_json::Value>(
-                "getinfo",
-                serde_json::json!([]),
-            );
+            // Dialect-neutral balance; version via getinfo (zallet) with a
+            // getwalletinfo fallback (zecd has no getinfo).
+            let bal_fut = rpc.wallet_balances(0);
+            let ver_fut = async {
+                match rpc.call_raw::<serde_json::Value>("getinfo", serde_json::json!([])).await {
+                    Ok(v) => Ok(v),
+                    Err(_) => rpc
+                        .call_raw::<serde_json::Value>("getwalletinfo", serde_json::json!([]))
+                        .await,
+                }
+            };
             let (bal_res, ver_res) = tokio::join!(
                 tokio::time::timeout(std::time::Duration::from_secs(30), bal_fut),
                 tokio::time::timeout(std::time::Duration::from_secs(10), ver_fut),
             );
             let (ok, bal) = match bal_res {
-                Ok(Ok(v)) => {
-                    let b = v.as_object().map(|obj| WalletBalanceInfo {
-                        transparent: obj.get("transparent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                        private: obj.get("private").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                        total: obj.get("total").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                    });
-                    (true, b)
+                Ok(Ok(b)) => {
+                    let info = WalletBalanceInfo {
+                        transparent: format!("{:.8}", b.transparent),
+                        private: format!("{:.8}", b.spendable),
+                        total: format!("{:.8}", b.transparent + b.spendable + b.pending + b.immature),
+                    };
+                    (true, Some(info))
                 }
                 _ => (false, None),
             };
