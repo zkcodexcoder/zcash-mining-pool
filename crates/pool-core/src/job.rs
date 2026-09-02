@@ -596,7 +596,13 @@ impl JobManager {
         // Race-to-tip already sent the clean_jobs=true empty notify when
         // sent_empty_block. If we skipped that fast path, the full-template
         // notify must be clean so miners switch to the new prev_hash.
-        let clean_jobs = is_new_block && !sent_empty_block;
+        //
+        // The empty->full upgrade must also be clean: miners (nheqminer et
+        // al.) keep working the job they have on a non-clean notify, so a
+        // clean_jobs=false upgrade never reaches the header — observed on
+        // testnet as every block carrying the empty job's ntime. Abandoning
+        // a few ms of work on the fee-less job is the whole point.
+        let clean_jobs = (is_new_block && !sent_empty_block) || upgrade_empty;
         let notify = job.to_notify(clean_jobs);
 
         {
