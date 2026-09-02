@@ -108,6 +108,21 @@ remote zebra-family node over `zebra://` JSON-RPC. Box: 8-core Linux, otherwise 
 - `z_shieldcoinbase` empty case: exactly as documented (`-6` "Could not find any
   coinbase funds to shield").
 
+## Spending-wallet restore (2026-09-02, seed-restored wallet at 130k txs)
+
+- Full restore from mnemonic on the same daemon as the UFVK watch-only wallet:
+  synced all history with zero errors; both wallets report identical
+  `getbalances` at the same `lastprocessedblock`, and trusted+immature matches
+  the incumbent wallet's `z_gettotalbalance` total to the zatoshi.
+- Finding 9: **`listtransactions` pagination cost is O(history), not O(page).**
+  On the 130k-tx wallet, default (10 entries) answers in seconds, `count=100`
+  takes ~140s, and `count=300` or any `skip` offset (e.g. `["*",30,300]`)
+  exceeds 170s and times out. `skip` does not avoid the walk. A pool does not
+  need this method in its hot path, but incident forensics ("did this send
+  ever leave the wallet?") do — we ended up reading `data.sqlite`
+  (`sent_notes` ⋈ `transactions`) directly, which answers instantly.
+  Suggest paging from an indexed cursor (id_tx / mined_height).
+
 ## Overall verdict for our use (pool payout wallet)
 
 PASS on everything testable without holding the spending seed. Standout results:
