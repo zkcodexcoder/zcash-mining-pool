@@ -139,7 +139,22 @@ pub struct JobManager {
     /// Tracks the lag between longpoll-return and broadcast_notify so the
     /// dashboard can surface our pool-side orphan-window contribution.
     lag_tracker: Arc<TemplateLagTracker>,
+    /// Mempool tx count of the most recently broadcast job. Zebra's longpoll
+    /// wakes us on a tip change BEFORE its mempool has re-synced to the new
+    /// tip, handing us a template with zero transactions; the full template
+    /// arrives ~100ms later. Miners that solve in that window mine an empty
+    /// block (subsidy only, no fees, and our own payout txs wait for someone
+    /// else's block). Tracking the count lets the empty->full upgrade bypass
+    /// the non-clean throttle and drives the post-wake re-poll in `run`.
+    last_broadcast_tx_count: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// Re-poll schedule after a new-tip template arrived with no transactions:
+/// short backoff until the node's mempool catches up to the new tip. While
+/// this runs no longpoll is in flight, so each sleep also bounds how late we
+/// could notice a *further* tip change in the (rare) genuinely-empty-mempool
+/// case — keep the tail short.
+const EMPTY_TEMPLATE_REPOLL_DELAYS_MS: [u64; 4] = [100, 200, 400, 800];
 
 impl JobManager {
     pub fn new(rpc: Arc<ZcashRpcClient>, stratum: Arc<StratumServer>) -> Self {
@@ -178,6 +193,7 @@ impl JobManager {
             longpoll_fail_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_longpoll_fail_at_ms: Arc::new(AtomicI64::new(0)),
             lag_tracker: Arc::new(TemplateLagTracker::new()),
+            last_broadcast_tx_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -250,6 +266,9 @@ impl JobManager {
                 Ok(new_block) => {
                     if new_block {
                         debug!("New block detected, jobs cleaned");
+                        if self.last_broadcast_tx_count.load(Ordering::Relaxed) == 0 {
+                            self.repoll_until_template_fills().await;
+                        }
                     }
                 }
                 Err(e) => {
@@ -310,6 +329,37 @@ impl JobManager {
                           "Longpoll failed, falling back to regular poll");
                 }
                 self.poll_template().await
+            }
+        }
+    }
+
+    /// A new-tip template arrived with no transactions (the node's mempool
+    /// hadn't re-synced yet). Re-poll on a short backoff so miners get the
+    /// fee-carrying template within ~100-300ms instead of after the next
+    /// throttled non-clean refresh (5s) — long enough for a fast solve to
+    /// produce an empty block. Stops as soon as a job with transactions is
+    /// out, another new block arrives, or the schedule is exhausted (a
+    /// genuinely empty mempool).
+    async fn repoll_until_template_fills(&self) {
+        let started = Instant::now();
+        for delay_ms in EMPTY_TEMPLATE_REPOLL_DELAYS_MS {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            match self.poll_template().await {
+                Ok(new_block) => {
+                    if new_block {
+                        return;
+                    }
+                    if self.last_broadcast_tx_count.load(Ordering::Relaxed) > 0 {
+                        debug!(
+                            after_ms = started.elapsed().as_millis() as u64,
+                            "Empty new-tip template upgraded to full template"
+                        );
+                        return;
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "Re-poll after empty template failed; will retry");
+                }
             }
         }
     }
@@ -394,6 +444,7 @@ impl JobManager {
             *latest = Some(notify.clone());
         }
         self.stratum.broadcast_notify(notify);
+        self.last_broadcast_tx_count.store(0, Ordering::Relaxed);
         if let Some(start) = t0 {
             self.lag_tracker
                 .record(start.elapsed(), template.height, LagKind::EmptyBlock);
@@ -457,7 +508,18 @@ impl JobManager {
             at.store(ms, Ordering::Relaxed);
         }
 
-        let should_broadcast = if is_new_block {
+        // The node's longpoll wakes us on a tip change before its mempool has
+        // re-synced, so the first template for a new tip is often empty and
+        // the miners' current job carries no fees. When the next template
+        // finally has transactions, bypass the non-clean throttle: every
+        // second miners spend on the empty job is a chance to solve an
+        // empty block.
+        let tx_count = template.transactions.len();
+        let upgrade_empty = !is_new_block
+            && tx_count > 0
+            && self.last_broadcast_tx_count.load(Ordering::Relaxed) == 0;
+
+        let should_broadcast = if is_new_block || upgrade_empty {
             true
         } else {
             let last = self.last_non_clean_broadcast.read().await;
@@ -466,6 +528,13 @@ impl JobManager {
 
         if !should_broadcast {
             return Ok(false);
+        }
+        if upgrade_empty {
+            info!(
+                height = template_height,
+                tx_count,
+                "Upgrading empty job to full template (mempool caught up)"
+            );
         }
 
         // Inject coinbase tag if configured
@@ -565,6 +634,8 @@ impl JobManager {
             *latest = Some(notify.clone());
         }
         self.stratum.broadcast_notify(notify);
+        self.last_broadcast_tx_count
+            .store(tx_count, Ordering::Relaxed);
         if is_new_block {
             if let Some(start) = t0 {
                 self.lag_tracker.record(
