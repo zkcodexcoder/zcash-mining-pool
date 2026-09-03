@@ -58,6 +58,12 @@ window_multiplier = 2.0
 enabled = true
 pool_address = "YOUR_UNIFIED_ADDRESS_HERE"
 mining_address = "YOUR_TRANSPARENT_ADDRESS_HERE"
+# Set true when the node's [mining] miner_address is the wallet's unified
+# address (Orchard receiver): the reward is minted straight into a shielded
+# note (Ironwood post-NU6.3), no coinbase sweep is needed, and the reconciler
+# verifies each block via wallet `gettransaction` instead of a transparent
+# vout. Keep mining_address set so legacy transparent coinbase still sweeps.
+shielded_coinbase = false
 maturity_confirmations = 100
 wallet_rpc_url = "http://127.0.0.1:28232"
 wallet_rpc_user = "your_wallet_user"

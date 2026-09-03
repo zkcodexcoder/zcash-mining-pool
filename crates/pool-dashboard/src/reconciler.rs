@@ -84,10 +84,11 @@ pub struct Reconciler {
     /// phantom check only alerts (legacy behavior).
     pub auto_void_reorged: bool,
     /// The node mints the coinbase straight into a shielded receiver, so
-    /// there is no transparent output paying `mining_address`. The coinbase
-    /// check instead asks the payout wallet whether it owns the coinbase
-    /// txid (`gettransaction`): a result means the reward landed in our
-    /// wallet, a JSON-RPC error means it went elsewhere.
+    /// there is normally no transparent output paying `mining_address`.
+    /// When the vout scan finds none, the coinbase check asks the payout
+    /// wallet whether it owns the coinbase txid (`gettransaction`): a
+    /// result means the reward landed in our wallet, a JSON-RPC error means
+    /// it went elsewhere. Legacy transparent blocks still pass on the vout.
     pub shielded_coinbase: bool,
 }
 
@@ -532,23 +533,6 @@ impl Reconciler {
                 let Some(cb_txid) = cb_txid else {
                     return Ok::<Option<bool>, node_rpc::RpcError>(None);
                 };
-                if self.shielded_coinbase {
-                    // No transparent output to inspect: the wallet is the
-                    // only party that can tell whether the shielded reward
-                    // decrypts to us. A JSON-RPC error ("Invalid or
-                    // non-wallet transaction id") is a definitive "not
-                    // ours"; anything else is a transport fault and
-                    // propagates so the watermark stays put.
-                    return match self
-                        .wallet_rpc
-                        .call_raw::<serde_json::Value>("gettransaction", serde_json::json!([cb_txid]))
-                        .await
-                    {
-                        Ok(_) => Ok(Some(true)),
-                        Err(node_rpc::RpcError::JsonRpc(_)) => Ok(Some(false)),
-                        Err(e) => Err(e),
-                    };
-                }
                 let tx = self.node_rpc.get_raw_transaction(&cb_txid, 1).await?;
                 let pays = tx
                     .get("vout")
@@ -565,7 +549,27 @@ impl Reconciler {
                         })
                     })
                     .unwrap_or(false);
-                Ok(Some(pays))
+                if pays || !self.shielded_coinbase {
+                    return Ok(Some(pays));
+                }
+                // Shielded mode and no transparent output to us: the reward
+                // (if it is ours) sits in a shielded note only the wallet
+                // can decrypt, so ask it. Blocks from before the switch
+                // still pass on the transparent vout above, which keeps the
+                // walk quiet across the transition and for a wallet that
+                // never indexed the legacy transparent coinbases. A JSON-RPC
+                // error ("Invalid or non-wallet transaction id") is a
+                // definitive "not ours"; anything else is a transport fault
+                // and propagates so the watermark stays put.
+                match self
+                    .wallet_rpc
+                    .call_raw::<serde_json::Value>("gettransaction", serde_json::json!([cb_txid]))
+                    .await
+                {
+                    Ok(_) => Ok(Some(true)),
+                    Err(node_rpc::RpcError::JsonRpc(_)) => Ok(Some(false)),
+                    Err(e) => Err(e),
+                }
             }
             .await;
             match paid_us {
@@ -1275,10 +1279,18 @@ mod fee_tests {
             .unwrap();
     }
 
+    /// Node view of a shielded coinbase: the only transparent vout is the
+    /// funding stream; the miner reward is in an Ironwood action.
     fn coinbase_node_responses() -> HashMap<&'static str, serde_json::Value> {
         HashMap::from([
             ("getblockhash", serde_json::json!("aa")),
             ("getblock", serde_json::json!({"hash": "aa", "tx": ["cb100"]})),
+            (
+                "getrawtransaction",
+                serde_json::json!({"txid": "cb100", "version": 6, "vout": [
+                    {"value": 0.125, "scriptPubKey": {"addresses": ["t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu"]}}
+                ], "ironwood": {"actions": [{}], "valueBalance": -1.2505}}),
+            ),
         ])
     }
 
@@ -1342,6 +1354,30 @@ mod fee_tests {
         );
         let wm = db.get_pool_status("coinbase_check_height").await.unwrap();
         assert!(wm.is_none(), "watermark must not advance on transport failure: {wm:?}");
+    }
+
+    #[tokio::test]
+    async fn shielded_mode_accepts_legacy_transparent_coinbase_without_asking_wallet() {
+        let (db, pool) = setup_db().await;
+        seed_coinbase_check_block(&pool).await;
+        // Pre-switch block: transparent vout pays mining_address. The wallet
+        // never indexed it (default -5), which must NOT turn into an alert.
+        let mut node = coinbase_node_responses();
+        node.insert(
+            "getrawtransaction",
+            serde_json::json!({"txid": "cb100", "vout": [
+                {"scriptPubKey": {"addresses": ["tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd"]}}
+            ]}),
+        );
+        let node = mock_rpc(node).await;
+        let wallet = mock_rpc(HashMap::new()).await;
+        let mut r = reconciler(db.clone(), &node, &wallet);
+        r.mining_address = "tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd".into();
+        r.shielded_coinbase = true;
+        let s = r.sweep_once().await.unwrap();
+        assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
+        let wm = db.get_pool_status("coinbase_check_height").await.unwrap();
+        assert_eq!(wm.map(|(v, _)| v).as_deref(), Some("100"));
     }
 
     #[tokio::test]
