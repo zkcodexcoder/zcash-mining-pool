@@ -139,8 +139,10 @@ fi
 
 # --- mainnet node (RPC direct + one ssh probe) ---
 # EOS fuse of the RUNNING zakurad binary: v1.3.0 (upgraded 2026-09-01 by Codex)
-# panics at ~3,511,707 (~Oct 9). Re-bump at every rebuild/cutover (task #17).
-EOS_PANIC_HEIGHT=3511707
+# = ESTIMATED_RELEASE_HEIGHT 3,465,627 + 31 days x 1152 = 3,501,339 (~Sept 30;
+# v1.3.1 halts at the same block, per its release notes). The earlier 3,511,707
+# figure was wrong. Re-bump at every rebuild/cutover (task #17).
+EOS_PANIC_HEIGHT=3501339
 H76=$(curl -s --max-time 8 --data-binary '{"jsonrpc":"1.0","id":"hc","method":"getblockcount","params":[]}' \
   -H 'content-type:text/plain;' "http://${MAINNET_NODE_HOST}:8232/" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"])' 2>/dev/null)
 report node76_rpc "$([ -n "$H76" ] && echo 1 || echo 0)" "mainnet node RPC not answering (pool cannot get work)"
