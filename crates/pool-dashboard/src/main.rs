@@ -270,6 +270,15 @@ struct PayoutConfig {
     /// balances never wait on a timer. Unset = no override. HOT-RELOADED.
     #[serde(default)]
     coalesce_override_zec: Option<f64>,
+    /// The node mints the block reward straight into a shielded receiver
+    /// (zakurad `mining.miner_address` = the wallet's UA), so there is no
+    /// transparent coinbase output to look for. The reconciler's coinbase
+    /// check then asks the wallet whether it received each coinbase txid
+    /// instead of scanning vouts for `mining_address`. The sweep loop keeps
+    /// running: `z_shieldcoinbase` still drains any legacy transparent
+    /// coinbase and is a benign no-op once that is gone.
+    #[serde(default)]
+    shielded_coinbase: bool,
 }
 
 fn default_minimum_payout() -> f64 {
@@ -311,6 +320,7 @@ impl Default for PayoutConfig {
             pay_immature: false,
             min_payout_interval_secs: 0,
             coalesce_override_zec: None,
+            shielded_coinbase: false,
         }
     }
 }
@@ -738,6 +748,7 @@ async fn main() -> Result<()> {
                 pool_fee: (config.pool.fee_percent / 100.0).clamp(0.0, 1.0),
                 mining_address: mining_address.clone(),
                 auto_void_reorged: config.payout.auto_void_reorged,
+                shielded_coinbase: config.payout.shielded_coinbase,
             };
             // Round-3: resolve any payout reservations orphaned by a crash BEFORE
             // the payout loop starts — confirm those whose tx reached the chain,
