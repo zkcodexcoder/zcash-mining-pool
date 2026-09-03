@@ -83,6 +83,12 @@ pub struct Reconciler {
     /// returns balances to pending and the loop re-pays. When false, the
     /// phantom check only alerts (legacy behavior).
     pub auto_void_reorged: bool,
+    /// The node mints the coinbase straight into a shielded receiver, so
+    /// there is no transparent output paying `mining_address`. The coinbase
+    /// check instead asks the payout wallet whether it owns the coinbase
+    /// txid (`gettransaction`): a result means the reward landed in our
+    /// wallet, a JSON-RPC error means it went elsewhere.
+    pub shielded_coinbase: bool,
 }
 
 impl Reconciler {
@@ -526,6 +532,23 @@ impl Reconciler {
                 let Some(cb_txid) = cb_txid else {
                     return Ok::<Option<bool>, node_rpc::RpcError>(None);
                 };
+                if self.shielded_coinbase {
+                    // No transparent output to inspect: the wallet is the
+                    // only party that can tell whether the shielded reward
+                    // decrypts to us. A JSON-RPC error ("Invalid or
+                    // non-wallet transaction id") is a definitive "not
+                    // ours"; anything else is a transport fault and
+                    // propagates so the watermark stays put.
+                    return match self
+                        .wallet_rpc
+                        .call_raw::<serde_json::Value>("gettransaction", serde_json::json!([cb_txid]))
+                        .await
+                    {
+                        Ok(_) => Ok(Some(true)),
+                        Err(node_rpc::RpcError::JsonRpc(_)) => Ok(Some(false)),
+                        Err(e) => Err(e),
+                    };
+                }
                 let tx = self.node_rpc.get_raw_transaction(&cb_txid, 1).await?;
                 let pays = tx
                     .get("vout")
@@ -550,7 +573,12 @@ impl Reconciler {
                 Ok(Some(false)) => {
                     summary.alerts.push(format!(
                         "COINBASE MISMATCH: confirmed block at height {height} does not pay \
-                         the mining address — book income may be phantom; investigate before payouts"
+                         {} — book income may be phantom; investigate before payouts",
+                        if self.shielded_coinbase {
+                            "the payout wallet (shielded coinbase not found by gettransaction)"
+                        } else {
+                            "the mining address"
+                        }
                     ));
                     // Advance past it so the alert fires once, not every sweep;
                     // the alert text is the operator's handle.
@@ -795,6 +823,7 @@ pub(crate) mod tests {
             // Legacy alert-only behavior for existing phantom tests; the
             // auto-void test flips this on explicitly.
             auto_void_reorged: false,
+            shielded_coinbase: false,
         }
     }
 
@@ -1223,6 +1252,115 @@ mod fee_tests {
         r.pool_fee = 0.01;
         let s = r.sweep_once().await.unwrap();
         assert_eq!(s.invariant_drift_zatoshis, 0, "fee-blind check would see -1.0");
+        assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
+    }
+
+    /// One confirmed block at height 100 with a matching balance so the
+    /// invariant stays quiet; the node maps it to coinbase txid "cb100".
+    async fn seed_coinbase_check_block(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "INSERT INTO blocks (height, hash, reward, status, found_by)
+             VALUES (100, 'aa', 1000000000, 'confirmed', NULL)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO miners (address) VALUES ('utest1bbb')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO balances (miner_id, pending, paid) VALUES (1, 1000000000, 0)")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn coinbase_node_responses() -> HashMap<&'static str, serde_json::Value> {
+        HashMap::from([
+            ("getblockhash", serde_json::json!("aa")),
+            ("getblock", serde_json::json!({"hash": "aa", "tx": ["cb100"]})),
+        ])
+    }
+
+    #[tokio::test]
+    async fn shielded_coinbase_check_passes_when_wallet_owns_tx() {
+        let (db, pool) = setup_db().await;
+        seed_coinbase_check_block(&pool).await;
+        // Node has no transparent vout paying us (all-shielded coinbase);
+        // the wallet recognises the txid → the reward is ours.
+        let node = mock_rpc(coinbase_node_responses()).await;
+        let wallet = mock_rpc(HashMap::from([(
+            "gettransaction",
+            serde_json::json!({"txid": "cb100", "confirmations": 12, "amount": 10.0}),
+        )]))
+        .await;
+        let mut r = reconciler(db.clone(), &node, &wallet);
+        r.mining_address = "tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd".into();
+        r.shielded_coinbase = true;
+        let s = r.sweep_once().await.unwrap();
+        assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
+        let wm = db.get_pool_status("coinbase_check_height").await.unwrap();
+        assert_eq!(wm.map(|(v, _)| v).as_deref(), Some("100"));
+    }
+
+    #[tokio::test]
+    async fn shielded_coinbase_check_alerts_when_wallet_lacks_tx() {
+        let (db, pool) = setup_db().await;
+        seed_coinbase_check_block(&pool).await;
+        // Wallet answers the default -5 error: the coinbase went elsewhere.
+        let node = mock_rpc(coinbase_node_responses()).await;
+        let wallet = mock_rpc(HashMap::new()).await;
+        let mut r = reconciler(db.clone(), &node, &wallet);
+        r.mining_address = "tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd".into();
+        r.shielded_coinbase = true;
+        let s = r.sweep_once().await.unwrap();
+        assert!(
+            s.alerts.iter().any(|a| a.contains("COINBASE MISMATCH") && a.contains("100")),
+            "alerts: {:?}",
+            s.alerts
+        );
+        // Alert fires once: the watermark still advances past the block.
+        let wm = db.get_pool_status("coinbase_check_height").await.unwrap();
+        assert_eq!(wm.map(|(v, _)| v).as_deref(), Some("100"));
+    }
+
+    #[tokio::test]
+    async fn shielded_coinbase_check_retries_on_wallet_transport_failure() {
+        let (db, pool) = setup_db().await;
+        seed_coinbase_check_block(&pool).await;
+        // Wallet unreachable is NOT a mismatch: no alert, watermark untouched.
+        let node = mock_rpc(coinbase_node_responses()).await;
+        let wallet = mock_rpc(HashMap::from([("gettransaction", serde_json::json!(TRANSPORT_FAIL))])).await;
+        let mut r = reconciler(db.clone(), &node, &wallet);
+        r.mining_address = "tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd".into();
+        r.shielded_coinbase = true;
+        let s = r.sweep_once().await.unwrap();
+        assert!(
+            !s.alerts.iter().any(|a| a.contains("COINBASE MISMATCH")),
+            "alerts: {:?}",
+            s.alerts
+        );
+        let wm = db.get_pool_status("coinbase_check_height").await.unwrap();
+        assert!(wm.is_none(), "watermark must not advance on transport failure: {wm:?}");
+    }
+
+    #[tokio::test]
+    async fn transparent_coinbase_check_still_reads_vouts() {
+        let (db, pool) = setup_db().await;
+        seed_coinbase_check_block(&pool).await;
+        let mut node = coinbase_node_responses();
+        node.insert(
+            "getrawtransaction",
+            serde_json::json!({"txid": "cb100", "vout": [
+                {"scriptPubKey": {"addresses": ["tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd"]}}
+            ]}),
+        );
+        let node = mock_rpc(node).await;
+        // Wallet knows nothing — irrelevant in transparent mode.
+        let wallet = mock_rpc(HashMap::new()).await;
+        let mut r = reconciler(db.clone(), &node, &wallet);
+        r.mining_address = "tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd".into();
+        let s = r.sweep_once().await.unwrap();
         assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
     }
 }
