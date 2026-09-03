@@ -518,6 +518,7 @@ async fn main() -> Result<()> {
         wallet_rpc,
         pool_address: config.payout.pool_address.clone(),
         mining_address: config.payout.mining_address.clone(),
+        coinbase_tag: config.pool.coinbase_tag.clone(),
         min_payout_zatoshis: (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64,
         pay_immature,
         maturity_confirmations: config.payout.maturity_confirmations,

@@ -35,6 +35,10 @@ pub struct ApiState {
     pub pool_address: Option<String>,
     /// Mining address (transparent, for shielding).
     pub mining_address: Option<String>,
+    /// Text the pool injects into its coinbase scriptSig. Lets the network
+    /// page recognise our blocks when the reward is minted into a shielded
+    /// note and no transparent vout pays `mining_address`.
+    pub coinbase_tag: Option<String>,
     /// Minimum payout in zatoshis.
     pub min_payout_zatoshis: i64,
     /// Effective immediate-payout flag (faucet mode): when true, displayed
