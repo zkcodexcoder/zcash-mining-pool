@@ -228,9 +228,33 @@ fn is_zakura_block(coinbase_hex: &str) -> bool {
     coinbase_hex.contains("f09f8cb8")
 }
 
+/// Placeholder miner address for a coinbase whose reward was minted straight
+/// into a shielded note (post-NU6.3 Ironwood / Orchard / Sapling coinbase).
+/// The recipient is not visible on-chain; only the value is.
+pub const SHIELDED_MINER: &str = "shielded";
+
+/// Value (zatoshis) a coinbase mints into the shielded pools: the negated sum
+/// of its Sapling / Orchard / Ironwood value balances. Zero for a transparent
+/// coinbase.
+fn shielded_coinbase_zat(coinbase_tx: &serde_json::Value) -> i64 {
+    let sapling = coinbase_tx.get("valueBalanceZat").and_then(|v| v.as_i64()).unwrap_or(0);
+    let bundle = |name: &str| {
+        coinbase_tx
+            .get(name)
+            .and_then(|b| b.get("valueBalanceZat"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
+    -(sapling + bundle("orchard") + bundle("ironwood"))
+}
+
 /// Extract coinbase info from a block JSON (verbosity=2, full tx objects inline).
-/// Returns (miner_address, reward_zec, coinbase_text, coinbase_hex).
 /// Returns (miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version).
+///
+/// A shielded coinbase pays the miner inside a note, so its transparent vouts
+/// are only the funding streams; reporting vout[0] would show the ZCG stream
+/// as the miner and its 8% slice as the reward. For those blocks the reward is
+/// the shielded value balance and the miner is [`SHIELDED_MINER`].
 fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, String, String, i32) {
     let unknown = ("unknown".to_string(), 0.0, String::new(), String::new(), 0);
 
@@ -263,6 +287,17 @@ fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, 
         .unwrap_or("")
         .to_string();
     let coinbase_text = hex_to_ascii_lossy(&coinbase_hex);
+
+    let shielded_zat = shielded_coinbase_zat(coinbase_tx);
+    if shielded_zat > 0 {
+        return (
+            SHIELDED_MINER.to_string(),
+            shielded_zat as f64 / 100_000_000.0,
+            coinbase_text,
+            coinbase_hex,
+            coinbase_tx_version,
+        );
+    }
 
     // Extract miner address and reward from vout[0]
     let vout = match coinbase_tx.get("vout").and_then(|v| v.as_array()) {
@@ -310,6 +345,13 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     let start_height = (tip).saturating_sub(scan_count).max(1);
 
     let our_mining_address = state.mining_address.clone().unwrap_or_default();
+    // Our coinbase tag as scriptSig hex; identifies our blocks when the reward
+    // is shielded and the vouts no longer name `mining_address`.
+    let our_tag_hex = state
+        .coinbase_tag
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| hex::encode(t.as_bytes()));
 
     // Collect heights to fetch (newest first).
     let heights: Vec<u64> = (start_height..=tip).rev().collect();
@@ -367,9 +409,19 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version) = extract_coinbase_from_block(block_data);
+        let (mut miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version) = extract_coinbase_from_block(block_data);
 
-        let is_our_pool = !our_mining_address.is_empty() && miner_address == our_mining_address;
+        let pays_our_address = !our_mining_address.is_empty() && miner_address == our_mining_address;
+        let carries_our_tag = our_tag_hex
+            .as_deref()
+            .is_some_and(|tag| coinbase_hex.contains(tag));
+        let is_our_pool = pays_our_address || carries_our_tag;
+        // A shielded coinbase that carries our tag is ours: file it under our
+        // mining address so legacy transparent blocks and shielded blocks
+        // share one distribution row.
+        if is_our_pool && miner_address == SHIELDED_MINER && !our_mining_address.is_empty() {
+            miner_address = our_mining_address.clone();
+        }
         let pool_name = if is_our_pool {
             Some("Our Pool".to_string())
         } else {
@@ -415,7 +467,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     let mut distribution: Vec<MinerDistribution> = addr_stats
         .into_iter()
         .map(|(addr, (count, zcount, zakcount, ver_counts))| {
-            let is_our_pool = !our_mining_address.is_empty() && addr == our_mining_address;
+            let is_our_pool = blocks.iter().any(|b| b.miner_address == addr && b.is_our_pool);
             let pool_name = if is_our_pool {
                 Some("Our Pool".to_string())
             } else {
@@ -1057,3 +1109,67 @@ document.addEventListener('DOMContentLoaded', () => {
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn block_with_coinbase(tx: serde_json::Value) -> serde_json::Value {
+        json!({ "hash": "00", "time": 1, "tx": [tx] })
+    }
+
+    #[test]
+    fn transparent_coinbase_reads_vout0() {
+        let block = block_with_coinbase(json!({
+            "version": 5,
+            "vin": [{ "coinbase": "03bced4104f09f8cb87a6b636f646578636f646572" }],
+            "vout": [
+                { "valueZat": 125_000_000, "scriptPubKey": { "addresses": ["tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd"] } },
+                { "valueZat": 12_500_000, "scriptPubKey": { "addresses": ["t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu"] } }
+            ],
+            "valueBalanceZat": 0,
+            "orchard": { "valueBalanceZat": 0 }
+        }));
+        let (addr, reward, text, _hex, ver) = extract_coinbase_from_block(&block);
+        assert_eq!(addr, "tmFU5Ak942B7SciQpZCh3xH76QV3UmJgnDd");
+        assert!((reward - 1.25).abs() < 1e-9);
+        assert!(text.contains("zkcodexcoder"));
+        assert_eq!(ver, 5);
+    }
+
+    #[test]
+    fn shielded_coinbase_reports_note_value_not_funding_stream() {
+        // Ironwood coinbase (testnet 4320700 shape): the only vout is the ZCG
+        // funding stream; the miner's 1.25 + fees sits in the ironwood bundle.
+        let block = block_with_coinbase(json!({
+            "version": 6,
+            "vin": [{ "coinbase": "03bced4104f09f8cb87a6b636f646578636f646572" }],
+            "vout": [
+                { "valueZat": 12_500_000, "scriptPubKey": { "addresses": ["t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu"] } }
+            ],
+            "valueBalanceZat": 0,
+            "orchard": { "valueBalanceZat": 0 },
+            "ironwood": { "valueBalanceZat": -125_050_000 }
+        }));
+        let (addr, reward, _text, hex, ver) = extract_coinbase_from_block(&block);
+        assert_eq!(addr, SHIELDED_MINER);
+        assert!((reward - 1.2505).abs() < 1e-9);
+        assert!(is_zakura_block(&hex));
+        assert_eq!(ver, 6);
+    }
+
+    #[test]
+    fn orchard_and_sapling_balances_also_count() {
+        let block = block_with_coinbase(json!({
+            "version": 5,
+            "vin": [{ "coinbase": "00" }],
+            "vout": [],
+            "valueBalanceZat": -100,
+            "orchard": { "valueBalanceZat": -200 }
+        }));
+        let (addr, reward, _, _, _) = extract_coinbase_from_block(&block);
+        assert_eq!(addr, SHIELDED_MINER);
+        assert!((reward - 3e-6).abs() < 1e-12);
+    }
+}
