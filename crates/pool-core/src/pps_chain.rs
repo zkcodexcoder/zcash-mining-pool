@@ -21,9 +21,10 @@ const QUERY_LIMIT: Duration = Duration::from_secs(10);
 const CHECK_LIMIT: Duration = Duration::from_secs(45);
 const BODY_LIMIT: usize = 65_536;
 const TIP_SPREAD: u64 = 24;
-// 300 is the ceiling pool-db's credit-time validation accepts; the proof's
-// own expiry still bounds how long a revoked upstream stays undetected.
-const LEASE_SECONDS: i64 = 300;
+// Stamped here, bounded identically at credit time in pool-db. Re-export the
+// single pool-db definition so the stamp and the credit-time bound cannot
+// diverge (mirrors FUNDING_LEASE_SECONDS).
+pub use pool_db::pps_funding::CHAIN_LEASE_SECONDS as LEASE_SECONDS;
 // Testnet block gaps regularly exceed the nominal 12-block/15-min pace; a
 // 30-min bound rejected every share exactly while the chain was slowest.
 const RECENT_ANCHOR_MAX_AGE: i64 = 90 * 60;

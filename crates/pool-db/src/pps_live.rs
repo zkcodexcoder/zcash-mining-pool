@@ -358,7 +358,7 @@ impl PoolDb {
             || l.agreeing_references < 2
             || l.checked_at_unix < 0
             || l.valid_until_unix < l.checked_at_unix
-            || l.valid_until_unix - l.checked_at_unix > 300
+            || l.valid_until_unix - l.checked_at_unix > crate::pps_funding::CHAIN_LEASE_SECONDS
             || now < l.checked_at_unix
             || now >= l.valid_until_unix
             || s.accepted_at_unix < l.checked_at_unix

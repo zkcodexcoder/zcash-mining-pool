@@ -72,6 +72,12 @@ impl PpsConventionalIntent {
 /// armed; solvency is still re-proven from the DB inside every credit tx.
 pub const FUNDING_LEASE_SECONDS: i64 = 600;
 
+/// Maximum chain-agreement proof lifetime accepted at credit time. Defined
+/// here (not in pool-core's pps_chain, which stamps it) because pool-db cannot
+/// depend on pool-core; pool-core re-exports and compile-time-asserts equality,
+/// so the stamp and this credit-time bound can never silently diverge.
+pub const CHAIN_LEASE_SECONDS: i64 = 300;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PpsFundingLease {
     pub network: String,
