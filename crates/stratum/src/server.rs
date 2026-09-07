@@ -10,6 +10,7 @@ use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
 use crate::codec::StratumCodec;
+use crate::fixed_target::{FixedShareTarget, FixedTargetError};
 use crate::messages::*;
 use crate::session::*;
 
@@ -78,6 +79,8 @@ pub struct StratumServer {
     port_initial: HashMap<u16, (f64, String)>,
     /// Announced when the connection's local port has no map entry.
     fallback_initial: (f64, String),
+    /// One immutable target for every PPS job/session, including pre-auth.
+    fixed_share_target: Option<FixedShareTarget>,
 }
 
 impl StratumServer {
@@ -102,6 +105,7 @@ impl StratumServer {
             latest_notify,
             ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
             port_initial: HashMap::new(),
+            fixed_share_target: None,
             fallback_initial: (
                 8192.0,
                 "000042e340f98608c00000000000000000000000000000000000000000000000"
@@ -121,13 +125,42 @@ impl StratumServer {
         per_port: HashMap<u16, (f64, String)>,
         fallback: (f64, String),
     ) {
+        if self.fixed_share_target.is_some() {
+            // A later per-port configuration call cannot weaken PPS assignment.
+            return;
+        }
         self.port_initial = per_port;
         self.fallback_initial = fallback;
     }
 
+    /// Configure before wrapping the server in Arc/listening. There is no
+    /// runtime disable/change route; all jobs issued by this instance share
+    /// these exact target bytes, independently of hashes or miner passwords.
+    pub fn set_fixed_share_target(&mut self, target: FixedShareTarget) -> Result<(), FixedTargetError> {
+        if self.fixed_share_target.is_some_and(|prior| prior != target) {
+            return Err(FixedTargetError::AlreadyConfigured);
+        }
+        self.fixed_share_target = Some(target);
+        self.port_initial.clear();
+        self.fallback_initial = (target.display_difficulty(), target.target_hex());
+        Ok(())
+    }
+
+    pub fn fixed_share_target(&self) -> Option<FixedShareTarget> {
+        self.fixed_share_target
+    }
+
+    fn enforce_fixed_target(&self, msg: ServerMessage) -> ServerMessage {
+        match (self.fixed_share_target, msg) {
+            (Some(target), ServerMessage::SetTarget { .. }) => ServerMessage::SetTarget { target: target.target_hex() },
+            (Some(target), ServerMessage::SetDifficulty { .. }) => ServerMessage::SetDifficulty { difficulty: target.display_difficulty() },
+            (_, msg) => msg,
+        }
+    }
+
     /// Broadcast a job notification to all connected miners.
     pub fn broadcast_notify(&self, msg: ServerMessage) {
-        let _ = self.notify_tx.send(msg);
+        let _ = self.notify_tx.send(self.enforce_fixed_target(msg));
     }
 
     /// Send a targeted message to a specific session (e.g., share response).
@@ -138,6 +171,7 @@ impl StratumServer {
     /// be able to wedge it. Dropping a message is preferable: the miner will
     /// just retry the next stratum exchange.
     pub async fn send_to_session(&self, session_id: &str, msg: ServerMessage) {
+        let msg = self.enforce_fixed_target(msg);
         let senders = self.session_senders.read().await;
         if let Some(tx) = senders.get(session_id) {
             if let Err(mpsc::error::TrySendError::Full(dropped)) = tx.try_send(msg) {
@@ -278,6 +312,11 @@ impl StratumServer {
                 // Broadcast notifications (new jobs, target changes)
                 msg = notify_rx.recv() => {
                     if let Ok(msg) = msg {
+                        if self.fixed_share_target.is_some() && !session.subscribed {
+                            // Subscribe announces the fixed target before its
+                            // cached first job; never issue PPS work beforehand.
+                            continue;
+                        }
                         debug!(%peer_addr, json = %msg.to_json(), "Broadcasting to miner");
                         if framed.send(msg.to_json()).await.is_err() {
                             break;
@@ -433,7 +472,7 @@ impl StratumServer {
                 let _ = self.event_tx.send(StratumEvent::WorkerConnected {
                     session_id: session.session_id.clone(),
                     worker_name: worker_name.clone(),
-                    password: worker_password,
+                    password: if self.fixed_share_target.is_some() { String::new() } else { worker_password },
                     addr: peer_addr,
                     local_port,
                 }).await;
@@ -473,6 +512,11 @@ impl StratumServer {
             }
 
             ClientRequest::SuggestTarget { id: _, target } => {
+                if let Some(fixed) = self.fixed_share_target {
+                    responses.push(ServerMessage::SetDifficulty { difficulty: fixed.display_difficulty() });
+                    responses.push(ServerMessage::SetTarget { target: fixed.target_hex() });
+                    return responses;
+                }
                 let _ = self.event_tx.send(StratumEvent::TargetSuggested {
                     session_id: session.session_id.clone(),
                     target,
@@ -562,5 +606,94 @@ mod tests {
         let (diff, target) = announced(&subscribe_on(&server, 1234).await);
         assert_eq!(diff, 100.0);
         assert_eq!(target, "bb".repeat(32));
+    }
+
+    fn fixed() -> FixedShareTarget {
+        let mut bytes = [0; 32]; bytes[1] = 1; bytes[31] = 7;
+        FixedShareTarget::new(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pps_pre_auth_uses_exact_fixed_target_on_every_port() {
+        let mut server = server_with_ports();
+        server.set_fixed_share_target(fixed()).unwrap();
+        // Configuration order must not permit a per-port override.
+        server.set_initial_difficulty(HashMap::from([(3336, (1.0, "ff".repeat(32)))]), (2.0, "aa".repeat(32)));
+        for port in [0, 3333, 3336, 65535] {
+            let (diff, target) = announced(&subscribe_on(&server, port).await);
+            assert_eq!(diff, fixed().display_difficulty());
+            assert_eq!(target, fixed().target_hex());
+        }
+    }
+
+    #[tokio::test]
+    async fn pps_first_job_follows_fixed_target_and_is_clean() {
+        let mut server = server_with_ports();
+        server.set_fixed_share_target(fixed()).unwrap();
+        *server.latest_notify.write().await = Some(ServerMessage::Notify {
+            job_id: "fixture-job".into(), version: "04000000".into(),
+            prev_hash: "00".repeat(32), merkle_root: "00".repeat(32),
+            reserved: "00".repeat(32), time: "00000000".into(),
+            bits: "00000000".into(), clean_jobs: false,
+        });
+        let responses = subscribe_on(&server, 3336).await;
+        assert!(matches!(&responses[1], ServerMessage::SetDifficulty { .. }));
+        assert!(matches!(&responses[2], ServerMessage::SetTarget { target } if target == &fixed().target_hex()));
+        assert!(matches!(&responses[3], ServerMessage::Notify { clean_jobs: true, .. }));
+    }
+
+    #[test]
+    fn pps_target_cannot_change_once_configured() {
+        let mut server = server_with_ports();
+        server.set_fixed_share_target(fixed()).unwrap();
+        server.set_fixed_share_target(fixed()).unwrap();
+        assert_eq!(server.set_fixed_share_target(FixedShareTarget::new([255; 32]).unwrap()), Err(FixedTargetError::AlreadyConfigured));
+        assert_eq!(server.fixed_share_target(), Some(fixed()));
+    }
+
+    #[tokio::test]
+    async fn pps_password_difficulty_and_target_suggestion_do_not_reach_validator() {
+        let (event_tx, mut events) = mpsc::channel(8);
+        let (mut server, _) = StratumServer::new(4, event_tx);
+        server.set_fixed_share_target(fixed()).unwrap();
+        let mut session = MinerSession::new("fixed-session".into(), "de810000".into());
+        session.subscribed = true;
+        server.handle_request(&mut session, ClientRequest::Authorize {
+            id: serde_json::json!(1), worker_name: "synthetic.worker".into(),
+            worker_password: "d=0.000001".into(),
+        }, "127.0.0.1:55555".parse().unwrap(), 3336).await;
+        match events.try_recv().unwrap() {
+            StratumEvent::WorkerConnected { password, .. } => assert!(password.is_empty()),
+            _ => panic!("unexpected event"),
+        }
+        let responses = server.handle_request(&mut session, ClientRequest::SuggestTarget {
+            id: serde_json::json!(2), target: "ff".repeat(32),
+        }, "127.0.0.1:55555".parse().unwrap(), 3336).await;
+        assert_eq!(announced(&responses), (fixed().display_difficulty(), fixed().target_hex()));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pps_targeted_and_broadcast_retarget_messages_remain_fixed() {
+        let mut server = server_with_ports();
+        server.set_fixed_share_target(fixed()).unwrap();
+        let (sender, mut messages) = mpsc::channel(8);
+        server.session_senders.write().await.insert("fixed-session".into(), sender);
+        server.send_to_session("fixed-session", ServerMessage::SetTarget { target: "ff".repeat(32) }).await;
+        match messages.recv().await.unwrap() {
+            ServerMessage::SetTarget { target } => assert_eq!(target, fixed().target_hex()),
+            _ => panic!("unexpected target message"),
+        }
+        server.send_to_session("fixed-session", ServerMessage::SetDifficulty { difficulty: f64::NAN }).await;
+        match messages.recv().await.unwrap() {
+            ServerMessage::SetDifficulty { difficulty } => assert_eq!(difficulty, fixed().display_difficulty()),
+            _ => panic!("unexpected difficulty message"),
+        }
+        let mut broadcasts = server.notify_tx.subscribe();
+        server.broadcast_notify(ServerMessage::SetTarget { target: "00".repeat(32) });
+        match broadcasts.recv().await.unwrap() {
+            ServerMessage::SetTarget { target } => assert_eq!(target, fixed().target_hex()),
+            _ => panic!("unexpected broadcast"),
+        }
     }
 }

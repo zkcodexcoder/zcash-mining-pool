@@ -17,6 +17,71 @@ use crate::block::BlockAssembler;
 use crate::difficulty::{difficulty_to_target_hex, VardiffTracker};
 use crate::job::MiningJob;
 use rewards::PplnsCalculator;
+use pool_db::pps_live::{PpsChainLease, PpsCredit, PpsEpoch};
+use pool_db::pps_funding::PpsFundingLease;
+use rewards::pps::{quote_standard_pps, PpsNetwork, PpsQuoteInput};
+
+/// Bounded PPS startup policy plus proof obtained by the automatic verifier.
+#[derive(Clone)]
+pub struct PpsRuntime {
+    pub epoch: PpsEpoch,
+    pub chain_lease: PpsChainLease,
+    pub funding_lease: PpsFundingLease,
+    pub wallet_rpc: Arc<ZcashRpcClient>,
+    pub payout_source: String,
+    pub funding_route: crate::pps_funding::PpsFundingRoute,
+}
+
+struct ActivePps {
+    epoch: PpsEpoch,
+    funding_route: crate::pps_funding::PpsFundingRoute,
+    lease: Arc<RwLock<Option<PpsChainLease>>>,
+    funding: Arc<RwLock<Option<PpsFundingLease>>>,
+    health: crate::pps_credit_health::SharedCreditHealth,
+}
+
+const PPS_FUNDING_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+fn begin_pps_funding_refresh(
+    route: &crate::pps_funding::PpsFundingRoute,
+    cached: &mut Option<PpsFundingLease>,
+) {
+    // Only the explicit testnet route retains its previous proof while a
+    // single replacement is pending. Its original expiry and generation still
+    // gate every DB credit; a pending read creates no new authorization.
+    if !route.holds_new_legacy_sends() {
+        *cached = None;
+    }
+}
+
+fn finish_pps_funding_refresh(
+    route: &crate::pps_funding::PpsFundingRoute,
+    cached: &mut Option<PpsFundingLease>,
+    result: Result<PpsFundingLease, crate::pps_funding::PpsFundingError>,
+    elapsed: Duration,
+) -> Duration {
+    let succeeded = result.is_ok();
+    // Never retain the old proof after failure or restamp either proof.
+    *cached = result.ok();
+    if route.holds_new_legacy_sends() && succeeded {
+        PPS_FUNDING_REFRESH_INTERVAL.saturating_sub(elapsed)
+    } else {
+        // Failed reads always back off after completion. The existing PCZT
+        // route keeps its original completion-to-start cadence on all results.
+        PPS_FUNDING_REFRESH_INTERVAL
+    }
+}
+
+/// At most two short retries for explicitly transient testnet evidence failures.
+/// The cache is already revoked by finish_pps_funding_refresh on every failure.
+fn pps_refresh_retry_delay(route:&crate::pps_funding::PpsFundingRoute,
+    category:&str, consecutive_failures:&mut u8, ordinary:Duration) -> Duration {
+    if category=="ok" { *consecutive_failures=0; return ordinary; }
+    *consecutive_failures=consecutive_failures.saturating_add(1);
+    if route.holds_new_legacy_sends() && *consecutive_failures<=2
+        && matches!(category,"rpc_unavailable"|"wallet_not_ready"|"concurrent_change"|"deadline_exceeded")
+    { Duration::from_secs(5) } else { ordinary }
+}
 
 /// Zcash target block interval.
 const BLOCK_TIME_SECS: f64 = 75.0;
@@ -143,6 +208,9 @@ pub struct SessionSnapshot {
 }
 
 pub struct ShareValidator {
+    pps: Option<ActivePps>,
+    pps_refresh_task: Option<tokio::task::JoinHandle<()>>,
+    pps_subsidies: RwLock<HashMap<u64, (u64, Instant)>>,
     db: PoolDb,
     stratum: Arc<StratumServer>,
     jobs: Arc<RwLock<HashMap<String, std::sync::Arc<MiningJob>>>>,
@@ -216,6 +284,9 @@ impl ShareValidator {
         rejects_other: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
+            pps: None,
+            pps_refresh_task: None,
+            pps_subsidies: RwLock::new(HashMap::new()),
             db,
             stratum,
             jobs,
@@ -252,11 +323,118 @@ impl ShareValidator {
         Arc::clone(&self.heartbeat)
     }
 
+    pub fn with_pps(mut self, runtime: PpsRuntime) -> Result<Self, String> {
+        if self.stratum.fixed_share_target().is_none() {
+            return Err("PPS requires one immutable announced target".into());
+        }
+        if runtime.epoch.network.parse::<PpsNetwork>().is_err()
+            || runtime.epoch.network != runtime.chain_lease.network
+            || runtime.epoch.fee_bps >= 10_000
+            || runtime.payout_source.is_empty() || runtime.payout_source.len() > 2048
+        {
+            return Err("invalid PPS runtime policy".into());
+        }
+        let network = runtime.epoch.network.parse::<PpsNetwork>()
+            .map_err(|_| "invalid PPS network".to_string())?;
+        runtime.funding_route.validate(&runtime.epoch)
+            .map_err(|_| "invalid PPS funding route policy".to_string())?;
+        crate::pps_funding::validate_funding_lease(&runtime.funding_lease,
+            &runtime.epoch, chrono::Utc::now().timestamp())
+            .map_err(|_| "invalid PPS startup funding evidence".to_string())?;
+        let lease = Arc::new(RwLock::new(Some(runtime.chain_lease)));
+        let funding = Arc::new(RwLock::new(Some(runtime.funding_lease)));
+        let health=Arc::new(std::sync::Mutex::new(crate::pps_credit_health::CreditHealthTracker::default()));
+        let refresh_health=Arc::clone(&health);
+        let refresh_latest=Arc::clone(&self.latest_notify);
+        let refresh_lease = Arc::clone(&lease);
+        let refresh_funding = Arc::clone(&funding);
+        let rpc = Arc::clone(&self.rpc);
+        let wallet = runtime.wallet_rpc;
+        let db = self.db.clone();
+        let epoch = runtime.epoch.clone();
+        let payout_source = runtime.payout_source;
+        let funding_route = runtime.funding_route;
+        self.pps_refresh_task = Some(tokio::spawn(async move {
+            // Independent loops: a slow public chain reference must not delay
+            // refreshing the shorter wallet lease. Aborting this one parent
+            // task drops all futures; no orphan verifier/publisher tasks are spawned.
+            tokio::join!(
+                async {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        let started=Instant::now();
+                        let next = match crate::pps_chain::verify_pps_chain(&rpc, network).await {
+                            Ok(proof) => Some(proof),
+                            Err(error) => {
+                                use crate::pps_chain::PpsChainError as E;
+                                let category=match error {
+                                    E::Timeout=>"deadline_exceeded",E::Unavailable=>"rpc_unavailable",
+                                    E::InvalidEvidence=>"invalid_evidence",E::NetworkMismatch=>"network_mismatch",
+                                    E::NotSynchronized=>"not_synchronized",E::BranchMismatch=>"branch_mismatch",
+                                    E::TipMismatch=>"tip_mismatch",E::HashMismatch=>"hash_mismatch",
+                                    E::StaleEvidence=>"stale_evidence",
+                                };
+                                let duration_ms=u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                                warn!(stage="chain_refresh",category,duration_ms,"PPS chain evidence unavailable; new credits paused");
+                                None
+                            }
+                        };
+                        // A newly observed failure revokes the previous proof
+                        // even if its timestamp has not expired.
+                        *refresh_lease.write().await = next;
+                    }
+                },
+                async {
+                    // A slow testnet collection can consume most of the original
+                    // 60-second lease. Start its replacement immediately, then
+                    // use a single-flight start-to-start cadence. PCZT retains
+                    // the original initial delay and clear-during-read behavior.
+                    let mut delay = if funding_route.holds_new_legacy_sends() {
+                        Duration::ZERO
+                    } else { PPS_FUNDING_REFRESH_INTERVAL };
+                    let mut consecutive_failures=0;
+                    loop {
+                        tokio::time::sleep(delay).await;
+                        begin_pps_funding_refresh(&funding_route, &mut *refresh_funding.write().await);
+                        if let Ok(mut h)=refresh_health.lock() { h.begin(chrono::Utc::now().timestamp()); }
+                        let started = Instant::now();
+                        let (result,stage,category) = crate::pps_credit_health::observe_refresh(
+                            crate::pps_funding::collect_pps_credit_funding_for_route(
+                            &db, &wallet, &epoch, &payout_source, &rpc, &funding_route,
+                        )).await;
+                        let elapsed = started.elapsed();
+                        let duration_ms=u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                        if result.is_err() {
+                            warn!(stage,category,duration_ms,"PPS credit funding refresh failed");
+                        } else {
+                            info!(stage,category,duration_ms,"PPS credit funding refresh completed");
+                        }
+                        delay = finish_pps_funding_refresh(&funding_route,
+                            &mut *refresh_funding.write().await, result, elapsed);
+                        if let Ok(mut h)=refresh_health.lock() { h.finish(chrono::Utc::now().timestamp(),stage,category); }
+                        delay=pps_refresh_retry_delay(&funding_route,category,&mut consecutive_failures,delay);
+                    }
+                },
+                crate::pps_credit_health::publish_loop(&db,&epoch,&funding_route,
+                    &refresh_lease,&refresh_funding,&refresh_health,&refresh_latest),
+            );
+        }));
+        self.pps = Some(ActivePps { epoch: runtime.epoch, funding_route: runtime.funding_route, lease, funding, health });
+        Ok(self)
+    }
+
     fn make_initial_target(&self) -> ([u8; 32], VardiffTracker) {
         self.make_target_for_difficulty(self.vardiff_config.initial_difficulty)
     }
 
     fn make_target_for_difficulty(&self, difficulty: f64) -> ([u8; 32], VardiffTracker) {
+        if let Some(fixed) = self.stratum.fixed_share_target() {
+            return (fixed.target_be(), VardiffTracker::new(
+                self.vardiff_config.target_shares_per_minute,
+                self.vardiff_config.retarget_interval_secs,
+                fixed.display_difficulty(),
+            ));
+        }
         let tracker = VardiffTracker::new(
             self.vardiff_config.target_shares_per_minute,
             self.vardiff_config.retarget_interval_secs,
@@ -437,7 +615,7 @@ impl ShareValidator {
                             // (5090-class) thrash: rate-limit ramps diff up, a
                             // burst of in-flight shares at old diff fails as
                             // low_diff, hits 10 streak, resets to diff 1, repeat.
-                            if is_low_diff {
+                            if is_low_diff && self.stratum.fixed_share_target().is_none() {
                                 let mut sessions = self.session_difficulty.write().await;
                                 if let Some(sd) = sessions.get_mut(&session_id) {
                                     sd.low_diff_streak += 1;
@@ -509,8 +687,9 @@ impl ShareValidator {
 
                     // Priority: password-requested > per-port > default
                     let requested_diff = parse_difficulty_from_password(&password);
-                    let initial_diff = requested_diff
-                        .or_else(|| Some(port_base));
+                    let initial_diff = self.stratum.fixed_share_target()
+                        .map(|fixed| fixed.display_difficulty())
+                        .or(requested_diff).or(Some(port_base));
                     let (target, tracker, init_source) = if let Some(diff) = initial_diff {
                         let source = if requested_diff.is_some() { "password" }
                             else { "port" };
@@ -614,6 +793,7 @@ impl ShareValidator {
 
     /// Check if a session needs retargeting after an accepted share.
     async fn maybe_retarget(&self, session_id: &str) {
+        if self.stratum.fixed_share_target().is_some() { return; }
         let result = {
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
@@ -629,6 +809,7 @@ impl ShareValidator {
 
     /// Force an immediate retarget, bypassing the vardiff interval gate.
     async fn force_retarget_session(&self, session_id: &str) {
+        if self.stratum.fixed_share_target().is_some() { return; }
         let result = {
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
@@ -644,6 +825,7 @@ impl ShareValidator {
 
     /// Apply a retarget with a reason string for logging/display.
     async fn apply_retarget(&self, session_id: &str, diff: f64, reason: &str) {
+        if self.stratum.fixed_share_target().is_some() { return; }
         let target_hex = difficulty_to_target_hex(diff);
         let new_target = parse_target(&target_hex).unwrap_or(self.default_target);
         {
@@ -839,9 +1021,15 @@ impl ShareValidator {
         &self,
         address: &str,
         worker: &str,
-    ) -> Result<(i64, Option<f64>), pool_db::DbError> {
-        let miner = self.db.get_or_create_miner(address).await?;
-        let w = self.db.get_or_create_worker(miner.id, worker).await?;
+    ) -> Result<(i64, Option<f64>), String> {
+        if let Some(pps) = &self.pps {
+            pps.funding_route.validate_recipient(&pps.epoch.network, address)
+                .map_err(|_| "unsupported PPS payout recipient".to_string())?;
+        }
+        let miner = self.db.get_or_create_miner(address).await
+            .map_err(|_| "worker registration database failure".to_string())?;
+        let w = self.db.get_or_create_worker(miner.id, worker).await
+            .map_err(|_| "worker registration database failure".to_string())?;
         Ok((w.id, w.last_difficulty))
     }
 
@@ -855,6 +1043,11 @@ impl ShareValidator {
         nonce_2: &str,
         equihash_solution: &str,
     ) -> Result<ShareResult, StratumError> {
+        if let Some(pps) = &self.pps {
+            let address = worker_name.split('.').next().unwrap_or(worker_name);
+            pps.funding_route.validate_recipient(&pps.epoch.network, address)
+                .map_err(|_| StratumError::other("PPS admission paused: unsupported payout recipient"))?;
+        }
         let job = {
             let jobs = self.jobs.read().await;
             jobs.get(job_id).cloned()
@@ -915,7 +1108,7 @@ impl ShareValidator {
             raw_solution.hash(&mut h);
             h.finish()
         };
-        {
+        if self.pps.is_none() {
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
                 if sd.recent_share_fps.contains(&share_fp) {
@@ -934,10 +1127,18 @@ impl ShareValidator {
         // Window: [template curtime, now + 90s]. Miners echo the job time or
         // roll it slightly forward; both stay inside.
         {
+            validate_ntime_encoding(time)?;
             let miner_time = u32::from_str_radix(time, 16)
                 .map_err(|_| StratumError::other("Invalid ntime hex"))?
                 .swap_bytes();
             let curtime = job.template.curtime as u32;
+            if self.pps.as_ref().is_some_and(|pps| pps.epoch.network == "testnet")
+                && miner_time != curtime
+            {
+                // Testnet minimum-difficulty rules depend on candidate time.
+                // A rolled timestamp cannot reuse the template's priced nBits.
+                return Err(StratumError::other("PPS testnet requires the exact job timestamp"));
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
@@ -952,6 +1153,9 @@ impl ShareValidator {
 
         // Build the block header input (version + prevhash + merkleroot + reserved + time + bits = 108 bytes)
         let header_input = build_header_input(&job, time)?;
+        if header_input.len() != 108 {
+            return Err(StratumError::other("Invalid consensus header length"));
+        }
 
         debug!(
             header_len = header_input.len(),
@@ -988,7 +1192,12 @@ impl ShareValidator {
         // the current target, fall back to the grace window: in-flight shares
         // generated against an older (easier) target should still be credited
         // at that older difficulty rather than being rejected as low_diff.
-        let difficulty = if meets_target(&hash_bytes, &pool_target) {
+        let difficulty = if let Some(fixed) = self.stratum.fixed_share_target() {
+            if !fixed.accepts_hash_le(&hash_bytes) {
+                return Err(StratumError::low_difficulty());
+            }
+            fixed.display_difficulty()
+        } else if meets_target(&hash_bytes, &pool_target) {
             current_difficulty
         } else {
             // Walk grace targets newest-first, accept the first that matches
@@ -1067,8 +1276,96 @@ impl ShareValidator {
             }
         };
 
-        self.db.record_share(worker_id, job_id, difficulty, is_block, session_id).await
-            .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
+        let mut pps_reward = None;
+        if let Some(pps) = &self.pps {
+            // The fixed target is identical for every issued job. Reject work
+            // superseded by a new tip rather than buying stale-chain shares.
+            let latest = self.latest_notify.read().await;
+            match latest.as_ref() {
+                Some(ServerMessage::Notify { prev_hash, .. }) if prev_hash == &job.prev_hash_hex => {},
+                _ => { crate::pps_credit_health::denial(&pps.health,"job","stale_job");
+                    return Err(StratumError::other("PPS admission paused: stale job")); },
+            }
+            drop(latest);
+            let network = pps.epoch.network.parse::<PpsNetwork>()
+                .map_err(|_| { crate::pps_credit_health::denial(&pps.health,"network","network_mismatch");
+                    StratumError::other("PPS network invalid") })?;
+            let cached = self.pps_subsidies.read().await.get(&job.template.height).copied();
+            let subsidy = match cached {
+                Some((subsidy, checked)) if checked.elapsed() < Duration::from_secs(15) => subsidy,
+                _ => {
+                    let subsidy = tokio::time::timeout(Duration::from_secs(5),
+                        crate::pps_economics::validated_miner_subsidy(
+                            &self.rpc, network, job.template.height,
+                        ),
+                    ).await.map_err(|_| { crate::pps_credit_health::denial(&pps.health,"subsidy","subsidy_timeout");
+                        StratumError::other("PPS admission paused: subsidy evidence timeout") })?
+                        .map_err(|_| { crate::pps_credit_health::denial(&pps.health,"subsidy","subsidy_unavailable");
+                            StratumError::other("PPS admission paused: subsidy evidence unavailable") })?;
+                    let mut cache = self.pps_subsidies.write().await;
+                    if cache.len() > 16 { cache.clear(); }
+                    cache.insert(job.template.height, (subsidy, Instant::now()));
+                    subsidy
+                }
+            };
+            let fixed = self.stratum.fixed_share_target()
+                .ok_or_else(|| { crate::pps_credit_health::denial(&pps.health,"target","fixed_target_unavailable");
+                    StratumError::other("PPS fixed target unavailable") })?;
+            crate::pps_economics::validate_template_target(&job.template.bits, &network_target)
+                .map_err(|_| { crate::pps_credit_health::denial(&pps.health,"target","target_invalid");
+                    StratumError::other("PPS admission paused: inconsistent consensus target") })?;
+            let quote = quote_standard_pps(&PpsQuoteInput {
+                network, height: job.template.height, network_target_be: network_target,
+                assigned_share_target_be: fixed.target_be(), miner_subsidy_zats: subsidy,
+                fee_bps: pps.epoch.fee_bps,
+            }).map_err(|_| { crate::pps_credit_health::denial(&pps.health,"quote","quote_invalid");
+                StratumError::other("PPS admission paused: invalid price") })?;
+            // Preserve the actual price's original observation time, including
+            // time spent waiting for the final job guard and ledger commit.
+            let quote_checked_at=chrono::Utc::now().timestamp();
+            let quote_checked=Instant::now();
+            let (proof_id, quote_id) = pps_credit_identity(
+                &pps.epoch, job.template.height, subsidy, &network_target,
+                &fixed.target_be(), &full_header,
+            );
+            // RPC may have taken long enough to cross a tip or lease expiry.
+            // Recheck after it, and keep the current-job guard until commit.
+            let latest = self.latest_notify.read().await;
+            match latest.as_ref() {
+                Some(ServerMessage::Notify { prev_hash, .. }) if prev_hash == &job.prev_hash_hex => {},
+                _ => { crate::pps_credit_health::denial(&pps.health,"job","stale_job");
+                    return Err(StratumError::other("PPS admission paused: superseded job")); },
+            }
+            let now = chrono::Utc::now().timestamp();
+            if crate::pps_credit_health::quote_required(&pps.epoch,&pps.funding_route) {
+                // Metadata only, under the existing current-tip guard. Keep
+                // the actual validated job identity, never relabel an older
+                // accepted job as the newest notify. Record before admission
+                // so a valid price rejected by the cap also informs health.
+                crate::pps_credit_health::validated_quote(&pps.health,&job.job_id,&job.prev_hash_hex,
+                    quote.amount_subzatoshis,quote_checked_at,quote_checked);
+            }
+            let lease = pps.lease.read().await.clone();
+            let funding = pps.funding.read().await.clone();
+            let receipt = self.db.credit_pps_share(&pps.epoch, &PpsCredit {
+                proof_id, quote_id, worker_id, job_id: job_id.to_string(),
+                session_id: session_id.to_string(), difficulty, is_block,
+                quote_height: job.template.height, network_target_be: network_target,
+                assigned_share_target_be: fixed.target_be(), miner_subsidy_zats: subsidy,
+                amount_subzatoshis: quote.amount_subzatoshis, accepted_at_unix: now,
+            }, lease.as_ref(), funding.as_ref(), now).await
+                .map_err(|error| { crate::pps_credit_health::denial(&pps.health,"ledger_credit",
+                    crate::pps_credit_health::db_category(&error));
+                    StratumError::other("PPS admission paused: ledger or authorization gate") })?;
+            drop(latest);
+            if receipt.duplicate && !is_block {
+                return Ok(ShareResult { is_block: false, block_height: None });
+            }
+            pps_reward = Some(subsidy as i64);
+        } else {
+            self.db.record_share(worker_id, job_id, difficulty, is_block, session_id).await
+                .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
+        }
 
         let mut block_height = None;
 
@@ -1085,7 +1382,7 @@ impl ShareValidator {
                 Ok(full_block) => {
                     let block_hex = hex::encode(&full_block);
                     let height = job.template.height as i64;
-                    let reward = compute_block_reward(height);
+                    let reward = pps_reward.unwrap_or_else(|| compute_block_reward(height));
                     // Audit P2: actual coinbase value = subsidy + the tx
                     // fees this job's template collected. BIP22 reports
                     // the coinbase "fee" as MINUS the collected fees.
@@ -1239,9 +1536,44 @@ impl ShareValidator {
     }
 }
 
+impl Drop for ShareValidator {
+    fn drop(&mut self) {
+        if let Some(task) = self.pps_refresh_task.take() {
+            task.abort();
+        }
+    }
+}
+
 pub struct ShareResult {
     pub is_block: bool,
     pub block_height: Option<i64>,
+}
+
+/// A canonical proof is globally unique across sessions, job counter reuse,
+/// and policy epochs. Pricing provenance is separate and binds exact inputs.
+fn pps_credit_identity(
+    epoch: &PpsEpoch, height: u64, subsidy: u64,
+    network_target: &[u8; 32], assigned_target: &[u8; 32], header: &[u8],
+) -> (String, String) {
+    let mut proof = Sha256::new();
+    proof.update(b"zcash-pps-proof-v1\0");
+    proof.update(epoch.network.as_bytes());
+    proof.update([0]);
+    proof.update(header);
+    let mut quote = Sha256::new();
+    quote.update(b"zcash-pps-standard-fixed-v1\0");
+    quote.update(epoch.network.as_bytes());
+    quote.update([0]);
+    quote.update(epoch.id.as_bytes());
+    quote.update([0]);
+    quote.update(epoch.quote_provenance.as_bytes());
+    quote.update([0]);
+    quote.update(height.to_be_bytes());
+    quote.update(subsidy.to_be_bytes());
+    quote.update(epoch.fee_bps.to_be_bytes());
+    quote.update(network_target);
+    quote.update(assigned_target);
+    (hex::encode(proof.finalize()), hex::encode(quote.finalize()))
 }
 
 fn sha256d(data: &[u8]) -> [u8; 32] {
@@ -1284,7 +1616,15 @@ fn strip_compact_size(data: &[u8]) -> Result<&[u8], StratumError> {
     Ok(&data[prefix_len..end])
 }
 
+fn validate_ntime_encoding(time_hex: &str) -> Result<(), StratumError> {
+    if time_hex.len() != 8 || !time_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(StratumError::other("ntime must encode exactly four bytes"));
+    }
+    Ok(())
+}
+
 fn build_header_input(job: &MiningJob, time_hex: &str) -> Result<Vec<u8>, StratumError> {
+    validate_ntime_encoding(time_hex)?;
     let mut input = Vec::with_capacity(108);
 
     let version = hex::decode(&job.version_hex)
@@ -1491,6 +1831,153 @@ pub fn parse_target(target_hex: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refresh_test_proof() -> PpsFundingLease {
+        PpsFundingLease { network:"testnet".into(),checked_at_unix:100,valid_until_unix:160,
+            spendable_zatoshis:1_000_000_001,reserve_floor_zatoshis:1,
+            reserved_fee_allowance_zatoshis:50_000_000,generation:7 }
+    }
+
+    #[test]
+    fn pps_testnet_refresh_retains_original_proof_without_renewing_expiry() {
+        use crate::pps_funding::{PpsFundingRoute, validate_funding_lease};
+        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
+        let original = refresh_test_proof();
+        let mut cached = Some(original.clone());
+        begin_pps_funding_refresh(&route,&mut cached);
+        assert_eq!(cached,Some(original.clone()));
+        let epoch = PpsEpoch { id:"refresh-test".into(),network:"testnet".into(),fee_bps:0,
+            max_liability_zatoshis:950_000_000,total_exposure_zatoshis:1_000_000_000,
+            fee_allowance_zatoshis:50_000_000,reserve_floor_zatoshis:1,
+            quote_provenance:"synthetic".into() };
+        assert!(validate_funding_lease(cached.as_ref().unwrap(),&epoch,159).is_ok());
+        assert!(validate_funding_lease(cached.as_ref().unwrap(),&epoch,160).is_err());
+        // Even if a replacement is still pending after expiry, no helper
+        // extends its timestamp or changes the generation used by the DB.
+        begin_pps_funding_refresh(&route,&mut cached);
+        assert_eq!(cached,Some(original));
+        assert!(validate_funding_lease(cached.as_ref().unwrap(),&epoch,168).is_err());
+    }
+
+    #[test]
+    fn pps_testnet_refresh_uses_single_flight_start_to_start_success_cadence() {
+        use crate::pps_funding::PpsFundingRoute;
+        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
+        for (collection_seconds,delay_seconds) in [(0,30),(10,20),(30,0),(34,0),(45,0)] {
+            let mut cached = Some(refresh_test_proof());
+            let mut replacement = refresh_test_proof();
+            replacement.checked_at_unix = 134;
+            replacement.valid_until_unix = 194;
+            replacement.generation = 8;
+            let delay = finish_pps_funding_refresh(&route,&mut cached,Ok(replacement.clone()),
+                Duration::from_secs(collection_seconds));
+            assert_eq!(delay,Duration::from_secs(delay_seconds));
+            assert_eq!(cached,Some(replacement));
+        }
+    }
+
+    #[test]
+    fn pps_testnet_refresh_failure_clears_evidence_and_backs_off_after_completion() {
+        use crate::pps_funding::{PpsFundingError, PpsFundingRoute};
+        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
+        for error in [PpsFundingError::Timeout,PpsFundingError::ConcurrentChange,
+            PpsFundingError::WalletUnavailable,PpsFundingError::InvalidEvidence]
+        {
+            for elapsed in [Duration::ZERO,Duration::from_secs(34),Duration::from_secs(45)] {
+                let mut cached = Some(refresh_test_proof());
+                begin_pps_funding_refresh(&route,&mut cached);
+                assert!(cached.is_some());
+                assert_eq!(finish_pps_funding_refresh(&route,&mut cached,Err(error),elapsed),
+                    Duration::from_secs(30));
+                assert!(cached.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn pps_pczt_refresh_preserves_clear_during_read_and_completion_delay() {
+        use crate::pps_funding::{PpsFundingError, PpsFundingRoute};
+        for network in ["mainnet","testnet"] {
+            let route = PpsFundingRoute::ZalletPczt;
+            let mut proof = refresh_test_proof();
+            proof.network = network.into();
+            let mut cached = Some(proof.clone());
+            begin_pps_funding_refresh(&route,&mut cached);
+            assert!(cached.is_none());
+            assert_eq!(finish_pps_funding_refresh(&route,&mut cached,Ok(proof.clone()),
+                Duration::from_secs(34)),Duration::from_secs(30));
+            assert_eq!(cached,Some(proof));
+            begin_pps_funding_refresh(&route,&mut cached);
+            assert_eq!(finish_pps_funding_refresh(&route,&mut cached,
+                Err(PpsFundingError::Timeout),Duration::ZERO),Duration::from_secs(30));
+            assert!(cached.is_none());
+        }
+    }
+
+    #[test]
+    fn pps_credit_refresh_fast_retries_are_bounded_and_never_retain_failed_proofs() {
+        use crate::pps_funding::{PpsFundingError,PpsFundingRoute};
+        let route=PpsFundingRoute::ZecdConventionalTestnet {hold_new_legacy_sends:true};
+        for category in ["rpc_unavailable","wallet_not_ready","concurrent_change","deadline_exceeded"] {
+            let mut failures=0;
+            for expected in [5,5,30,30] {
+                let mut cached=Some(refresh_test_proof());
+                let ordinary=finish_pps_funding_refresh(&route,&mut cached,Err(PpsFundingError::WalletUnavailable),Duration::ZERO);
+                assert_eq!(pps_refresh_retry_delay(&route,category,&mut failures,ordinary),Duration::from_secs(expected));
+                assert!(cached.is_none());
+            }
+            assert_eq!(pps_refresh_retry_delay(&route,"ok",&mut failures,Duration::ZERO),Duration::ZERO);
+            assert_eq!(failures,0);
+            assert_eq!(pps_refresh_retry_delay(&route,category,&mut failures,Duration::from_secs(30)),Duration::from_secs(5));
+        }
+        for category in ["invalid_evidence","identity_mismatch","chain_mismatch","accounting_unavailable","fee_capacity_exhausted","identity_signer_not_proven"] {
+            assert_eq!(pps_refresh_retry_delay(&route,category,&mut 0,Duration::from_secs(30)),Duration::from_secs(30));
+        }
+        assert_eq!(pps_refresh_retry_delay(&PpsFundingRoute::ZalletPczt,"deadline_exceeded",&mut 0,Duration::from_secs(30)),Duration::from_secs(30));
+    }
+
+    #[test]
+    fn consensus_ntime_requires_exact_four_byte_hex() {
+        for invalid in ["", "000000", "0000000", "000000000", "0000000000", "0000000g", "é000000"] {
+            assert!(validate_ntime_encoding(invalid).is_err());
+        }
+        assert!(validate_ntime_encoding("001122Af").is_ok());
+    }
+
+    #[test]
+    fn pps_proof_identity_is_restart_stable_and_quote_binds_economics() {
+        let mut epoch = PpsEpoch {
+            id: "test-epoch".into(), network: "testnet".into(), fee_bps: 100,
+            max_liability_zatoshis: 1_000_000, quote_provenance: "fixed-v1".into(),
+            total_exposure_zatoshis: 1_010_000, fee_allowance_zatoshis: 10_000,
+            reserve_floor_zatoshis: 1,
+        };
+        let n = [1u8; 32];
+        let s = [2u8; 32];
+        let original = pps_credit_identity(&epoch, 100, 25, &n, &s, b"canonical-header");
+        assert_eq!(original, pps_credit_identity(&epoch, 100, 25, &n, &s, b"canonical-header"));
+        epoch.fee_bps += 1;
+        let changed_fee = pps_credit_identity(&epoch, 100, 25, &n, &s, b"canonical-header");
+        assert_eq!(original.0, changed_fee.0);
+        assert_ne!(original.1, changed_fee.1);
+        epoch.fee_bps -= 1;
+        for changed in [
+            pps_credit_identity(&epoch, 101, 25, &n, &s, b"canonical-header"),
+            pps_credit_identity(&epoch, 100, 26, &n, &s, b"canonical-header"),
+            pps_credit_identity(&epoch, 100, 25, &s, &s, b"canonical-header"),
+            pps_credit_identity(&epoch, 100, 25, &n, &n, b"canonical-header"),
+        ] {
+            assert_eq!(original.0, changed.0);
+            assert_ne!(original.1, changed.1);
+        }
+        assert_ne!(original.0, pps_credit_identity(&epoch, 100, 25, &n, &s, b"other-header").0);
+        epoch.id = "new-epoch".into();
+        let next_epoch = pps_credit_identity(&epoch, 100, 25, &n, &s, b"canonical-header");
+        assert_eq!(original.0, next_epoch.0);
+        assert_ne!(original.1, next_epoch.1);
+        epoch.network = "mainnet".into();
+        assert_ne!(original.0, pps_credit_identity(&epoch, 100, 25, &n, &s, b"canonical-header").0);
+    }
 
     #[test]
     fn test_sha256d() {

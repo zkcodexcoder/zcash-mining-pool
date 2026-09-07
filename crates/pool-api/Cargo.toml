@@ -21,6 +21,7 @@ prost = "0.13"
 toml = "0.8"
 libc = "0.2"
 pool-db = { path = "../pool-db" }
+pool-core = { path = "../pool-core" }
 node-rpc = { path = "../node-rpc" }
 rewards = { path = "../rewards" }
 sqlx.workspace = true

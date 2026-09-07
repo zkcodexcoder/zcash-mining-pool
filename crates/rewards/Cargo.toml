@@ -11,3 +11,5 @@ thiserror.workspace = true
 chrono.workspace = true
 pool-db = { path = "../pool-db" }
 sqlx.workspace = true
+num-bigint = "0.4.8"
+num-traits = "0.2"

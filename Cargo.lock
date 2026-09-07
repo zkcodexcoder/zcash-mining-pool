@@ -2114,13 +2114,22 @@ dependencies = [
 name = "node-rpc"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "hex",
+ "orchard",
+ "pczt",
+ "rand",
  "reqwest",
+ "sapling-crypto",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zcash_address",
+ "zcash_primitives",
+ "zcash_protocol",
+ "zcash_transparent",
 ]
 
 [[package]]
@@ -2274,9 +2283,9 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchard"
-version = "0.15.4"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "793e2e8c2323f35f082d1b3467ca8f576d646f9c93aef8c5168809d099245af8"
+checksum = "e8b67beade27dbebdbfee0819e23170b0b263dc7b4f558ee936151716baf6e1f"
 dependencies = [
  "aes",
  "bitvec",
@@ -2390,6 +2399,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "pczt"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7d4693dcb3d72f30064e0fdab122292d803bd9325a95b25df08679cf895452f"
+dependencies = [
+ "blake2b_simd",
+ "bls12_381",
+ "document-features",
+ "ff",
+ "getset",
+ "jubjub",
+ "nonempty",
+ "orchard",
+ "pasta_curves",
+ "postcard",
+ "rand_core",
+ "redjubjub",
+ "sapling-crypto",
+ "secp256k1",
+ "serde",
+ "serde_with",
+ "zcash_note_encryption",
+ "zcash_primitives",
+ "zcash_protocol",
+ "zcash_script",
+ "zcash_transparent",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2494,6 +2532,7 @@ dependencies = [
  "hex",
  "libc",
  "node-rpc",
+ "pool-core",
  "pool-db",
  "prost",
  "rand",
@@ -2519,16 +2558,22 @@ dependencies = [
  "chrono",
  "equihash 0.2.2",
  "hex",
+ "libc",
  "node-rpc",
  "pool-db",
+ "prost",
  "rand",
+ "reqwest",
  "rewards",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "stratum",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
+ "tonic",
  "tracing",
  "zebra-chain",
 ]
@@ -2541,13 +2586,18 @@ dependencies = [
  "axum 0.8.8",
  "bs58",
  "chrono",
+ "equihash 0.2.2",
  "hex",
  "node-rpc",
  "pool-api",
+ "pool-core",
  "pool-db",
+ "rewards",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
+ "stratum",
  "tokio",
  "toml",
  "tracing",
@@ -2560,7 +2610,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2941,6 +2994,8 @@ name = "rewards"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "num-bigint",
+ "num-traits",
  "pool-db",
  "serde",
  "sqlx",
@@ -5095,9 +5150,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_protocol"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d23144aed9cc370a746896a1b0cb5ebe40d7ce0599aa8522ac6b189c1d61a22"
+checksum = "9f074493fff337207e28bcfa5bbdf0e2a125c4203a4bdd07e72067eea81e9e7b"
 dependencies = [
  "corez",
  "document-features",

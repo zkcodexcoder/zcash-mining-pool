@@ -65,6 +65,8 @@ pub struct ApiState {
     pub banner: Option<String>,
     /// Reward distribution scheme label for the dashboard UI ("PPLNS" or "Solo").
     pub payout_scheme: String,
+    /// Explicit configuration, not inferred from a presentation label or DB row.
+    pub pps_enabled: bool,
     /// Background-refreshed snapshot of zebra's /metrics endpoint. The
     /// admin health handler reads this directly instead of triggering a
     /// live scrape — zebra 4.4.x's metrics body grew to ~9 MB with
@@ -175,6 +177,12 @@ pub struct StratumPortInfo {
 
 #[derive(Serialize)]
 pub struct PoolStats {
+    /// Separate sampled credit readiness; missing PPS telemetry is explicitly unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pps_credit_health: Option<pool_core::pps_credit_health::PpsCreditHealth>,
+    /// Bounded PPS health only; no other miner's balances are disclosed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pps_status: Option<PpsPublicStatus>,
     pub name: String,
     pub fee_percent: f64,
     /// Minimum payout threshold in ZEC.
@@ -211,10 +219,76 @@ pub struct PoolStats {
 }
 
 #[derive(Serialize)]
+pub struct PpsPublicStatus {
+    pub invariant_ok: bool,
+    pub chain_lease_current: bool,
+    pub last_checked_at: String,
+}
+
+#[derive(Serialize)]
 pub struct MinerStats {
     pub address: String,
     pub balance: MinerBalance,
     pub workers: Vec<WorkerInfo>,
+    /// Isolated PPS earnings for this queried miner only. Legacy balance
+    /// fields retain their existing meaning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pps_balance: Option<PpsMinerBalance>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PpsMinerBalance {
+    pub pending_zatoshis: i64,
+    pub paying_zatoshis: i64,
+    pub paid_zatoshis: i64,
+    pub fractional_subzatoshis: String,
+    pub subzatoshis_per_zatoshi: String,
+}
+
+async fn read_pps_miner_balance(db: &PoolDb, miner_id: i64)
+    -> Result<Option<PpsMinerBalance>, sqlx::Error>
+{
+    let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT pending,paying,paid,fraction FROM pps_accounts WHERE miner_id=?1",
+    ).bind(miner_id).fetch_optional(db.inner()).await?;
+    Ok(row.map(|(pending, paying, paid, fraction)| PpsMinerBalance {
+        pending_zatoshis: pending, paying_zatoshis: paying, paid_zatoshis: paid,
+        fractional_subzatoshis: fraction.to_string(),
+        subzatoshis_per_zatoshi: pool_db::pps_live::PPS_SCALE.to_string(),
+    }))
+}
+
+#[cfg(test)]
+mod pps_balance_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pps_fields_are_isolated_to_the_queried_miner() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        let db = PoolDb::new(pool.clone());
+        db.run_migrations().await.unwrap();
+        for (miner, pending) in [(1_i64, 123_i64), (2, 987)] {
+            sqlx::query("INSERT INTO miners(id,address) VALUES(?1,?2)")
+                .bind(miner).bind(format!("synthetic-miner-{miner}")).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO pps_accounts(miner_id,pending,paying,paid,fraction) VALUES(?1,?2,4,5,6)")
+                .bind(miner).bind(pending).execute(&pool).await.unwrap();
+        }
+        assert_eq!(read_pps_miner_balance(&db, 1).await.unwrap().unwrap().pending_zatoshis, 123);
+        assert_eq!(read_pps_miner_balance(&db, 2).await.unwrap().unwrap().pending_zatoshis, 987);
+        assert!(read_pps_miner_balance(&db, 3).await.unwrap().is_none());
+        let response = MinerStats {
+            address: "synthetic-miner-1".into(), workers: vec![],
+            balance: MinerBalance { pending_zatoshis: 10, paid_zatoshis: 20, pending_zec: 0.0000001, paid_zec: 0.0000002 },
+            pps_balance: read_pps_miner_balance(&db, 1).await.unwrap(),
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["balance"]["pending_zatoshis"], 10);
+        assert_eq!(json["pps_balance"]["pending_zatoshis"], 123);
+        assert_eq!(json["pps_balance"]["paying_zatoshis"], 4);
+        assert_eq!(json["pps_balance"]["fractional_subzatoshis"], "6");
+        assert!(!json.to_string().contains("synthetic-miner-2"));
+    }
 }
 
 #[derive(Serialize)]
@@ -450,7 +524,24 @@ pub async fn get_pool_stats(
     };
     let luck_lifetime = state.db.get_lifetime_luck().await.unwrap_or(None);
 
+    let pps_status = state.db.get_pool_status("pps_health").await.ok().flatten()
+        .and_then(|(raw, _)| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            let last = v.get("last_run")?.as_str()?;
+            let checked = chrono::DateTime::parse_from_rfc3339(last).ok()?;
+            let age = chrono::Utc::now().timestamp() - checked.timestamp();
+            let fresh = (0..=90).contains(&age);
+            Some(PpsPublicStatus {
+                invariant_ok: fresh && v.get("invariant_ok")?.as_bool()?,
+                chain_lease_current: fresh && v.get("chain_lease_current")?.as_bool()?
+                    && v.get("chain_valid_until_unix")?.as_i64()? > chrono::Utc::now().timestamp(),
+                last_checked_at: last.to_string(),
+            })
+        });
+    let pps_credit_health = crate::credit_health::read(&state.db, state.pps_enabled).await;
     Ok(Json(PoolStats {
+        pps_credit_health,
+        pps_status,
         name: state.pool_name.clone(),
         fee_percent: state.pool_fee,
         payout_scheme: state.payout_scheme.clone(),
@@ -725,8 +816,12 @@ pub async fn get_miner_stats(
             )
         })?;
 
+    let pps_balance = read_pps_miner_balance(&state.db, miner.id).await.map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "Database error".into() }))
+    })?;
     Ok(Json(MinerStats {
         address: miner.address,
+        pps_balance,
         balance: MinerBalance {
             pending_zatoshis: balance.pending,
             paid_zatoshis: balance.paid,

@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 tracing.workspace = true
 thiserror.workspace = true
 hex.workspace = true
@@ -20,3 +20,11 @@ pool-db = { path = "../pool-db" }
 rewards = { path = "../rewards" }
 equihash = "0.2"
 sha2 = "0.10"
+reqwest.workspace = true
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+prost = "0.13"
+
+[dev-dependencies]
+toml = "0.8"
+libc = "0.2"
+sqlx.workspace = true

@@ -12,8 +12,22 @@ use tracing_subscriber::EnvFilter;
 use node_rpc::ZcashRpcClient;
 use pool_api::{ApiState, AppState};
 use pool_db::PoolDb;
+use pool_db::pps_policy::PpsPolicy;
 
 mod reconciler;
+mod wallet_operation;
+mod payout_ledger;
+mod payout_health;
+mod pps_gate;
+mod pps_payout;
+mod pps_conventional;
+#[cfg(test)]
+mod pps_conventional_tests;
+use pool_core::pps_funding::PpsFundingRoute;
+use pps_gate::PpsGate;
+#[cfg(test)]
+mod pps_lifecycle_tests;
+use payout_ledger::PayoutLedger;
 
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
 
@@ -27,6 +41,8 @@ struct Config {
     difficulty: DifficultyConfig,
     #[serde(default)]
     pplns: PplnsModeOnlyConfig,
+    pps: Option<PpsPolicy>,
+    pps_funding: Option<PpsFundingRoute>,
     #[serde(default)]
     payout: PayoutConfig,
     api: ApiConfig,
@@ -39,14 +55,49 @@ struct Config {
 
 /// Dashboard only needs the reward mode from [pplns] (for the Payout Scheme
 /// label). All other [pplns] fields are pool-server concerns.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 struct PplnsModeOnlyConfig {
     #[serde(default = "default_pplns_mode")]
     mode: String,
 }
 
+impl Default for PplnsModeOnlyConfig {
+    fn default() -> Self { Self { mode: default_pplns_mode() } }
+}
+
 fn default_pplns_mode() -> String {
     "pplns".to_string()
+}
+
+fn validate_dashboard_pps(config: &Config) -> Result<()> {
+    let mode = config.pplns.mode.to_ascii_lowercase();
+    anyhow::ensure!(matches!(mode.as_str(), "pplns" | "solo" | "pps"), "Unsupported reward mode");
+    match (mode == "pps", config.pps.as_ref()) {
+        (true, Some(p)) => {
+            p.validate(&config.pool.network).map_err(anyhow::Error::msg)?;
+            config.pps_funding.unwrap_or_default().validate(&p.epoch_config())?;
+            anyhow::ensure!(config.payout.enabled && config.payout.reconcile_interval_secs > 0
+                && config.payout.interval_secs > 0 && !config.payout.pay_immature
+                && config.payout.wallet_rpc_url.is_some() && config.payout.pool_address.is_some(),
+                "PPS requires enabled payouts, reconciliation, wallet configuration and no immature-credit bypass");
+            let minimum = config.payout.minimum_payout * ZATOSHIS_PER_ZEC;
+            anyhow::ensure!(minimum.is_finite() && minimum >= 1.0
+                && minimum <= p.max_payout_zatoshis as f64,
+                "PPS payout minimum must fit the explicit per-round payout cap");
+            anyhow::ensure!(config.payout.available_balance_margin.is_finite()
+                && (0.5..=1.0).contains(&config.payout.available_balance_margin),
+                "PPS available balance margin must be finite and within 0.5..=1.0");
+            let legacy_floor = (config.payout.reserve_min * ZATOSHIS_PER_ZEC).ceil();
+            anyhow::ensure!(legacy_floor.is_finite() && legacy_floor >= 0.0
+                && legacy_floor < i64::MAX as f64 && p.reserve_min_zatoshis >= legacy_floor as i64,
+                "PPS reserve floor cannot be lower than the existing legacy payout reserve");
+        }
+        (true, None) => anyhow::bail!("PPS requires explicit [pps] bounded policy"),
+        (false, Some(_)) => anyhow::bail!("[pps] requires explicit reward mode pps"),
+        (false, None) => anyhow::ensure!(config.pps_funding.is_none(),
+            "PPS funding route requires explicit PPS policy"),
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,6 +411,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to read config file: {config_path}"))?;
     let mut config: Config =
         toml::from_str(&config_str).with_context(|| "Failed to parse config file")?;
+    validate_dashboard_pps(&config)?;
 
     if let Some(port) = port_override {
         config.api.listen_addr = format!("0.0.0.0:{port}");
@@ -384,7 +436,8 @@ async fn main() -> Result<()> {
         .with_context(|| "Invalid database url")?;
     let db_opts = db_opts
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .synchronous(if config.pps.is_some() { sqlx::sqlite::SqliteSynchronous::Full }
+            else { sqlx::sqlite::SqliteSynchronous::Normal })
         .busy_timeout(std::time::Duration::from_secs(20));
     let db_pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -404,6 +457,11 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "Failed to enable WAL mode")?;
     info!("Database connected (WAL mode, read-only dashboard)");
+    db.assert_reward_mode(config.pps.is_some()).await?;
+    if let Some(policy) = &config.pps {
+        db.verify_pps_epoch(&policy.epoch_config()).await?;
+        db.pps_invariant().await?;
+    }
 
     // Initialize Zcash node RPC client
     let rpc = match (&config.node.rpc_user, &config.node.rpc_password) {
@@ -412,6 +470,8 @@ async fn main() -> Result<()> {
         }
         _ => Arc::new(ZcashRpcClient::new(&config.node.rpc_url)),
     };
+    let pps_gate = config.pps.as_ref().map(|p|
+        Arc::new(PpsGate::new(Arc::clone(&rpc), &p.network)));
 
     // Wallet RPC for Zallet monitoring (balance/health checks + trigger_payout)
     let wallet_rpc = config.payout.wallet_rpc_url.as_ref().map(|url| {
@@ -500,7 +560,7 @@ async fn main() -> Result<()> {
         db: db.clone(),
         rpc: Arc::clone(&rpc),
         pool_name: config.pool.name.clone(),
-        pool_fee: config.pool.fee_percent,
+        pool_fee: config.pps.as_ref().map_or(config.pool.fee_percent, |p| f64::from(p.fee_bps) / 100.0),
         network: config.pool.network.clone(),
         hostname: config
             .pool
@@ -534,8 +594,10 @@ async fn main() -> Result<()> {
         difficulty_multiplier,
         payout_scheme: match config.pplns.mode.to_lowercase().as_str() {
             "solo" => "Solo".to_string(),
+            "pps" => "PPS (bounded canary)".to_string(),
             _ => "PPLNS".to_string(),
         },
+        pps_enabled: config.pps.is_some(),
         zebra_metrics_cache: Arc::clone(&zebra_metrics_cache),
         authoritative_tip_cache: Arc::clone(&authoritative_tip_cache),
     });
@@ -623,7 +685,7 @@ async fn main() -> Result<()> {
         if admin_cfg.enabled {
             let config_view = pool_api::admin::PoolConfigView {
                 pool_name: config.pool.name.clone(),
-                pool_fee: config.pool.fee_percent,
+                pool_fee: config.pps.as_ref().map_or(config.pool.fee_percent, |p| f64::from(p.fee_bps) / 100.0),
                 network: config.pool.network.clone(),
                 stratum_ports: stratum_addrs.clone(),
                 difficulty_multiplier,
@@ -712,7 +774,8 @@ async fn main() -> Result<()> {
             _ => Arc::new(ZcashRpcClient::new(&wallet_url)),
         };
         let min_payout_zatoshis = (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64;
-        let reserve_min_zatoshis = (config.payout.reserve_min * ZATOSHIS_PER_ZEC) as i64;
+        let reserve_min_zatoshis = ((config.payout.reserve_min * ZATOSHIS_PER_ZEC) as i64)
+            .max(config.pps.as_ref().map_or(0, |p| p.reserve_min_zatoshis));
         let interval = Duration::from_secs(config.payout.interval_secs);
         let maturity = config.payout.maturity_confirmations;
         let payout_db = db.clone();
@@ -742,6 +805,8 @@ async fn main() -> Result<()> {
                 pool_fee: (config.pool.fee_percent / 100.0).clamp(0.0, 1.0),
                 mining_address: mining_address.clone(),
                 auto_void_reorged: config.payout.auto_void_reorged,
+                pps_policy: config.pps.clone(),
+                pps_gate: pps_gate.clone(),
                 shielded_coinbase: config.payout.shielded_coinbase,
             };
             // Round-3: resolve any payout reservations orphaned by a crash BEFORE
@@ -769,6 +834,8 @@ async fn main() -> Result<()> {
                 .unwrap_or(i64::MAX),
         );
         let payout_config_path = config_path.clone();
+        let pps_policy = config.pps.clone();
+        let funding_route = config.pps_funding.unwrap_or_default();
         let payout_task = tokio::spawn(async move {
             run_payout_loop(
                 payout_db, node_rpc, payout_wallet_rpc,
@@ -777,7 +844,7 @@ async fn main() -> Result<()> {
                 maturity, interval,
                 &payout_network, pay_immature,
                 loop_wake,
-                payout_config_path, coalesce_fallback,
+                payout_config_path, coalesce_fallback, pps_policy, pps_gate, funding_route,
             ).await;
         });
         Some((payout_task, reconciler_handle))
@@ -886,6 +953,9 @@ async fn run_payout_loop(
     wake: Arc<tokio::sync::Notify>,
     config_path: String,
     coalesce_fallback: (i64, i64),
+    pps_policy: Option<PpsPolicy>,
+    pps_gate: Option<Arc<PpsGate>>,
+    funding_route: PpsFundingRoute,
 ) {
     info!("Payout loop started");
     // Short initial delay to let dashboard fully start before doing RPC work.
@@ -917,7 +987,11 @@ async fn run_payout_loop(
         }
 
         // Phase 2: Shield mature coinbase UTXOs (transparent -> shielded)
-        match shield_coinbase(&db, &wallet_rpc, mining_address, pool_address).await {
+        // PPS uses a pre-funded confirmed shielded reserve. Unbounded legacy
+        // shielding fees cannot be charged to the fixed all-in PPS budget.
+        match if pps_policy.is_some() { Ok(()) } else {
+            shield_coinbase(&db, &wallet_rpc, mining_address, pool_address).await
+        } {
             Ok(()) => {
                 consecutive_shielding_failures = 0;
                 last_shielding_error.clear();
@@ -932,14 +1006,37 @@ async fn run_payout_loop(
         // Phase 3: Pay miners from shielded pool (respects reserve_min)
         let (coalesce_cooldown, coalesce_override) =
             reload_coalesce_knobs(&config_path, coalesce_fallback);
-        match process_payouts(
+        let (payout_result, payout_cycle) = payout_health::observe(async {
+            if pps_policy.is_some() {
+                pps_gate.as_ref().context("missing PPS verification gate")?.fresh_lease().await?;
+                db.pps_invariant().await?;
+            }
+            let mut paid = if funding_route.holds_new_legacy_sends() {
+                // Approved finite testnet trial: earned legacy claims and
+                // reconciliation remain intact; this loop starts no new sends.
+                anyhow::ensure!(pps_policy.is_some(), "legacy hold requires testnet PPS");
+                0
+            } else { process_payouts(
             &db, &wallet_rpc, &node_rpc, pool_address, mining_address,
             min_payout_zatoshis, reserve_min_zatoshis, balance_margin, network,
             pay_immature, coalesce_cooldown, coalesce_override,
-        ).await {
+            ).await? };
+            if let Some(p) = &pps_policy {
+                paid += if funding_route.holds_new_legacy_sends() {
+                    pps_conventional::process(&db,&wallet_rpc,&node_rpc,pool_address,
+                        min_payout_zatoshis,p,pps_gate.as_deref().context("missing PPS verification gate")?,
+                        &funding_route).await?
+                } else { process_payouts_for_ledger(
+                    &db, &wallet_rpc, &node_rpc, pool_address, mining_address,
+                    min_payout_zatoshis, reserve_min_zatoshis, balance_margin, network,
+                    false, coalesce_cooldown, coalesce_override, Some(p), pps_gate.as_deref(),
+                ).await? };
+            }
+            Ok::<usize, anyhow::Error>(paid)
+        }).await;
+        match payout_result {
             Ok(count) => {
-                consecutive_payout_failures = 0;
-                last_payout_error.clear();
+                payout_health::clear_successful_cycle(&mut consecutive_payout_failures, &mut last_payout_error);
                 if count > 0 {
                     info!(payouts = count, "Payout round completed");
                 }
@@ -958,6 +1055,7 @@ async fn run_payout_loop(
                 maturity: (consecutive_maturity_failures, &last_maturity_error),
                 shielding: (consecutive_shielding_failures, &last_shielding_error),
             },
+            pps_policy.as_ref().map(|_| &payout_cycle),
         ).await;
 
         // Sleep until the next scheduled cycle OR an admin nudge (audit #14:
@@ -986,6 +1084,7 @@ async fn write_payout_health(
     mining_address: &str,
     reserve_min_zatoshis: i64,
     failures: PhaseFailures<'_>,
+    pps_payout_cycle: Option<&payout_health::PpsPayoutCycleReport>,
 ) -> anyhow::Result<()> {
     // Check transparent balance (unshielded funds). Dialect-neutral: works
     // against zallet (z_gettotalbalance) and zecd (getbalances).
@@ -1008,6 +1107,7 @@ async fn write_payout_health(
         // Kept under the original key for dashboard/API compatibility.
         "consecutive_payout_failures": failures.payout.0,
         "last_payout_error": failures.payout.1,
+        "pps_payout_cycle": pps_payout_cycle,
         // Per-phase counters (audit P8).
         "consecutive_maturity_failures": failures.maturity.0,
         "last_maturity_error": failures.maturity.1,
@@ -1269,17 +1369,10 @@ async fn wait_for_operation(
             let state = status.get("status").and_then(|s| s.as_str()).unwrap_or("");
             match state {
                 "success" => {
-                    let txid = status.get("result")
-                        .and_then(|r| r.get("txid"))
-                        .or_else(|| {
-                            status.get("result")
-                                .and_then(|r| r.get("txids"))
-                                .and_then(|a| a.as_array())
-                                .and_then(|a| a.first())
-                        })
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    // Invalid success evidence is ambiguous, not a failed send.
+                    // The payout caller retains `paying` funds on this error.
+                    let txid = wallet_operation::successful_txid(status.get("result"))
+                        .context("Wallet success result cannot identify one transaction")?;
                     return Ok(OpResult::Success(txid));
                 }
                 "failed" => {
@@ -1310,13 +1403,39 @@ async fn process_payouts(
     coalesce_cooldown_secs: i64,
     coalesce_override_zatoshis: i64,
 ) -> anyhow::Result<usize> {
+    process_payouts_for_ledger(db, rpc, node_rpc, pool_address, mining_address,
+        min_payout_zatoshis, reserve_min_zatoshis, balance_margin, network,
+        pay_immature, coalesce_cooldown_secs, coalesce_override_zatoshis, None, None).await
+}
+
+async fn process_payouts_for_ledger(
+    db: &PoolDb, rpc: &ZcashRpcClient, node_rpc: &ZcashRpcClient,
+    pool_address: &str, mining_address: &str, min_payout_zatoshis: i64,
+    reserve_min_zatoshis: i64, balance_margin: f64, network: &str,
+    pay_immature: bool, coalesce_cooldown_secs: i64, coalesce_override_zatoshis: i64,
+    pps_policy: Option<&PpsPolicy>,
+    pps_gate: Option<&PpsGate>,
+) -> anyhow::Result<usize> {
+    if let Some(policy) = pps_policy {
+        return pps_payout::process(db, rpc, node_rpc, pool_address,
+            min_payout_zatoshis, network, policy,
+            pps_gate.context("missing PPS verification gate")?).await;
+    }
+    let ledger = if let Some(p) = pps_policy {
+        p.validate(network).map_err(anyhow::Error::msg)?;
+        pps_gate.context("missing PPS verification gate")?.fresh_lease().await?;
+        db.pps_invariant().await?;
+        PayoutLedger::Pps
+    } else { PayoutLedger::Legacy };
+    let reserve_min_zatoshis = reserve_min_zatoshis
+        .max(pps_policy.map_or(0, |p| p.reserve_min_zatoshis));
     // Immediate-payout safeguard: only skip the maturity gate while the
     // total credits on still-pending blocks (= worst-case orphan loss the
     // reserve could be asked to absorb) fit within the reserve. Past that,
     // fall back to mature-only for the round; exposure shrinks as blocks
     // confirm.
     let mut include_immature = false;
-    if pay_immature {
+    if pay_immature && ledger == PayoutLedger::Legacy {
         let exposure = db.get_immature_exposure().await?;
         if exposure <= reserve_min_zatoshis {
             include_immature = true;
@@ -1328,8 +1447,8 @@ async fn process_payouts(
             );
         }
     }
-    let pending = db
-        .get_pending_payouts(
+    let pending = ledger
+        .pending(db,
             min_payout_zatoshis, include_immature,
             coalesce_cooldown_secs, coalesce_override_zatoshis,
         )
@@ -1351,13 +1470,18 @@ async fn process_payouts(
             return Err(anyhow::anyhow!("Failed to check wallet balance: {e}"));
         }
     };
+    anyhow::ensure!(private_balance.is_finite() && private_balance >= 0.0,
+        "Wallet returned invalid spendable balance");
 
     // Enforce the reserve threshold: only spend the portion of the balance
     // above the reserve. Keeps a buffer so subsequent payouts can fire
     // without waiting for fresh shielding.
     let reserve_min_zec = reserve_min_zatoshis as f64 / ZATOSHIS_PER_ZEC;
     let spendable_zec = (private_balance - reserve_min_zec).max(0.0);
-    let available_zec = (spendable_zec * balance_margin).max(0.0);
+    let mut available_zec = (spendable_zec * balance_margin).max(0.0);
+    if let Some(p) = pps_policy {
+        available_zec = available_zec.min(p.max_payout_zatoshis as f64 / ZATOSHIS_PER_ZEC);
+    }
 
     if available_zec < min_payout_zatoshis as f64 / ZATOSHIS_PER_ZEC {
         info!(
@@ -1385,10 +1509,11 @@ async fn process_payouts(
             })
     };
 
+    let mut round_remaining = pps_policy.map_or(i64::MAX, |p| p.max_payout_zatoshis);
     for (i, p) in pending.iter().enumerate() {
         let pay_to = if is_valid_zcash_address(&p.address, network) {
             p.address.clone()
-        } else if is_older_than_two_days(&p.created_at) {
+        } else if ledger == PayoutLedger::Legacy && is_older_than_two_days(&p.created_at) {
             warn!(
                 miner_id = p.miner_id, address = %p.address, created_at = %p.created_at,
                 amount_zec = p.amount as f64 / ZATOSHIS_PER_ZEC,
@@ -1400,9 +1525,10 @@ async fn process_payouts(
                 "Skipping payout: invalid address format (account < 2 days old)");
             continue;
         };
-        let scaled_zatoshis = (p.amount as f64 * scale).floor() as i64;
+        let scaled_zatoshis = ((p.amount as f64 * scale).floor() as i64).min(round_remaining);
         if scaled_zatoshis >= min_payout_zatoshis {
             payout_list.push((i, scaled_zatoshis, pay_to));
+            round_remaining -= scaled_zatoshis;
         }
     }
 
@@ -1436,7 +1562,7 @@ async fn process_payouts(
         .iter()
         .map(|(i, amt, _)| (pending[*i].miner_id, *amt))
         .collect();
-    let reserved = match db.reserve_payout(attempt_id, &reserve_items).await {
+    let reserved = match ledger.reserve(db, attempt_id, &reserve_items).await {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "Payout reservation failed; nothing sent");
@@ -1478,9 +1604,26 @@ async fn process_payouts(
     // broadcast (external review 2026-08-21). 'submitting'/'sent' with no opid
     // are parked as fate-unknown instead. Fail CLOSED if the write fails:
     // nothing has been sent yet, so refunding is safe.
+    if let Some(p) = pps_policy {
+        let gate = async {
+            pps_gate.context("missing PPS verification gate")?.fresh_lease().await?;
+            db.verify_pps_epoch(&p.epoch_config()).await?;
+            db.pps_invariant().await?;
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        if let Err(e) = gate {
+            // This path is before any wallet send, so releasing the exact
+            // reservation is safe. A failed release remains held, not retried.
+            if ledger.refund(db, attempt_id).await.is_ok() {
+                let _ = db.update_payout_attempt(attempt_id, "failed", None, None,
+                    Some("PPS pre-send gate failed; nothing sent")).await;
+            }
+            return Err(e);
+        }
+    }
     if let Err(e) = db.update_payout_attempt(attempt_id, "submitting", None, None, None).await {
         error!(error = %e, "could not durably mark attempt submitting; refunding (nothing sent)");
-        let _ = db.refund_payout(attempt_id).await;
+        let _ = ledger.refund(db, attempt_id).await;
         let _ = db
             .update_payout_attempt(attempt_id, "failed", None, None,
                 Some(&format!("could not mark submitting (refunded, nothing sent): {e}")))
@@ -1516,7 +1659,7 @@ async fn process_payouts(
             // reservation and defer; the next cycle recomputes the scale against
             // the live balance (the rescale, one cycle later, without churn).
             let deferred = msg.contains("Insufficient balance");
-            let _ = db.refund_payout(attempt_id).await;
+            let _ = ledger.refund(db, attempt_id).await;
             let note = if deferred {
                 format!("deferred: insufficient spendable balance (refunded): {msg}")
             } else {
@@ -1546,7 +1689,7 @@ async fn process_payouts(
         }
         Ok(OpResult::Failed(msg)) => {
             // Operation definitively failed: no tx exists, so refunding is safe.
-            let _ = db.refund_payout(attempt_id).await;
+            let _ = ledger.refund(db, attempt_id).await;
             let _ = db
                 .update_payout_attempt(attempt_id, "failed", None, None, Some(&format!("z_sendmany operation failed: {msg}")))
                 .await;
@@ -1603,13 +1746,28 @@ async fn process_payouts(
         .map(|(_, _, addr)| addr.as_str())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    if let Err(e) = db.record_tx_cost("payout", &txid, estimate_payout_fee(recipients)).await {
-        warn!(error = %e, txid = %txid, "Failed to record payout tx cost");
+    if ledger == PayoutLedger::Legacy {
+        if let Err(e) = db.record_tx_cost("payout", &txid, estimate_payout_fee(recipients)).await {
+            warn!(error = %e, txid = %txid, "Failed to record payout tx cost");
+        }
     }
 
     // CONFIRM: atomically move the reservation paying -> paid and write the
     // payouts rows (round-3). Idempotent, so a reconciliation re-run is harmless.
-    let count = match db.confirm_payout(attempt_id, &txid).await {
+    if let Some(policy) = pps_policy {
+        let gate = async {
+            pps_gate.context("missing PPS verification gate")?.fresh_lease().await?;
+            db.verify_pps_epoch(&policy.epoch_config()).await?;
+            db.pps_invariant().await?;
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        if let Err(e) = gate {
+            let _ = db.update_payout_attempt(attempt_id, "sent", None, Some(&txid),
+                Some("PPS settlement gate unavailable; reservation held")).await;
+            return Err(e);
+        }
+    }
+    let count = match ledger.confirm(db, attempt_id, &txid).await {
         Ok(n) => n as usize,
         Err(e) => {
             // Tx is on chain but ledger finalization failed. Do NOT refund; leave
@@ -1817,7 +1975,7 @@ mod lifecycle_tests {
             ("z_sendmany", serde_json::json!("opid-zecd")),
             (
                 "z_getoperationstatus",
-                serde_json::json!([{"status": "success", "result": {"txid": TXID}}]),
+                serde_json::json!([{"status": "success", "result": {"txids": [TXID]}}]),
             ),
         ]))
         .await;
@@ -1829,6 +1987,33 @@ mod lifecycle_tests {
             (0, 0, REWARD, REWARD),
             "zecd dialect must conserve exactly like zallet"
         );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_success_keeps_entire_batch_reserved() {
+        for result in [
+            serde_json::json!({"txids": [TXID, "b".repeat(64)]}),
+            serde_json::json!({"txid": TXID, "txids": ["b".repeat(64)]}),
+            serde_json::json!({"txid": "unknown"}),
+            serde_json::json!({}),
+        ] {
+            let (db, pool) = setup_db().await;
+            credited_block(&db, 175).await;
+            let mut wallet_responses = happy_wallet();
+            wallet_responses.insert("z_getoperationstatus", serde_json::json!([
+                {"status": "success", "result": result}
+            ]));
+            let wallet = mock_rpc(wallet_responses).await;
+            // Even an affirmative node response must not settle an ambiguous batch.
+            let node = mock_rpc(node_with_tx()).await;
+            assert!(run_payouts(&db, &wallet, &node).await.is_err());
+            assert_eq!(sums(&pool).await, (0, REWARD, 0, 0));
+            let attempt: (String, Option<String>) = sqlx::query_as(
+                "SELECT status, txid FROM payout_attempts ORDER BY id DESC LIMIT 1",
+            ).fetch_one(&pool).await.unwrap();
+            assert_eq!(attempt, ("sent".to_string(), None));
+            assert_eq!(db.get_reserved_attempts(None).await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]

@@ -31,6 +31,8 @@ use std::time::Duration;
 
 use node_rpc::ZcashRpcClient;
 use pool_db::PoolDb;
+use pool_db::pps_policy::PpsPolicy;
+use crate::payout_ledger::PayoutLedger;
 use tracing::{error, info, warn};
 
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
@@ -83,6 +85,8 @@ pub struct Reconciler {
     /// returns balances to pending and the loop re-pays. When false, the
     /// phantom check only alerts (legacy behavior).
     pub auto_void_reorged: bool,
+    pub pps_policy: Option<PpsPolicy>,
+    pub pps_gate: Option<Arc<crate::pps_gate::PpsGate>>,
     /// The node mints the coinbase straight into a shielded receiver, so
     /// there is normally no transparent output paying `mining_address`.
     /// When the vout scan finds none, the coinbase check asks the payout
@@ -97,7 +101,8 @@ impl Reconciler {
     pub async fn run(self) {
         info!(interval_secs = self.interval.as_secs(), "Reconciler started");
         // Offset from the payout loop's startup burst.
-        tokio::time::sleep(Duration::from_secs(90)).await;
+        tokio::time::sleep(if self.pps_policy.is_some() { Duration::ZERO }
+            else { Duration::from_secs(90) }).await;
         loop {
             match self.sweep_once().await {
                 Ok(summary) => {
@@ -107,7 +112,8 @@ impl Reconciler {
                 }
                 Err(e) => error!(error = %e, "Reconciler sweep failed"),
             }
-            tokio::time::sleep(self.interval).await;
+            tokio::time::sleep(if self.pps_policy.is_some() { self.interval.min(Duration::from_secs(30)) }
+                else { self.interval }).await;
         }
     }
 
@@ -120,8 +126,10 @@ impl Reconciler {
         self.reconcile_reserved_payouts(&mut summary, Some(STALE_ATTEMPT_MINUTES)).await;
         self.resolve_stale_attempts(&mut summary).await;
         self.check_phantom_payouts(&mut summary).await;
+        self.check_pps_phantom_payouts(&mut summary).await;
         self.check_clawbacks(&mut summary).await;
         self.check_invariant(&mut summary).await;
+        self.check_pps_invariant(&mut summary).await;
         self.check_coinbase_outputs(&mut summary).await;
 
         let health = serde_json::json!({
@@ -166,14 +174,70 @@ impl Reconciler {
         summary: &mut SweepSummary,
         older_than_minutes: Option<i64>,
     ) {
-        let reserved = match self.db.get_reserved_attempts(older_than_minutes).await {
-            Ok(v) => v,
+        if let (Some(policy),Some(gate)) = (&self.pps_policy,&self.pps_gate) {
+          if policy.network=="testnet" {
+            // Dedicated immutable-intent path; these journals are permanently
+            // excluded from PCZT and legacy stale-attempt queries.
+            match self.db.get_reserved_pps_conventional_attempts(100).await {
+                Ok(rows) => for row in rows {
+                    match crate::pps_conventional::reconcile_one(&self.db,&self.wallet_rpc,
+                        &self.node_rpc,policy,gate,row.attempt_id).await {
+                        Ok(count) if count>0 => { summary.attempts_resolved+=1; summary.late_confirmed+=1; },
+                        Ok(_) => {},
+                        Err(_) => summary.alerts.push("Testnet PPS exact outcome unproven; funds held".into()),
+                    }
+                },
+                Err(_) => summary.alerts.push("Testnet PPS journal unavailable; held".into()),
+            }
+          }
+        }
+        let mut reserved = match self.db.get_reserved_attempts(older_than_minutes).await {
+            Ok(v) => v.into_iter().map(|item| (PayoutLedger::Legacy, item)).collect::<Vec<_>>(),
             Err(e) => {
                 summary.alerts.push(format!("reserved-attempt query failed: {e}"));
                 return;
             }
         };
-        for (id, status, opid, txid, total_zats, created_at) in reserved {
+        if self.pps_policy.is_some() {
+            let proof = match self.pps_gate.as_ref() {
+                Some(gate) => gate.fresh_lease().await.map(|_| ()),
+                None => Err(anyhow::anyhow!("missing PPS verification gate")),
+            };
+            match proof {
+                Err(reason) => summary.alerts.push(format!("PPS recovery held: {reason}")),
+                Ok(()) => match self.db.get_reserved_pps_attempts(older_than_minutes).await {
+                    Ok(v) => reserved.extend(v.into_iter().map(|item| (PayoutLedger::Pps, item))),
+                    Err(e) => summary.alerts.push(format!("PPS reserved-attempt query failed: {e}")),
+                },
+            }
+        }
+        for (ledger, (id, status, opid, txid, total_zats, created_at)) in reserved {
+            if ledger == PayoutLedger::Pps {
+                // PCZT recovery has no async wallet operation id. A sealed
+                // transaction may only settle its durably bound expected txid;
+                // unknown extraction, failed visibility or absent txid NEVER
+                // grants refund/replan/broadcast authority.
+                let Some(expected) = txid.as_deref()
+                    .and_then(|t|crate::wallet_operation::normalize_txid(t).ok()) else {
+                    summary.alerts.push("PPS signed proposal unresolved; principal and fee held".into());
+                    continue;
+                };
+                if self.node_rpc.get_raw_transaction(&expected,1).await.is_err() {
+                    summary.alerts.push("PPS fixed transaction not proven visible; principal and fee held".into());
+                    continue;
+                }
+                if !self.pps_decision_gate(ledger,summary).await { continue; }
+                match self.db.confirm_pps_payout(id,&expected).await {
+                    Ok(_) => {
+                        let _ = self.db.update_payout_attempt(id,"confirmed",None,Some(&expected),
+                            Some("PPS fixed transaction reconciled")).await;
+                        summary.attempts_resolved += 1;
+                        summary.late_confirmed += 1;
+                    }
+                    Err(_) => summary.alerts.push("PPS fixed transaction settlement rejected; held".into()),
+                }
+                continue;
+            }
             let total_zec = total_zats as f64 / ZATOSHIS_PER_ZEC;
 
             // Learn the txid: recorded on the attempt, or resolved via the opid.
@@ -197,11 +261,17 @@ impl Reconciler {
                     if let Some(st) = statuses.first() {
                         match st.get("status").and_then(|s| s.as_str()).unwrap_or("") {
                             "success" => {
-                                resolved_txid = st
-                                    .get("result")
-                                    .and_then(|r| r.get("txid"))
-                                    .and_then(|t| t.as_str())
-                                    .map(String::from);
+                                match crate::wallet_operation::successful_txid(st.get("result")) {
+                                    Ok(txid) => resolved_txid = Some(txid),
+                                    Err(reason) => {
+                                        // Do not refund or settle a possibly broadcast
+                                        // operation whose transaction set is unknown.
+                                        summary.alerts.push(format!(
+                                            "reservation {id}: ambiguous successful wallet result ({reason}); holding"
+                                        ));
+                                        continue;
+                                    }
+                                }
                             }
                             "failed" => op_failed = true,
                             // executing/queued — still in flight, leave it.
@@ -212,10 +282,20 @@ impl Reconciler {
             }
 
             if let Some(t) = resolved_txid {
+                let t = match crate::wallet_operation::normalize_txid(&t) {
+                    Ok(t) => t,
+                    Err(reason) => {
+                        summary.alerts.push(format!(
+                            "reservation {id}: invalid recorded transaction ID ({reason}); holding"
+                        ));
+                        continue;
+                    }
+                };
                 match self.node_rpc.get_raw_transaction(&t, 1).await {
                     Ok(_) => {
                         // On chain -> finalize the reservation (idempotent).
-                        match self.db.confirm_payout(id, &t).await {
+                        if !self.pps_decision_gate(ledger, summary).await { continue; }
+                        match ledger.confirm(&self.db, id, &t).await {
                             Ok(n) => {
                                 let _ = self
                                     .db
@@ -253,8 +333,8 @@ impl Reconciler {
                         // Refund only once it is old enough that the tx would
                         // have expired unmined, so a merely-slow broadcast is
                         // never refunded-then-repaid.
-                        if older_than(&created_at, RESERVATION_REFUND_MINUTES) {
-                            self.refund_reservation(id, total_zec, "txid not on chain (-5) past expiry", summary)
+                        if ledger == PayoutLedger::Legacy && older_than(&created_at, RESERVATION_REFUND_MINUTES) {
+                            self.refund_reservation(ledger, id, total_zec, "txid not on chain (-5) past expiry", summary)
                                 .await;
                         } else {
                             summary.alerts.push(format!(
@@ -266,7 +346,7 @@ impl Reconciler {
                 }
             } else if op_failed {
                 // Operation definitively failed: nothing broadcast -> refund.
-                self.refund_reservation(id, total_zec, "operation failed", summary)
+                self.refund_reservation(ledger, id, total_zec, "operation failed", summary)
                     .await;
             } else if opid.is_none() {
                 if status == "sent" || status == "submitting" {
@@ -287,7 +367,7 @@ impl Reconciler {
                     // Still 'queued': the loop crashed BEFORE the durable
                     // 'submitting' write that precedes z_sendmany, so nothing
                     // was submitted. Safe to refund once past expiry.
-                    self.refund_reservation(id, total_zec, "never submitted (no opid) past expiry", summary)
+                    self.refund_reservation(ledger, id, total_zec, "never submitted (no opid) past expiry", summary)
                         .await;
                 } else {
                     summary.alerts.push(format!(
@@ -312,12 +392,14 @@ impl Reconciler {
     /// Refund a reservation (paying -> pending) and mark its attempt failed.
     async fn refund_reservation(
         &self,
+        ledger: PayoutLedger,
         id: i64,
         total_zec: f64,
         why: &str,
         summary: &mut SweepSummary,
     ) {
-        match self.db.refund_payout(id).await {
+        if !self.pps_decision_gate(ledger, summary).await { return; }
+        match ledger.refund(&self.db, id).await {
             Ok(n) => {
                 let _ = self
                     .db
@@ -337,6 +419,22 @@ impl Reconciler {
             Err(e) => summary
                 .alerts
                 .push(format!("reservation {id}: refund_payout failed: {e}")),
+        }
+    }
+
+    async fn pps_decision_gate(&self, ledger: PayoutLedger, summary: &mut SweepSummary) -> bool {
+        if ledger == PayoutLedger::Legacy { return true; }
+        let result = async {
+            let gate = self.pps_gate.as_ref().ok_or_else(|| anyhow::anyhow!("missing PPS verification gate"))?;
+            gate.fresh_lease().await?;
+            let policy = self.pps_policy.as_ref().ok_or_else(|| anyhow::anyhow!("missing PPS policy"))?;
+            self.db.verify_pps_epoch(&policy.epoch_config()).await?;
+            self.db.pps_invariant().await?;
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        match result {
+            Ok(()) => true,
+            Err(_) => { summary.alerts.push("PPS recovery decision held: current chain and exact ledger proof required".into()); false }
         }
     }
 
@@ -376,11 +474,15 @@ impl Reconciler {
                             let state = st.get("status").and_then(|s| s.as_str()).unwrap_or("");
                             match state {
                                 "success" => {
-                                    resolved_txid = st
-                                        .get("result")
-                                        .and_then(|r| r.get("txid"))
-                                        .and_then(|t| t.as_str())
-                                        .map(String::from);
+                                    match crate::wallet_operation::successful_txid(st.get("result")) {
+                                        Ok(txid) => resolved_txid = Some(txid),
+                                        Err(reason) => {
+                                            summary.alerts.push(format!(
+                                                "attempt {id}: ambiguous successful wallet result ({reason}); holding"
+                                            ));
+                                            continue;
+                                        }
+                                    }
                                 }
                                 "failed" => {
                                     let msg = st
@@ -413,6 +515,12 @@ impl Reconciler {
 
             // If we have a txid (recorded or just resolved), ask the node.
             if let Some(ref t) = resolved_txid {
+                if let Err(reason) = crate::wallet_operation::normalize_txid(t) {
+                    summary.alerts.push(format!(
+                        "attempt {id}: invalid recorded transaction ID ({reason}); holding"
+                    ));
+                    continue;
+                }
                 match self.node_rpc.get_raw_transaction(t, 1).await {
                     // Node unreachable / transport error: unknown, not absent.
                     Err(ref e) if !e.is_definitely_not_found() => {
@@ -745,6 +853,82 @@ impl Reconciler {
             Err(e) => summary.alerts.push(format!("invariant query failed: {e}")),
         }
     }
+
+    async fn check_pps_invariant(&self, summary: &mut SweepSummary) {
+        let Some(policy) = &self.pps_policy else { return; };
+        let lease = match &self.pps_gate {
+            Some(gate) => gate.fresh_lease().await.ok(), None => None,
+        };
+        let fresh = lease.is_some();
+        let valid_until = lease.map_or(0, |l| l.valid_until_unix);
+        if !fresh {
+            summary.alerts.push("PPS chain-agreement lease expired; new PPS actions are blocked".into());
+        }
+        match self.db.pps_invariant().await {
+            Ok(totals) => {
+                let health = serde_json::json!({
+                    "schema": "pps-v1", "last_run": chrono::Utc::now().to_rfc3339(),
+                    "epoch": policy.epoch, "network": policy.network,
+                    "invariant_ok": true, "chain_lease_current": fresh,
+                    "chain_valid_until_unix": valid_until,
+                    "accepted_events": totals.accepted_events,
+                    "pending_zatoshis": totals.pending_zatoshis,
+                    "paying_zatoshis": totals.paying_zatoshis,
+                    "paid_zatoshis": totals.paid_zatoshis,
+                    "gross_subzatoshis": totals.gross_subzatoshis.to_string(),
+                    "max_liability_subzatoshis": totals.max_liability_subzatoshis.to_string(),
+                    "fractional_subzatoshis": totals.fractional_subzatoshis.to_string(),
+                });
+                if self.db.set_pool_status("pps_health", &health.to_string()).await.is_err() {
+                    summary.alerts.push("PPS health persistence failed".into());
+                }
+            }
+            Err(e) => {
+                // Any mismatch pages immediately; never turn a first observed
+                // error into a baseline, and never compare PPS against block luck.
+                summary.alerts.push(format!("PPS exact accounting invariant FAILED: {e}"));
+                let _ = self.db.set_pool_status("pps_health", &serde_json::json!({
+                    "schema": "pps-v1", "last_run": chrono::Utc::now().to_rfc3339(),
+                    "invariant_ok": false, "chain_lease_current": fresh,
+                    "chain_valid_until_unix": valid_until,
+                }).to_string()).await;
+            }
+        }
+    }
+
+    async fn check_pps_phantom_payouts(&self, summary: &mut SweepSummary) {
+        if self.pps_policy.is_none() { return; }
+        let recent: Result<Vec<(String,)>, _> = sqlx::query_as(
+            "SELECT DISTINCT txid FROM pps_payouts WHERE created_at>=datetime('now','-24 hours') ORDER BY txid LIMIT 1001",
+        ).fetch_all(self.db.inner()).await;
+        let recent = match recent {
+            Ok(v) => v,
+            Err(_) => { summary.alerts.push("PPS payout verification query failed".into()); return; }
+        };
+        if recent.len() > 1000 {
+            summary.alerts.push("PPS payout verification coverage exceeded 1000 transactions; manual review required".into());
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut absent = 0;
+        let mut unknown = 0;
+        for (txid,) in recent.into_iter().take(1000) {
+            if tokio::time::Instant::now() >= deadline {
+                summary.alerts.push("PPS payout verification time budget exhausted; coverage incomplete".into());
+                break;
+            }
+            match tokio::time::timeout(Duration::from_secs(1), self.node_rpc.get_raw_transaction(&txid, 1)).await {
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) if e.is_definitely_not_found() => absent += 1,
+                _ => unknown += 1,
+            }
+        }
+        if absent > 0 {
+            summary.alerts.push(format!("PPS paid transactions not visible: {absent}; manual reorg/expiry review required, no automatic refund or resend"));
+        }
+        if unknown > 0 {
+            summary.alerts.push(format!("PPS paid transaction visibility unknown: {unknown}; no automatic action"));
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -827,6 +1011,8 @@ pub(crate) mod tests {
             // Legacy alert-only behavior for existing phantom tests; the
             // auto-void test flips this on explicitly.
             auto_void_reorged: false,
+            pps_policy: None,
+            pps_gate: None,
             shielded_coinbase: false,
         }
     }
@@ -859,12 +1045,12 @@ pub(crate) mod tests {
         let wallet = mock_rpc(HashMap::from([(
             "z_getoperationstatus",
             serde_json::json!([{"id": "opid-test1", "status": "success",
-                               "result": {"txid": "ab12cd34"}}]),
+                               "result": {"txid": "ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34"}}]),
         )]))
         .await;
         let node = mock_rpc(HashMap::from([(
             "getrawtransaction",
-            serde_json::json!({"txid": "ab12cd34", "height": 100}),
+            serde_json::json!({"txid": "ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34", "height": 100}),
         )]))
         .await;
 
@@ -884,8 +1070,9 @@ pub(crate) mod tests {
         let (db, pool) = setup_db().await;
         sqlx::query(
             "INSERT INTO payout_attempts (status, opid, txid, miner_count, total_zatoshis, source, created_at, updated_at)
-             VALUES ('sent', 'opid-test2', 'dead00beef', 1, 100000000, 'loop', datetime('now','-30 minutes'), datetime('now','-30 minutes'))",
+             VALUES ('sent', 'opid-test2', ?1, 1, 100000000, 'loop', datetime('now','-30 minutes'), datetime('now','-30 minutes'))",
         )
+        .bind("deadbeef".repeat(8))
         .execute(&pool)
         .await
         .unwrap();
@@ -898,7 +1085,7 @@ pub(crate) mod tests {
         let s = r.sweep_once().await.unwrap();
         assert_eq!(s.attempts_failed, 1);
         assert!(
-            s.alerts.iter().any(|a| a.contains("never") && a.contains("dead00beef")),
+            s.alerts.iter().any(|a| a.contains("never") && a.contains("deadbeef")),
             "alerts: {:?}",
             s.alerts
         );
@@ -911,7 +1098,7 @@ pub(crate) mod tests {
         let (db, pool) = setup_db().await;
         sqlx::query(
             "INSERT INTO payout_attempts (status, opid, txid, miner_count, total_zatoshis, source, created_at, updated_at)
-             VALUES ('sent', 'opid-t1', 'beef01', 1, 100000000, 'loop', datetime('now','-30 minutes'), datetime('now','-30 minutes'))",
+             VALUES ('sent', 'opid-t1', 'beef010000000000000000000000000000000000000000000000000000000000', 1, 100000000, 'loop', datetime('now','-30 minutes'), datetime('now','-30 minutes'))",
         )
         .execute(&pool)
         .await
@@ -932,6 +1119,131 @@ pub(crate) mod tests {
         );
     }
 
+    async fn operation_attempt(
+        reserved: bool,
+        recorded_txid: Option<&str>,
+    ) -> (PoolDb, sqlx::SqlitePool) {
+        let (db, pool) = setup_db().await;
+        sqlx::query("INSERT INTO miners (id, address) VALUES (20, 'synthetic-miner')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO balances (miner_id, pending, paid, paying) VALUES (20, 0, 0, ?1)")
+            .bind(if reserved { 50_000_000_i64 } else { 0 })
+            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO payout_attempts (id, status, opid, txid, miner_count, total_zatoshis, source, created_at, updated_at)
+             VALUES (600, 'sent', 'synthetic-opid', ?1, 1, 50000000, 'loop', datetime('now','-180 minutes'), datetime('now','-180 minutes'))",
+        ).bind(recorded_txid).execute(&pool).await.unwrap();
+        if reserved {
+            sqlx::query("INSERT INTO payout_items (attempt_id, miner_id, amount) VALUES (600, 20, 50000000)")
+                .execute(&pool).await.unwrap();
+        }
+        (db, pool)
+    }
+
+    #[tokio::test]
+    async fn recovery_accepts_single_txid_and_singleton_txids_exactly_once() {
+        let txid = "a".repeat(64);
+        for reserved in [false, true] {
+            for result in [serde_json::json!({"txid": txid}), serde_json::json!({"txids": [txid]})] {
+                let (db, pool) = operation_attempt(reserved, None).await;
+                let wallet = mock_rpc(HashMap::from([("z_getoperationstatus", serde_json::json!([
+                    {"status": "success", "result": result}
+                ]))])).await;
+                let node = mock_rpc(HashMap::from([("getrawtransaction", serde_json::json!({"height": 100}))])).await;
+                let r = reconciler(db.clone(), &node, &wallet);
+                let mut summary = SweepSummary::default();
+                for _ in 0..2 {
+                    if reserved {
+                        r.reconcile_reserved_payouts(&mut summary, None).await;
+                    } else {
+                        r.resolve_stale_attempts(&mut summary).await;
+                    }
+                }
+                assert_eq!(summary.attempts_resolved, 1);
+                let attempt: (String, String) = sqlx::query_as(
+                    "SELECT status, txid FROM payout_attempts WHERE id=600",
+                ).fetch_one(&pool).await.unwrap();
+                assert_eq!(attempt, ("confirmed".to_string(), txid.clone()));
+                if reserved {
+                    let balances: (i64, i64, i64) = sqlx::query_as(
+                        "SELECT pending, paying, paid FROM balances WHERE miner_id=20",
+                    ).fetch_one(&pool).await.unwrap();
+                    assert_eq!(balances, (0, 0, 50_000_000));
+                    let paid: i64 = sqlx::query_scalar("SELECT SUM(amount) FROM payouts")
+                        .fetch_one(&pool).await.unwrap();
+                    assert_eq!(paid, 50_000_000);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_holds_ambiguous_success_even_past_expiry() {
+        let txid = "a".repeat(64);
+        for reserved in [false, true] {
+            for result in [
+                serde_json::json!({"txids": [txid, "b".repeat(64)]}),
+                serde_json::json!({"txid": txid, "txids": ["b".repeat(64)]}),
+                serde_json::json!({"txid": "unknown"}),
+                serde_json::json!({"txids": []}),
+                serde_json::json!({}),
+            ] {
+                let (db, pool) = operation_attempt(reserved, None).await;
+                let wallet = mock_rpc(HashMap::from([("z_getoperationstatus", serde_json::json!([
+                    {"status": "success", "result": result}
+                ]))])).await;
+                let node = mock_rpc(HashMap::new()).await;
+                let r = reconciler(db.clone(), &node, &wallet);
+                let mut summary = SweepSummary::default();
+                for _ in 0..2 {
+                    if reserved {
+                        r.reconcile_reserved_payouts(&mut summary, None).await;
+                    } else {
+                        r.resolve_stale_attempts(&mut summary).await;
+                    }
+                }
+                assert_eq!(summary.attempts_resolved + summary.attempts_failed, 0);
+                assert!(summary.alerts.iter().any(|a| a.contains("ambiguous successful wallet result")));
+                let state: String = sqlx::query_scalar("SELECT status FROM payout_attempts WHERE id=600")
+                    .fetch_one(&pool).await.unwrap();
+                assert_eq!(state, "sent");
+                let balances: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT pending, paying, paid FROM balances WHERE miner_id=20",
+                ).fetch_one(&pool).await.unwrap();
+                assert_eq!(balances, (0, if reserved { 50_000_000 } else { 0 }, 0));
+                let payout_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payouts")
+                    .fetch_one(&pool).await.unwrap();
+                assert_eq!(payout_count, 0);
+                assert_eq!(db.get_reserved_attempts(None).await.unwrap().len(), usize::from(reserved));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_holds_legacy_unknown_recorded_txid() {
+        for reserved in [false, true] {
+            let (db, pool) = operation_attempt(reserved, Some("unknown")).await;
+            let wallet = mock_rpc(HashMap::new()).await;
+            let node = mock_rpc(HashMap::new()).await;
+            let r = reconciler(db.clone(), &node, &wallet);
+            let mut summary = SweepSummary::default();
+            if reserved {
+                r.reconcile_reserved_payouts(&mut summary, None).await;
+            } else {
+                r.resolve_stale_attempts(&mut summary).await;
+            }
+            assert_eq!(summary.attempts_resolved + summary.attempts_failed, 0);
+            assert!(summary.alerts.iter().any(|a| a.contains("invalid recorded transaction ID")));
+            let state: String = sqlx::query_scalar("SELECT status FROM payout_attempts WHERE id=600")
+                .fetch_one(&pool).await.unwrap();
+            assert_eq!(state, "sent");
+            let balances: (i64, i64, i64) = sqlx::query_as(
+                "SELECT pending, paying, paid FROM balances WHERE miner_id=20",
+            ).fetch_one(&pool).await.unwrap();
+            assert_eq!(balances, (0, if reserved { 50_000_000 } else { 0 }, 0));
+        }
+    }
+
     /// Audit #13 (round-3): a reservation whose txid check hits a TRANSPORT
     /// error is HELD — never refunded — even far past the expiry window.
     #[tokio::test]
@@ -943,7 +1255,7 @@ pub(crate) mod tests {
             .execute(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO payout_attempts (id, status, opid, txid, miner_count, total_zatoshis, source, created_at, updated_at)
-             VALUES (500, 'sent', 'opid-r3', 'beef02', 1, 50000000, 'loop', datetime('now','-180 minutes'), datetime('now','-180 minutes'))",
+             VALUES (500, 'sent', 'opid-r3', 'beef020000000000000000000000000000000000000000000000000000000000', 1, 50000000, 'loop', datetime('now','-180 minutes'), datetime('now','-180 minutes'))",
         )
         .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO payout_items (attempt_id, miner_id, amount) VALUES (500, 7, 50000000)")
@@ -977,7 +1289,7 @@ pub(crate) mod tests {
             .execute(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO payout_attempts (id, status, opid, txid, miner_count, total_zatoshis, source, created_at, updated_at)
-             VALUES (501, 'sent', 'opid-r4', 'beef03', 1, 60000000, 'loop', datetime('now','-180 minutes'), datetime('now','-180 minutes'))",
+             VALUES (501, 'sent', 'opid-r4', 'beef030000000000000000000000000000000000000000000000000000000000', 1, 60000000, 'loop', datetime('now','-180 minutes'), datetime('now','-180 minutes'))",
         )
         .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO payout_items (attempt_id, miner_id, amount) VALUES (501, 8, 60000000)")

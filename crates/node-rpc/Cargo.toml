@@ -6,8 +6,21 @@ edition.workspace = true
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 reqwest.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+base64 = "0.22"
+pczt = { version = "=0.9.1", features = ["signer"] }
+zcash_address = "=0.13.0"
+zcash_protocol = "=0.10.3"
+zcash_primitives = { version = "=0.30.0", default-features = false, features = ["std"] }
+transparent = { package = "zcash_transparent", version = "=0.10.0", default-features = false }
+orchard = { version = "=0.15.3", default-features = false }
+sapling = { package = "sapling-crypto", version = "=0.7.0", default-features = false }
+
+[dev-dependencies]
+rand = "0.8"
+pczt = { version = "=0.9.1", features = ["zcp-builder", "io-finalizer", "prover", "tx-extractor"] }
+zcash_primitives = { version = "=0.30.0", features = ["circuits"] }

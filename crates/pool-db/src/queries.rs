@@ -1,5 +1,5 @@
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Connection, Row, SqlitePool};
 
 use crate::models::*;
 
@@ -59,6 +59,13 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_013).execute(&self.pool).await;
         let migration_014 = include_str!("../migrations/014_shares_rollup.sql");
         let _ = sqlx::raw_sql(migration_014).execute(&self.pool).await;
+        let mut pps_migration = self.pool.begin().await?;
+        sqlx::raw_sql(include_str!("../migrations/015_pps_accounts.sql")).execute(&mut *pps_migration).await?;
+        sqlx::raw_sql(include_str!("../migrations/016_pps_funding.sql")).execute(&mut *pps_migration).await?;
+        sqlx::raw_sql(include_str!("../migrations/017_pps_conventional.sql")).execute(&mut *pps_migration).await?;
+        sqlx::raw_sql(include_str!("../migrations/018_pps_conventional_intents.sql")).execute(&mut *pps_migration).await?;
+        sqlx::raw_sql(include_str!("../migrations/019_pps_budget_extension.sql")).execute(&mut *pps_migration).await?;
+        pps_migration.commit().await?;
         Ok(())
     }
 
@@ -72,6 +79,12 @@ impl PoolDb {
             "payout_attempts", "payout_items", "block_credits",
             "orphan_clawbacks", "pool_tx_costs", "block_submissions",
             "shares_rollup", "pool_status",
+            "pps_meta", "pps_epochs", "pps_accounts", "pps_quotes", "pps_events", "pps_payout_items", "pps_payouts", "pps_block_markers", "pps_submission_markers",
+            "pps_funding_generation", "pps_funding_policy", "pps_fee_reservations",
+            "pps_conventional_attempts",
+            "pps_conventional_intents",
+            "pps_conventional_halts",
+            "pps_budget_extensions",
         ];
         for t in tables {
             let n: (i64,) = sqlx::query_as(
@@ -292,6 +305,21 @@ impl PoolDb {
         txid: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<(), DbError> {
+        // Conventional PPS receipts have typed one-way transitions. Keep their
+        // shared recovery metadata immutable through this legacy/general API.
+        // The write lock also fences a concurrent reservation marker insertion.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let conventional: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pps_conventional_attempts WHERE attempt_id=?1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if conventional != 0 {
+            return Err(DbError::Sqlx(sqlx::Error::Protocol(
+                "Conventional PPS attempt requires its typed journal API".into(),
+            )));
+        }
         sqlx::query(
             "UPDATE payout_attempts
              SET status = ?1,
@@ -306,8 +334,9 @@ impl PoolDb {
         .bind(txid)
         .bind(error_message)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -326,6 +355,8 @@ impl PoolDb {
              WHERE status IN ('queued', 'submitting', 'sent')
                AND created_at < datetime('now', '-' || ?1 || ' minutes')
                AND NOT EXISTS (SELECT 1 FROM payout_items pi WHERE pi.attempt_id = payout_attempts.id)
+               AND NOT EXISTS (SELECT 1 FROM pps_payout_items pi WHERE pi.attempt_id = payout_attempts.id)
+               AND NOT EXISTS (SELECT 1 FROM pps_conventional_attempts ca WHERE ca.attempt_id = payout_attempts.id)
              ORDER BY id ASC",
         )
         .bind(stale_minutes)
@@ -387,7 +418,7 @@ impl PoolDb {
     pub async fn get_accounting_invariant(&self) -> Result<(i64, i64, i64), DbError> {
         let reward: (i64,) = sqlx::query_as(
             "SELECT COALESCE(SUM(COALESCE(actual_reward, reward) - COALESCE(costs_recovered, 0)), 0) \
-             FROM blocks WHERE status IN ('pending', 'confirmed')",
+             FROM blocks WHERE status IN ('pending', 'confirmed') AND NOT EXISTS (SELECT 1 FROM pps_block_markers pb WHERE pb.block_id=blocks.id)",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -617,6 +648,7 @@ impl PoolDb {
         found_by: i64,
         luck_percent: Option<f64>,
     ) -> Result<i64, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             "INSERT INTO blocks (height, hash, reward, actual_reward, found_by, luck_percent) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -627,10 +659,13 @@ impl PoolDb {
         .bind(actual_reward)
         .bind(found_by)
         .bind(luck_percent)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-
-        Ok(result.last_insert_rowid())
+        let block_id = result.last_insert_rowid();
+        sqlx::query("INSERT INTO pps_block_markers(block_id,epoch_id) SELECT ?1,active_epoch FROM pps_meta WHERE singleton=1")
+            .bind(block_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(block_id)
     }
 
     /// Atomically record a block's per-miner credits AND apply them to
@@ -642,7 +677,9 @@ impl PoolDb {
         block_id: i64,
         credits: &[(i64, i64)], // (miner_id, amount_zatoshis)
     ) -> Result<(), DbError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let pps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_block_markers WHERE block_id=?1").bind(block_id).fetch_one(&mut *tx).await?;
+        if pps != 0 { return Err(DbError::Sqlx(sqlx::Error::Protocol("PPS block cannot receive legacy credits".into()))); }
         for (miner_id, amount) in credits {
             sqlx::query("INSERT OR IGNORE INTO balances (miner_id) VALUES (?1)")
                 .bind(miner_id)
@@ -706,6 +743,8 @@ impl PoolDb {
         conn: &mut sqlx::SqliteConnection,
         block_id: i64,
     ) -> Result<Option<(i64, i64)>, DbError> {
+        let pps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_block_markers WHERE block_id=?1").bind(block_id).fetch_one(&mut *conn).await?;
+        if pps != 0 { return Ok(Some((0, 0))); }
         let credits: Vec<(i64, i64)> = sqlx::query(
             "SELECT miner_id, amount FROM block_credits WHERE block_id = ?1",
         )
@@ -846,12 +885,15 @@ impl PoolDb {
     /// Record a pipeline tx cost (ZIP-317 fee the pool wallet paid for a
     /// shield or payout tx). Recovered from a future block's distribution.
     pub async fn record_tx_cost(&self, kind: &str, reference: &str, fee: i64) -> Result<(), DbError> {
+        let mut tx=self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("INSERT INTO pool_tx_costs (kind, ref, fee) VALUES (?1, ?2, ?3)")
             .bind(kind)
             .bind(reference)
             .bind(fee)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        crate::pps_funding::bump_generation(&mut tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -933,6 +975,7 @@ impl PoolDb {
         reward: i64,
         actual_reward: Option<i64>,
     ) -> Result<i64, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let r = sqlx::query(
             "INSERT INTO block_submissions (height, hash, worker_id, reward, actual_reward) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -942,9 +985,13 @@ impl PoolDb {
         .bind(worker_id)
         .bind(reward)
         .bind(actual_reward)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(r.last_insert_rowid())
+        let submission_id = r.last_insert_rowid();
+        sqlx::query("INSERT INTO pps_submission_markers(submission_id,epoch_id) SELECT ?1,active_epoch FROM pps_meta WHERE singleton=1")
+            .bind(submission_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(submission_id)
     }
 
     /// Settle a breadcrumb once the block's fate is known.
@@ -994,6 +1041,7 @@ impl PoolDb {
              WHERE b.status IN ('pending', 'confirmed') \
                AND b.created_at > datetime('now', '-' || ?1 || ' days') \
                AND NOT EXISTS (SELECT 1 FROM block_credits bc WHERE bc.block_id = b.id) \
+               AND NOT EXISTS (SELECT 1 FROM pps_block_markers pb WHERE pb.block_id = b.id) \
              ORDER BY b.id ASC",
         )
         .bind(days)
@@ -1414,6 +1462,7 @@ impl PoolDb {
         .execute(&mut *tx)
         .await?;
 
+        crate::pps_funding::bump_generation(&mut tx).await?;
         tx.commit().await?;
         Ok(result.last_insert_rowid())
     }
@@ -1433,20 +1482,10 @@ impl PoolDb {
     /// Returns (rows_voided, zatoshis_returned_to_pending).
     pub async fn void_reorged_payout(&self, txid: &str) -> Result<(i64, i64), DbError> {
         let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        match Self::void_reorged_payout_txn(&mut *conn, txid).await {
-            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-                Ok(_) => Ok(v),
-                Err(e) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(e.into())
-                }
-            },
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let result = Self::void_reorged_payout_txn(&mut tx, txid).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn void_reorged_payout_txn(
@@ -1498,11 +1537,13 @@ impl PoolDb {
         sqlx::query(
             "UPDATE payout_attempts SET status = 'failed', updated_at = datetime('now'), \
              error_message = 'auto-void: tx reorged out and expired (-5); funds returned to pending' \
-             WHERE txid = ?1 AND status = 'confirmed'",
+             WHERE txid = ?1 AND status = 'confirmed' AND NOT EXISTS \
+             (SELECT 1 FROM pps_conventional_attempts ca WHERE ca.attempt_id=payout_attempts.id)",
         )
         .bind(txid)
         .execute(&mut *conn)
         .await?;
+        crate::pps_funding::bump_generation(conn).await?;
         Ok((rows.len() as i64, zats))
     }
 
@@ -1526,20 +1567,10 @@ impl PoolDb {
         items: &[(i64, i64)],
     ) -> Result<Vec<(i64, i64)>, DbError> {
         let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        match Self::reserve_payout_txn(&mut *conn, attempt_id, items).await {
-            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-                Ok(_) => Ok(v),
-                Err(e) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(e.into())
-                }
-            },
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let result = Self::reserve_payout_txn(&mut tx, attempt_id, items).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn reserve_payout_txn(
@@ -1547,6 +1578,8 @@ impl PoolDb {
         attempt_id: i64,
         items: &[(i64, i64)],
     ) -> Result<Vec<(i64, i64)>, DbError> {
+        let pps:i64=sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM pps_payout_items WHERE attempt_id=?1)+(SELECT COUNT(*) FROM pps_payouts WHERE attempt_id=?1)+(SELECT COUNT(*) FROM pps_conventional_attempts WHERE attempt_id=?1)").bind(attempt_id).fetch_one(&mut *conn).await?;
+        if pps!=0{return Err(DbError::Sqlx(sqlx::Error::Protocol("PPS attempt cannot enter legacy payout saga".into())))}
         let mut reserved: Vec<(i64, i64)> = Vec::new();
         for &(miner_id, amount) in items {
             if amount <= 0 {
@@ -1575,6 +1608,7 @@ impl PoolDb {
             .await?;
             reserved.push((miner_id, amount));
         }
+        if !reserved.is_empty() { crate::pps_funding::bump_generation(conn).await?; }
         Ok(reserved)
     }
 
@@ -1584,20 +1618,10 @@ impl PoolDb {
     /// Returns the number of items finalized. One BEGIN IMMEDIATE tx.
     pub async fn confirm_payout(&self, attempt_id: i64, txid: &str) -> Result<i64, DbError> {
         let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        match Self::confirm_payout_txn(&mut *conn, attempt_id, txid).await {
-            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-                Ok(_) => Ok(v),
-                Err(e) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(e.into())
-                }
-            },
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let result = Self::confirm_payout_txn(&mut tx, attempt_id, txid).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn confirm_payout_txn(
@@ -1605,6 +1629,8 @@ impl PoolDb {
         attempt_id: i64,
         txid: &str,
     ) -> Result<i64, DbError> {
+        let pps:i64=sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM pps_payout_items WHERE attempt_id=?1)+(SELECT COUNT(*) FROM pps_payouts WHERE attempt_id=?1)+(SELECT COUNT(*) FROM pps_conventional_attempts WHERE attempt_id=?1)").bind(attempt_id).fetch_one(&mut *conn).await?;
+        if pps!=0{return Err(DbError::Sqlx(sqlx::Error::Protocol("PPS attempt cannot enter legacy payout saga".into())))}
         let items: Vec<(i64, i64)> = sqlx::query(
             "SELECT miner_id, amount FROM payout_items WHERE attempt_id = ?1",
         )
@@ -1650,6 +1676,7 @@ impl PoolDb {
             .bind(attempt_id)
             .execute(&mut *conn)
             .await?;
+        if finalized != 0 { crate::pps_funding::bump_generation(conn).await?; }
         Ok(finalized)
     }
 
@@ -1659,26 +1686,18 @@ impl PoolDb {
     /// Returns the number of items refunded. One BEGIN IMMEDIATE tx.
     pub async fn refund_payout(&self, attempt_id: i64) -> Result<i64, DbError> {
         let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        match Self::refund_payout_txn(&mut *conn, attempt_id).await {
-            Ok(v) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-                Ok(_) => Ok(v),
-                Err(e) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(e.into())
-                }
-            },
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let result = Self::refund_payout_txn(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn refund_payout_txn(
         conn: &mut sqlx::SqliteConnection,
         attempt_id: i64,
     ) -> Result<i64, DbError> {
+        let pps:i64=sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM pps_payout_items WHERE attempt_id=?1)+(SELECT COUNT(*) FROM pps_payouts WHERE attempt_id=?1)+(SELECT COUNT(*) FROM pps_conventional_attempts WHERE attempt_id=?1)").bind(attempt_id).fetch_one(&mut *conn).await?;
+        if pps!=0{return Err(DbError::Sqlx(sqlx::Error::Protocol("PPS attempt cannot enter legacy payout saga".into())))}
         let items: Vec<(i64, i64)> = sqlx::query(
             "SELECT miner_id, amount FROM payout_items WHERE attempt_id = ?1",
         )
@@ -1715,6 +1734,7 @@ impl PoolDb {
             .bind(attempt_id)
             .execute(&mut *conn)
             .await?;
+        if refunded != 0 { crate::pps_funding::bump_generation(conn).await?; }
         Ok(refunded)
     }
 
@@ -1730,11 +1750,12 @@ impl PoolDb {
         let base = "SELECT pa.id, pa.status, pa.opid, pa.txid, pa.created_at, \
                     COALESCE(SUM(pi.amount), 0) AS total \
              FROM payout_attempts pa \
-             JOIN payout_items pi ON pi.attempt_id = pa.id ";
+             JOIN payout_items pi ON pi.attempt_id = pa.id \
+             WHERE NOT EXISTS (SELECT 1 FROM pps_conventional_attempts ca WHERE ca.attempt_id=pa.id) ";
         let rows: Vec<SqliteRow> = match older_than_minutes {
             Some(mins) => {
                 sqlx::query(&format!(
-                    "{base} WHERE pa.created_at < datetime('now', '-' || ?1 || ' minutes') \
+                    "{base} AND pa.created_at < datetime('now', '-' || ?1 || ' minutes') \
                      GROUP BY pa.id, pa.status, pa.opid, pa.txid, pa.created_at ORDER BY pa.id ASC"
                 ))
                 .bind(mins)

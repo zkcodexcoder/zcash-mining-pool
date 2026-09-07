@@ -8,6 +8,8 @@ use tracing::info;
 pub enum RewardMode {
     Pplns,
     Solo,
+    /// Per-share accounting lives in the separate PPS ledger, never here.
+    Pps,
 }
 
 /// Reward calculator. Routes to PPLNS or Solo distribution based on `mode`.
@@ -56,6 +58,11 @@ impl PplnsCalculator {
         block_id: i64,
         found_by_worker_id: i64,
     ) -> Result<Vec<PplnsReward>, RewardError> {
+        if self.mode == RewardMode::Pps {
+            // PPS block revenue belongs to treasury. In particular, do not
+            // recover costs or distribute the block through legacy balances.
+            return Ok(Vec::new());
+        }
         // Recover the pool's own tx costs (shielding + payout ZIP-317 fees)
         // from this block's distribution before splitting. Capped at 2% of
         // the block reward per block so a backlog of queued costs can never

@@ -13,6 +13,8 @@ use tracing_subscriber::EnvFilter;
 use node_rpc::ZcashRpcClient;
 use pool_core::{BlockAssembler, JobManager, ShareValidator, VardiffConfig};
 use pool_db::PoolDb;
+use pool_db::pps_policy::PpsPolicy;
+use pool_core::pps_funding::PpsFundingRoute;
 use rewards::{PplnsCalculator, RewardMode};
 use stratum::StratumServer;
 
@@ -24,6 +26,8 @@ struct Config {
     node: NodeConfig,
     difficulty: DifficultyConfig,
     pplns: PplnsConfig,
+    pps: Option<PpsPolicy>,
+    pps_funding: Option<PpsFundingRoute>,
     #[serde(default)]
     payout: PayoutConfig,
     api: ApiConfig,
@@ -153,13 +157,66 @@ fn default_longpoll_timeout_secs() -> u64 {
 #[derive(Debug, Deserialize)]
 struct PplnsConfig {
     window_multiplier: f64,
-    /// Reward distribution mode. "pplns" (default) or "solo".
-    #[serde(default = "default_reward_mode")]
-    mode: String,
+    /// Unknown modes are rejected; PPS additionally requires bounded policy.
+    #[serde(default = "default_reward_mode", deserialize_with = "deserialize_reward_mode")]
+    mode: RewardMode,
 }
 
-fn default_reward_mode() -> String {
-    "pplns".to_string()
+fn default_reward_mode() -> RewardMode {
+    RewardMode::Pplns
+}
+
+fn deserialize_reward_mode<'de, D>(deserializer: D) -> std::result::Result<RewardMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mode = String::deserialize(deserializer)?;
+    if mode.eq_ignore_ascii_case("pplns") {
+        Ok(RewardMode::Pplns)
+    } else if mode.eq_ignore_ascii_case("solo") {
+        Ok(RewardMode::Solo)
+    } else if mode.eq_ignore_ascii_case("pps") {
+        Ok(RewardMode::Pps)
+    } else {
+        // Fail while parsing configuration, before opening the database or
+        // starting services. Never silently turn a PPS request into PPLNS.
+        Err(serde::de::Error::custom(
+            "unsupported [pplns].mode: expected pplns, solo or pps",
+        ))
+    }
+}
+
+fn validate_pps_config(mode: RewardMode, policy: Option<&PpsPolicy>, network: &str) -> Result<()> {
+    match (mode == RewardMode::Pps, policy) {
+        (true, Some(p)) => {
+            p.validate(network).map_err(anyhow::Error::msg)?;
+        }
+        (true, None) => anyhow::bail!("PPS mode requires explicit [pps] bounded policy"),
+        (false, Some(_)) => anyhow::bail!("[pps] policy requires explicit [pplns].mode=pps"),
+        (false, None) => {},
+    }
+    Ok(())
+}
+
+fn validate_pps_legacy_reserve(policy: &PpsPolicy, reserve: Option<f64>) -> Result<()> {
+    // The legacy dashboard's established missing-field default is zero. Ceil
+    // rather than truncate makes this comparison conservative at its f64
+    // boundary; the new authoritative PPS floor remains exact integer zats.
+    let legacy = reserve.unwrap_or(0.0) * 100_000_000.0;
+    anyhow::ensure!(legacy.is_finite() && legacy >= 0.0
+        && legacy.ceil() <= policy.reserve_min_zatoshis as f64,
+        "PPS reserve floor must preserve the existing legacy payout reserve");
+    Ok(())
+}
+
+fn validate_pps_funding_route(policy: Option<&PpsPolicy>, configured: Option<PpsFundingRoute>)
+    -> Result<PpsFundingRoute>
+{
+    anyhow::ensure!(policy.is_some() || configured.is_none(),
+        "PPS funding route requires an explicit PPS policy");
+    let route = configured.unwrap_or_default();
+    if let Some(policy) = policy { route.validate(&policy.epoch_config())?; }
+    Ok(route)
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +234,10 @@ struct PayoutConfig {
     wallet_rpc_user: Option<String>,
     #[serde(default)]
     wallet_rpc_password: Option<String>,
+    // Existing legacy dashboard reserve, in ZEC. Read here solely to prevent
+    // a new immutable PPS reserve floor from reducing the prior protection.
+    #[serde(default)]
+    reserve_min: Option<f64>,
     #[serde(default = "default_minimum_payout")]
     minimum_payout: f64,
     #[serde(default = "default_payout_interval")]
@@ -198,6 +259,7 @@ impl Default for PayoutConfig {
             wallet_rpc_url: None,
             wallet_rpc_user: None,
             wallet_rpc_password: None,
+            reserve_min: None,
             minimum_payout: default_minimum_payout(),
             interval_secs: default_payout_interval(),
             maturity_confirmations: default_maturity(),
@@ -234,6 +296,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to read config file: {config_path}"))?;
     let config: Config = toml::from_str(&config_str)
         .with_context(|| "Failed to parse config file")?;
+    validate_pps_config(config.pplns.mode, config.pps.as_ref(), &config.pool.network)?;
+    let funding_route = validate_pps_funding_route(config.pps.as_ref(), config.pps_funding)?;
 
     let stratum_addrs = config.stratum.addrs();
     info!(
@@ -257,7 +321,9 @@ async fn main() -> Result<()> {
         .with_context(|| "Invalid database url")?;
     let db_opts = db_opts
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .synchronous(if config.pps.is_some() {
+            sqlx::sqlite::SqliteSynchronous::Full
+        } else { sqlx::sqlite::SqliteSynchronous::Normal })
         .busy_timeout(std::time::Duration::from_secs(20));
     let db_pool = SqlitePoolOptions::new()
         .max_connections(10)
@@ -278,6 +344,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "Failed to enable WAL mode")?;
     info!("Database initialized (WAL mode)");
+    db.assert_reward_mode(config.pps.is_some()).await?;
 
     // Backfill luck_percent for any blocks that don't have it yet.
     // This runs once at startup using the current network hashrate as an approximation.
@@ -387,6 +454,9 @@ async fn main() -> Result<()> {
             pool_core::difficulty::difficulty_to_target_hex(initial_difficulty),
         ),
     );
+    if config.pps.is_some() {
+        stratum.set_fixed_share_target(stratum::FixedShareTarget::new(pool_target)?)?;
+    }
     let stratum = Arc::new(stratum);
 
     // Stall detection: last time we got a block template (unix ms)
@@ -427,14 +497,7 @@ async fn main() -> Result<()> {
 
     // Initialize reward calculator (PPLNS or Solo).
     let pplns_window = (config.pplns.window_multiplier * 1000.0) as i64;
-    let reward_mode = match config.pplns.mode.to_lowercase().as_str() {
-        "solo" => RewardMode::Solo,
-        "pplns" => RewardMode::Pplns,
-        other => {
-            tracing::warn!(mode = other, "Unknown [pplns] mode, defaulting to pplns");
-            RewardMode::Pplns
-        }
-    };
+    let reward_mode = config.pplns.mode;
     tracing::info!(?reward_mode, pplns_window, fee_percent = config.pool.fee_percent, "Reward calculator initialized");
     let pplns = Arc::new(PplnsCalculator::new(
         db.clone(),
@@ -484,6 +547,34 @@ async fn main() -> Result<()> {
         Arc::clone(&rejects_duplicate),
         Arc::clone(&rejects_other),
     );
+    let share_validator = if let Some(policy) = &config.pps {
+        validate_pps_legacy_reserve(policy, config.payout.reserve_min)?;
+        let network = policy.network.parse().map_err(|_| anyhow::anyhow!("invalid PPS network"))?;
+        let chain_lease = pool_core::pps_chain::verify_pps_chain(&rpc, network).await?;
+        // Never infer that the mining node also owns spendable wallet funds.
+        // PPS needs its explicit existing wallet RPC endpoint; no wallet write
+        // or automatic funding transfer is performed by this read-only gate.
+        let wallet_url = config.payout.wallet_rpc_url.as_deref()
+            .context("PPS requires explicit payout wallet RPC")?;
+        let wallet_rpc = Arc::new(match (&config.payout.wallet_rpc_user, &config.payout.wallet_rpc_password) {
+            (Some(user), Some(password)) => ZcashRpcClient::with_auth(wallet_url, user, password),
+            (None, None) => ZcashRpcClient::new(wallet_url),
+            _ => anyhow::bail!("PPS wallet authentication configuration incomplete"),
+        });
+        let epoch = policy.epoch_config();
+        let payout_source = config.payout.pool_address.clone()
+            .context("PPS requires explicit existing shielded payout source")?;
+        let funding_lease = pool_core::pps_funding::collect_pps_credit_funding_for_route(&db, &wallet_rpc, &epoch, &payout_source, &rpc, &funding_route).await?;
+        let validator = share_validator.with_pps(pool_core::share::PpsRuntime {
+            epoch: epoch.clone(), chain_lease, funding_lease: funding_lease.clone(), wallet_rpc, payout_source, funding_route,
+        }).map_err(anyhow::Error::msg)?;
+        // Activate the durable mode boundary only after fixed target, runtime
+        // configuration, independent chain proof and fresh funding have passed.
+        // Activation rechecks funding under its own SQLite write lock.
+        db.initialize_pps_epoch(&epoch, Some(&funding_lease)).await?;
+        db.pps_invariant().await?;
+        validator
+    } else { share_validator };
 
     // Audit #15: settle any block whose fate a previous crash left unknown,
     // and redistribute recent blocks whose distribution was swallowed —
@@ -628,4 +719,85 @@ async fn main() -> Result<()> {
 
     info!("Pool shut down gracefully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PplnsConfig, RewardMode, PpsPolicy, PpsFundingRoute, validate_pps_config,
+        validate_pps_legacy_reserve, validate_pps_funding_route};
+
+    #[test]
+    fn testnet_funding_route_is_opt_in_and_cannot_cross_into_mainnet_or_legacy() {
+        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends: true };
+        assert!(validate_pps_funding_route(None, Some(route)).is_err());
+        assert_eq!(validate_pps_funding_route(None,None).unwrap(), PpsFundingRoute::ZalletPczt);
+        let mut policy = PpsPolicy { network:"testnet".into(), epoch:"testnet-canary".into(),
+            fee_bps:100, max_liability_zatoshis:95_000_000_000, total_exposure_zatoshis:100_000_000_000,
+            fee_allowance_zatoshis:5_000_000_000, reserve_min_zatoshis:1, max_payout_zatoshis:1_000_000 };
+        assert_eq!(validate_pps_funding_route(Some(&policy), Some(route)).unwrap(), route);
+        assert_eq!(policy.fee_bps,100); // The route never rewrites the existing pool fee.
+        policy.network="mainnet".into();
+        assert!(validate_pps_funding_route(Some(&policy),Some(route)).is_err());
+        assert_eq!(validate_pps_funding_route(Some(&policy),None).unwrap(),PpsFundingRoute::ZalletPczt);
+        policy.network="testnet".into(); policy.max_liability_zatoshis+=1;
+        assert!(validate_pps_funding_route(Some(&policy),Some(route)).is_err());
+    }
+
+    fn parse_mode(mode: &str) -> Result<PplnsConfig, toml::de::Error> {
+        toml::from_str(&format!("window_multiplier = 2.0\nmode = {mode:?}\n"))
+    }
+
+    #[test]
+    fn omitted_reward_mode_keeps_the_pplns_default() {
+        let config: PplnsConfig = toml::from_str("window_multiplier = 2.0\n").unwrap();
+        assert_eq!(config.mode, RewardMode::Pplns);
+    }
+
+    #[test]
+    fn implemented_reward_modes_remain_case_insensitive() {
+        for mode in ["pplns", "PPLNS", "PpLnS"] {
+            assert_eq!(parse_mode(mode).unwrap().mode, RewardMode::Pplns);
+        }
+        for mode in ["solo", "SOLO", "SoLo"] {
+            assert_eq!(parse_mode(mode).unwrap().mode, RewardMode::Solo);
+        }
+        for mode in ["pps", "PPS"] {
+            assert_eq!(parse_mode(mode).unwrap().mode, RewardMode::Pps);
+        }
+    }
+
+    #[test]
+    fn unsupported_pps_modes_and_typos_fail_during_config_parsing() {
+        for mode in ["pps-shadow", "fpps", "ppln", "sol", "", " pplns", "solo "] {
+            let error = parse_mode(mode).unwrap_err();
+            assert!(error.message().contains("unsupported [pplns].mode"));
+        }
+    }
+
+    #[test]
+    fn non_string_reward_modes_are_rejected() {
+        for value in ["1", "true", "[]", "{}"] {
+            assert!(toml::from_str::<PplnsConfig>(&format!(
+                "window_multiplier = 2.0\nmode = {value}\n",
+            )).is_err());
+        }
+    }
+
+    #[test]
+    fn pps_mode_without_explicit_policy_fails_before_startup() {
+        assert!(validate_pps_config(RewardMode::Pps, None, "testnet").is_err());
+        assert!(validate_pps_config(RewardMode::Pplns, None, "testnet").is_ok());
+        let policy = PpsPolicy { network: "testnet".into(), epoch: "canary-1".into(),
+            fee_bps: 100, max_liability_zatoshis: 100_000_000, reserve_min_zatoshis: 10_000_000,
+            total_exposure_zatoshis: 110_000_000, fee_allowance_zatoshis: 10_000_000,
+            max_payout_zatoshis: 20_000_000 };
+        assert!(validate_pps_config(RewardMode::Pplns, Some(&policy), "testnet").is_err());
+        assert!(validate_pps_config(RewardMode::Pps, Some(&policy), "mainnet").is_err());
+        assert!(validate_pps_config(RewardMode::Pps, Some(&policy), "testnet").is_ok());
+        assert!(validate_pps_legacy_reserve(&policy,None).is_ok());
+        assert!(validate_pps_legacy_reserve(&policy,Some(0.1)).is_ok());
+        for bad in [0.10000001, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(validate_pps_legacy_reserve(&policy,Some(bad)).is_err());
+        }
+    }
 }

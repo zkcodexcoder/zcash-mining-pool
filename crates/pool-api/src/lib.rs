@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod credit_health;
 pub mod diagnostics;
 pub mod handlers;
 pub mod lwd_tip;

@@ -3,6 +3,10 @@ pub mod coinbase;
 pub mod difficulty;
 pub mod job;
 pub mod lag;
+pub mod pps_chain;
+pub mod pps_credit_health;
+pub mod pps_economics;
+pub mod pps_funding;
 pub mod share;
 
 pub use block::BlockAssembler;

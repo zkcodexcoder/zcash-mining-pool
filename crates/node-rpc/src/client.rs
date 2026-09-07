@@ -43,6 +43,17 @@ pub struct ZcashRpcClient {
 }
 
 impl ZcashRpcClient {
+    /// Construct a client with an explicitly bounded transport. This permits
+    /// owner-run read-only probes to disable redirects/proxies without changing
+    /// the established runtime defaults used by `new` and `with_auth`.
+    pub fn with_transport(
+        url: &str,
+        auth: Option<(String, String)>,
+        http: reqwest::Client,
+    ) -> Self {
+        Self { http, url: url.to_string(), auth, next_id: AtomicU64::new(1) }
+    }
+
     fn default_http_client() -> reqwest::Client {
         reqwest::Client::builder()
             .timeout(RPC_TIMEOUT)
@@ -75,6 +86,138 @@ impl ZcashRpcClient {
         params: serde_json::Value,
     ) -> Result<T, RpcError> {
         self.call(method, params).await
+    }
+
+    /// Isolated zecd funding reads only. Unlike legacy call_raw this bounds
+    /// the streamed body before parsing and never retains remote error text.
+    /// No existing RPC caller or mainnet wallet path uses this helper.
+    pub(crate) async fn zecd_funding_read(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::zecd_funding::ZecdFundingError> {
+        use crate::zecd_funding::ZecdFundingError as E;
+        let limit = match method {
+            "listunspent" => crate::zecd_funding::MAX_RPC_BODY_BYTES,
+            "getnetworkinfo" | "getwalletinfo" | "getblockchaininfo" | "getaddressinfo"
+            | "getbalance" | "getblockcount" | "getblockhash" => 128 * 1024,
+            _ => return Err(E::InvalidEvidence),
+        };
+        self.zecd_bounded_rpc(method, params, limit, false).await
+    }
+
+    /// Isolated conventional testnet payout transport. This is deliberately
+    /// separate from the funding read allowlist: z_sendmany is a wallet write
+    /// and must only follow the typed durable reservation and one-shot seal.
+    /// It sends exactly once, never redirects/retries, and suppresses remote
+    /// error content. Mainnet and existing generic RPC callers are unchanged.
+    pub async fn zecd_conventional_rpc(
+        &self, method: &'static str, params: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::zecd_funding::ZecdFundingError> {
+        if !matches!(method, "z_sendmany" | "z_getoperationstatus" | "getrawtransaction"
+            | "getblock" | "getblockhash" | "gettransaction" | "getwalletinfo")
+        { return Err(crate::zecd_funding::ZecdFundingError::InvalidEvidence); }
+        self.zecd_bounded_rpc(method, params, crate::zecd_funding::MAX_RPC_BODY_BYTES, false).await
+    }
+
+    pub(crate) async fn zecd_signer_read(
+        &self, method: &'static str, params: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::zecd_funding::ZecdFundingError> {
+        if !matches!(method, "z_getoperationstatus" | "getrawtransaction" | "getblock" | "getblockhash" | "gettransaction") {
+            return Err(crate::zecd_funding::ZecdFundingError::InvalidEvidence);
+        }
+        self.zecd_bounded_rpc(method, params, crate::zecd_funding::MAX_RPC_BODY_BYTES, false).await
+    }
+
+    /// Bounded signer-receipt discovery only. None means an explicit -5 error
+    /// for this exact raw lookup, never a transport failure or unconfirmed tx.
+    /// Actor probes and all ordinary RPC error semantics remain separate.
+    pub(crate) async fn zecd_signer_raw_lookup(
+        &self, txid: &str,
+    ) -> Result<Option<serde_json::Value>, crate::zecd_funding::ZecdFundingError> {
+        if txid.len()!=64 || !txid.bytes().all(|b|b.is_ascii_hexdigit()) {
+            return Err(crate::zecd_funding::ZecdFundingError::InvalidEvidence);
+        }
+        self.zecd_bounded_rpc_outcome("getrawtransaction", serde_json::json!([txid,1]),
+            crate::zecd_funding::MAX_RPC_BODY_BYTES, false, true).await
+    }
+
+    /// A fixed absent-tx lookup bypasses the read-side cache and reaches the
+    /// wallet actor in pinned zecd. Only -5 is the successful missing response;
+    /// a dead actor (-1), missing RPC, upstream error or unexpected result fails.
+    pub(crate) async fn zecd_actor_live(&self) -> Result<(), crate::zecd_funding::ZecdFundingError> {
+        use crate::zecd_funding::ZecdFundingError as E;
+        match self.zecd_bounded_rpc("getrawtransaction",
+            serde_json::json!(["0".repeat(64), 0]), 128 * 1024, true).await
+        {
+            Err(E::ActorProbeMissing) => Ok(()),
+            _ => Err(E::NotReady),
+        }
+    }
+
+    async fn zecd_bounded_rpc(
+        &self, method: &'static str, params: serde_json::Value, limit: usize, actor_probe: bool,
+    ) -> Result<serde_json::Value, crate::zecd_funding::ZecdFundingError> {
+        self.zecd_bounded_rpc_outcome(method, params, limit, actor_probe, false).await?
+            .ok_or(crate::zecd_funding::ZecdFundingError::InvalidEvidence)
+    }
+
+    async fn zecd_bounded_rpc_outcome(
+        &self, method: &'static str, params: serde_json::Value, limit: usize,
+        actor_probe: bool, raw_absence: bool,
+    ) -> Result<Option<serde_json::Value>, crate::zecd_funding::ZecdFundingError> {
+        use crate::zecd_funding::ZecdFundingError as E;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = JsonRpcRequest { jsonrpc: "2.0", id, method, params };
+        // Keep this isolated path on the exact configured URL: no proxy
+        // environment or HTTP redirect may send wallet-source data elsewhere.
+        // Existing caller transports and all legacy/mainnet RPCs are unchanged.
+        let http = reqwest::Client::builder().no_proxy()
+            .redirect(reqwest::redirect::Policy::none()).timeout(RPC_TIMEOUT)
+            .build().map_err(|_| E::Unavailable)?;
+        let mut req = http.post(&self.url).json(&request).timeout(RPC_TIMEOUT);
+        if let Some((user, pass)) = &self.auth { req = req.basic_auth(user, Some(pass)); }
+        let mut response = req.send().await.map_err(|_| E::Unavailable)?;
+        let http_success = response.status().is_success();
+        // Pinned zecd follows Bitcoin Core: a single JSON-RPC error uses HTTP
+        // 500. Parse only that bounded error envelope, never treat a 500 result
+        // as success. Redirects, authentication and all other statuses reject.
+        if !http_success && response.status() != reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+            return Err(E::Unavailable);
+        }
+        if response.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(E::ResponseTooLarge);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| E::Unavailable)? {
+            if chunk.len() > limit.saturating_sub(body.len()) { return Err(E::ResponseTooLarge); }
+            body.extend_from_slice(&chunk);
+        }
+        let envelope: serde_json::Value = serde_json::from_slice(&body).map_err(|_| E::InvalidEvidence)?;
+        if !envelope.is_object() || envelope.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+            return Err(E::InvalidEvidence);
+        }
+        if let Some(error) = envelope.get("error").filter(|v| !v.is_null()) {
+            // JSON-RPC 2 permits an error response to omit result. Only this
+            // fixed discovery lookup admits absent-or-null result with -5;
+            // no other method or error gains that interpretation.
+            if raw_absence && error.is_object()
+                && error.get("code").and_then(serde_json::Value::as_i64)==Some(-5)
+                && error.get("message").and_then(serde_json::Value::as_str).is_some()
+                && envelope.get("result").is_none_or(serde_json::Value::is_null)
+            { return Ok(None); }
+            if envelope.get("result") != Some(&serde_json::Value::Null) {
+                return Err(E::InvalidEvidence);
+            }
+            if actor_probe && error.get("code").and_then(serde_json::Value::as_i64) == Some(-5) {
+                return Err(E::ActorProbeMissing);
+            }
+            return Err(if error.get("code").and_then(serde_json::Value::as_i64) == Some(-32601) {
+                E::UnsupportedRpc
+            } else { E::Unavailable });
+        }
+        if !http_success { return Err(E::Unavailable); }
+        envelope.get("result").filter(|v| !v.is_null()).cloned().map(Some).ok_or(E::InvalidEvidence)
     }
 
     async fn call<T: serde::de::DeserializeOwned>(

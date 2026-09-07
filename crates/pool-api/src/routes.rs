@@ -95,7 +95,9 @@ async fn dashboard(State(state): State<AppState>) -> Html<String> {
         DASHBOARD_HTML
             .replace("__INITIAL_COIN__", coin)
             .replace("__INITIAL_EXPLORER__", explorer)
-            .replace("__PAYOUT_SCHEME__", &state.payout_scheme),
+            .replace("__PAYOUT_SCHEME__", &state.payout_scheme)
+            .replace("__PPS_ENABLED__", if state.pps_enabled { "true" } else { "false" })
+            .replace("__PPS_CREDIT_HEALTH_JS__", crate::credit_health::SCRIPT),
     )
 }
 
@@ -831,12 +833,29 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <span>Last Template</span>
         <span id="sf-template-text" style="color:#666">--</span>
     </div>
+    <div class="sf-item" id="sf-pps-credit" style="display:none" title="Sampled credit gates, independent of payout cycles; not a guarantee of acceptance for a particular share.">
+        <span class="sf-dot" id="sf-pps-credit-dot"></span>
+        <span>PPS Credits</span>
+        <span id="sf-pps-credit-text">Unknown</span>
+    </div>
     <div style="margin-left:auto" class="sf-item">
         <span id="sf-uptime">--</span>
     </div>
 </div>
 
 <script>
+__PPS_CREDIT_HEALTH_JS__
+const PPS_ENABLED = __PPS_ENABLED__;
+let ppsCreditHealth = null;
+function renderPpsCreditHealth() {
+    document.getElementById('sf-pps-credit').style.display = PPS_ENABLED ? '' : 'none';
+    const view = ppsCreditView(ppsCreditHealth);
+    document.getElementById('sf-pps-credit-text').textContent = view.label + (view.warning ? ' — budget below 20%' : '');
+    document.getElementById('sf-pps-credit-dot').style.background = view.state === 'ready' && !view.warning ? '#48bb78' : view.state === 'paused' ? '#fc8181' : '#ecc94b';
+    document.getElementById('sf-pps-credit-text').title = view.category + '. Funding evidence: ' + view.funding + (view.warning ? '. credit_budget_low' : '');
+}
+renderPpsCreditHealth();
+setInterval(renderPpsCreditHealth, 1000);
 const MAX_HISTORY = 360;
 const REFRESH_STATS = 10000;
 const REFRESH_MINERS = 10000;
@@ -1015,6 +1034,8 @@ async function fetchStats() {
     try {
         const resp = await fetch('/api/pool/stats');
         const d = await resp.json();
+        ppsCreditHealth = resp.ok ? d.pps_credit_health : null;
+        renderPpsCreditHealth();
         const now = Date.now();
 
         document.getElementById('pool-name').textContent = d.name.toUpperCase();
@@ -1141,6 +1162,8 @@ async function fetchStats() {
         updateCharts();
     } catch (e) {
         console.error('Failed to fetch stats:', e);
+        ppsCreditHealth = null;
+        renderPpsCreditHealth();
     }
 }
 

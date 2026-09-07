@@ -608,8 +608,10 @@ async fn handle_logout() -> Response {
         .into_response()
 }
 
-async fn admin_dashboard() -> Html<&'static str> {
-    Html(ADMIN_DASHBOARD_HTML)
+async fn admin_dashboard(State(state): State<AdminState>) -> Html<String> {
+    Html(ADMIN_DASHBOARD_HTML
+        .replace("__PPS_CREDIT_HEALTH_JS__", crate::credit_health::SCRIPT)
+        .replace("__PPS_ENABLED__", if state.app.pps_enabled { "true" } else { "false" }))
 }
 
 async fn api_config(State(state): State<AdminState>) -> Json<PoolConfigView> {
@@ -732,6 +734,7 @@ struct AdminHealth {
     rejects_other: u64,
     system: Option<SystemStats>,
     payout_health: Option<serde_json::Value>,
+    pps_credit_health: Option<pool_core::pps_credit_health::PpsCreditHealth>,
     /// Curated set of zebrad prometheus metrics.
     zebra: crate::zebra_metrics::ZebraMetrics,
     /// Authoritative chain tip from a fan-out across public lwd servers.
@@ -860,6 +863,7 @@ async fn api_health(
     let payout_health = state.app.db.get_pool_status("payout_health").await
         .ok().flatten()
         .and_then(|(v, _)| serde_json::from_str::<serde_json::Value>(&v).ok());
+    let pps_credit_health = crate::credit_health::read(&state.app.db, state.app.pps_enabled).await;
 
     // Pool-side lag stats (written by zcash-pool every 5 s into pool_status).
     let template_lag = state.app.db.get_pool_status("template_lag_stats").await
@@ -921,6 +925,7 @@ async fn api_health(
         rejects_other: rej_other,
         system,
         payout_health,
+        pps_credit_health,
         zebra,
         authoritative_tip,
         template_lag,
@@ -1453,6 +1458,13 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
         <h2>Payout Pipeline</h2>
         <div id="payout-health-content" style="color:#718096;font-size:0.85rem">Loading...</div>
     </div>
+    <div class="card" id="pps-credit-card" style="display:none">
+        <h2>PPS Credit Admission</h2>
+        <p style="color:#718096;font-size:0.85rem">Sampled credit gates, independent of the payout cycle. Readiness does not guarantee acceptance of a particular share.</p>
+        <div id="pps-credit-state"></div>
+        <div id="pps-credit-category" style="color:#718096;font-size:0.85rem"></div>
+        <div id="pps-credit-detail" style="color:#718096;font-size:0.85rem"></div>
+    </div>
     <div class="card">
         <h2>Zallet (Wallet)</h2>
         <div style="display:flex;gap:0.5rem;margin-bottom:0.75rem">
@@ -1498,6 +1510,22 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
 
 </div>
 <script>
+__PPS_CREDIT_HEALTH_JS__
+let ppsCreditHealth = null;
+let ppsCreditEnabled = __PPS_ENABLED__;
+function renderPpsCreditHealth() {
+    document.getElementById('pps-credit-card').style.display = ppsCreditEnabled ? '' : 'none';
+    const view = ppsCreditView(ppsCreditHealth);
+    const status = document.getElementById('pps-credit-state');
+    status.textContent = view.label;
+    status.style.color = view.state === 'ready' && !view.warning ? '#68d391' : view.state === 'paused' ? '#fc8181' : '#f4b728';
+    document.getElementById('pps-credit-category').textContent = view.category + (view.warning ? ' · credit_budget_low (below 20%)' : '');
+    document.getElementById('pps-credit-detail').textContent = 'Funding evidence: ' + view.funding + '. ' + (view.state === 'unknown' ? '' :
+        'Last refresh: ' + ppsCreditHealth.last_refresh_result + ' (' + ppsCreditHealth.last_refresh_stage + '). ' +
+        'Refresh in progress: ' + (ppsCreditHealth.refresh_in_progress ? 'yes' : 'no') + '. ' +
+        'Process-local denials: ' + ppsCreditHealth.denial_count +
+        (ppsCreditHealth.last_denial_category ? ' (' + ppsCreditHealth.last_denial_category + ')' : ''));
+}
 // Tab switching
 let currentTab = 'config';
 document.querySelectorAll('.tab').forEach(tab => {
@@ -2042,6 +2070,8 @@ function renderZebraCard(d) {
 async function fetchHealth() {
     try {
         const d = await fetchJson('/admin/api/health');
+        ppsCreditHealth = d ? d.pps_credit_health : null;
+        renderPpsCreditHealth();
         if (!d) return;
         let html = '<table class="kv-table">';
         html += '<tr><td>Zebrad (Node)</td><td>' + (d.node_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline/Stalled</span>') + (d.node_version ? ' <span style="color:#718096;font-size:0.75rem">' + d.node_version + '</span>' : '') + '</td></tr>';
@@ -2136,6 +2166,14 @@ async function fetchHealth() {
             phHtml += '<table class="kv-table">';
             const failColor = ph.consecutive_payout_failures > 2 ? '#fc8181' : ph.consecutive_payout_failures > 0 ? '#f4b728' : '#68d391';
             phHtml += '<tr><td>Consecutive Failures</td><td style="color:' + failColor + '">' + ph.consecutive_payout_failures + '</td></tr>';
+            if (ppsCreditEnabled) {
+                const cycle = ph.pps_payout_cycle || {};
+                const outcomes = { no_payout_due: 'No payout due', no_payout_processed: 'No payout processed', payouts_processed: 'Payouts processed', held: 'Held' };
+                const funding = { not_checked_no_payout_due: 'Not checked (no payout due)', attempted: 'Attempted', not_observed: 'Not observed' };
+                phHtml += '<tr><td>Last PPS Cycle</td><td>' + (outcomes[cycle.outcome] || 'Unknown') + '</td></tr>';
+                phHtml += '<tr><td>Cycle Funding Check</td><td>' + (funding[cycle.funding_check] || 'Unknown') + '</td></tr>';
+                phHtml += '<tr><td colspan="2" style="color:#718096">Payout-cycle status does not establish PPS credit readiness.</td></tr>';
+            }
             if (ph.last_payout_error) {
                 phHtml += '<tr><td>Last Error</td><td style="color:#fc8181;font-size:0.75rem">' + ph.last_payout_error.substring(0, 200) + '</td></tr>';
             }
@@ -2169,6 +2207,8 @@ async function fetchHealth() {
         document.getElementById('health-alerts').innerHTML = alerts;
 
     } catch (e) {
+        ppsCreditHealth = null;
+        renderPpsCreditHealth();
         document.getElementById('health-content').innerHTML = '<span style="color:#fc8181">Failed: ' + e + '</span>';
     }
 }
@@ -2213,8 +2253,10 @@ async function repairZallet() {
 document.getElementById('pub-dash-link').href = 'https://' + window.location.hostname;
 
 // Initial load + auto-refresh
+renderPpsCreditHealth();
 fetchConfig();
 setInterval(() => { if (currentTab === 'health') fetchHealth(); }, 10000);
+setInterval(renderPpsCreditHealth, 1000);
 setInterval(() => { if (currentTab === 'payouts') { fetchWalletBal(); } }, 15000);
 setInterval(() => { if (currentTab === 'miners') fetchMiners(); }, 30000);
 </script>
