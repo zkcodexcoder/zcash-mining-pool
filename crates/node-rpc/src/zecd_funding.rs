@@ -10,7 +10,10 @@ use std::{collections::HashSet, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 pub const MAX_RPC_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_UNSPENT_OUTPUTS: usize = 8192;
-pub const EVIDENCE_LIFETIME_SECONDS: i64 = 60;
+/// Must equal pool-db's FUNDING_LEASE_SECONDS (asserted at compile time in
+/// pool-core). Collections take ~40 s against a large zecd wallet; a lifetime
+/// of the same order made it impossible for admission to stay armed.
+pub const EVIDENCE_LIFETIME_SECONDS: i64 = 600;
 /// Collection remains bounded below the evidence's original-start lifetime.
 /// Slow successful reads consume validity; completing collection never renews it.
 pub const COLLECTION_TIMEOUT_SECONDS: u64 = 45;
@@ -836,7 +839,7 @@ mod tests {
     fn collection_timeout_preserves_original_evidence_lifetime() {
         const { assert!(COLLECTION_TIMEOUT_SECONDS < EVIDENCE_LIFETIME_SECONDS as u64); }
         assert_eq!(COLLECTION_TIMEOUT_SECONDS,45);
-        assert_eq!(EVIDENCE_LIFETIME_SECONDS,60);
+        assert_eq!(EVIDENCE_LIFETIME_SECONDS,600);
     }
 
     #[tokio::test]
@@ -895,7 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn actual_collector_uses_original_clock_and_rejects_expiry_or_clock_rollback() {
-        for finished in [159,160,99] {
+        for finished in [159,100+EVIDENCE_LIFETIME_SECONDS,99] {
             let mut r=responses();
             r[2]=json!({"mock_expected_method":"getwalletinfo","mock_delay_ms":30,"mock_result":info(100)});
             let (wallet,w)=mock(r,None).await;
@@ -912,7 +915,7 @@ mod tests {
             if finished==159 {
                 let proof=outcome.unwrap();
                 assert_eq!(proof.checked_at_unix,100);
-                assert_eq!(proof.valid_until_unix,160);
+                assert_eq!(proof.valid_until_unix,100+EVIDENCE_LIFETIME_SECONDS);
             } else {
                 let error=outcome.unwrap_err();
                 assert_eq!(error.error,ZecdFundingError::InvalidEvidence);
@@ -991,7 +994,7 @@ mod tests {
         assert!(PROBE_STAGE.try_with(|_|()).is_err());
         assert!(SHARED_PROBE_STAGE.try_with(|_|()).is_err());
         assert_eq!(collection_timeout(),Duration::from_secs(45));
-        assert_eq!(EVIDENCE_LIFETIME_SECONDS,60);
+        assert_eq!(EVIDENCE_LIFETIME_SECONDS,600);
     }
 
     #[tokio::test]
@@ -1005,7 +1008,7 @@ mod tests {
             let evidence=collect_testnet_funding(&wallet,"synthetic-source",&node).await.unwrap();
             assert_eq!(evidence.confirmed_eligible_zatoshis,200_000_000);
             assert!(evidence.checked_at_unix>=at && evidence.checked_at_unix<=now().unwrap());
-            assert_eq!(evidence.valid_until_unix,evidence.checked_at_unix+60);
+            assert_eq!(evidence.valid_until_unix,evidence.checked_at_unix+EVIDENCE_LIFETIME_SECONDS);
             let reads=w.await.unwrap();
             assert_eq!(reads.len(),8);
             assert_eq!(reads[6]["method"],"getwalletinfo");
@@ -1084,7 +1087,7 @@ mod tests {
         assert_eq!(report,FundingProbeReport {passed:false,stage:"balance_inventory_read",category:"deadline_exceeded"});
         assert_eq!(counter.load(Ordering::SeqCst),2);
         assert_eq!(COLLECTION_TIMEOUT_SECONDS,45);
-        assert_eq!(EVIDENCE_LIFETIME_SECONDS,60);
+        assert_eq!(EVIDENCE_LIFETIME_SECONDS,600);
     }
 
     #[tokio::test]
@@ -1232,7 +1235,7 @@ mod tests {
         let (wallet,w)=mock(responses(),None).await;
         let (node,n)=mock(vec![json!(102),json!("a".repeat(64))],None).await;
         let evidence=collect_testnet_funding(&wallet,"synthetic-source",&node).await.unwrap();
-        assert_eq!(evidence.valid_until_unix-evidence.checked_at_unix,60);
+        assert_eq!(evidence.valid_until_unix-evidence.checked_at_unix,EVIDENCE_LIFETIME_SECONDS);
         assert_eq!(evidence.confirmed_eligible_zatoshis,200_000_000);
         assert_eq!(evidence.signer_readiness,SignerReadiness::PassphraseUnlocked);
         assert_eq!(format!("{evidence:?}"),"ZecdFundingEvidence { redacted }");
@@ -1529,7 +1532,7 @@ mod tests {
 
     #[tokio::test]
     async fn signer_first_original_timestamp_is_never_restamped_after_historical_work() {
-        for finished in [159,160,99] {
+        for finished in [159,100+EVIDENCE_LIFETIME_SECONDS,99] {
             let (src,mut wr,mut nr)=identity_receipt_responses();
             wr[4][0]["creation_time"]=json!(99); wr[10][0]["creation_time"]=json!(99);
             nr[0]=json!({"mock_expected_method":"getrawtransaction","mock_delay_ms":30,"mock_result":nr[0]});
@@ -1540,7 +1543,7 @@ mod tests {
                     TEST_NOW.with(|clock|clock.set(finished));
                 }); result
             }).await;
-            if finished==159 {let proof=result.unwrap(); assert_eq!(proof.checked_at_unix,100); assert_eq!(proof.valid_until_unix,160);}
+            if finished==159 {let proof=result.unwrap(); assert_eq!(proof.checked_at_unix,100); assert_eq!(proof.valid_until_unix,100+EVIDENCE_LIFETIME_SECONDS);}
             else {let error=result.unwrap_err(); assert_eq!(error.error,ZecdFundingError::InvalidEvidence); assert_eq!(error.stage,"diagnostic_final_freshness");}
             assert_eq!(w.await.unwrap().len(),14); assert_eq!(n.await.unwrap().len(),6);
         }
@@ -1564,7 +1567,7 @@ mod tests {
         let reads=w.await.unwrap(); assert_eq!(reads.len(),9); assert_eq!(n.await.unwrap().len(),3);
         assert_eq!(reads.iter().filter(|r|r["method"]=="getrawtransaction").count(),0);
         assert_eq!(reads.iter().filter(|r|r["method"]=="z_getoperationstatus").count(),1);
-        assert_eq!(COLLECTION_TIMEOUT_SECONDS,45); assert_eq!(EVIDENCE_LIFETIME_SECONDS,60);
+        assert_eq!(COLLECTION_TIMEOUT_SECONDS,45); assert_eq!(EVIDENCE_LIFETIME_SECONDS,600);
     }
 
     #[tokio::test]
@@ -1694,7 +1697,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_preserves_original_clock_across_absence_and_never_renews_its_lease() {
-        for finished in [159,160] {
+        for finished in [159,100+EVIDENCE_LIFETIME_SECONDS] {
             let (src,mut wr,mut nr)=identity_receipt_responses();
             let mut selected=wr[4][0].clone();selected["creation_time"]=json!(98);
             let mut absent=selected.clone();absent["creation_time"]=json!(99);
@@ -1708,7 +1711,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;TEST_NOW.with(|clock|clock.set(finished));
                 });result
             }).await;
-            if finished==159 {let proof=result.unwrap();assert_eq!(proof.checked_at_unix,100);assert_eq!(proof.valid_until_unix,160);}
+            if finished==159 {let proof=result.unwrap();assert_eq!(proof.checked_at_unix,100);assert_eq!(proof.valid_until_unix,100+EVIDENCE_LIFETIME_SECONDS);}
             else {assert_eq!(result,Err(ZecdFundingError::InvalidEvidence));}
             assert_eq!(w.await.unwrap().len(),14);assert_eq!(n.await.unwrap().len(),7);
         }
@@ -1737,7 +1740,7 @@ mod tests {
             assert_eq!(observer.stage(),"signer_raw_read");tokio::time::timeout(Duration::ZERO,collector).await
         };
         assert!(result.is_err());server.await.unwrap();assert_eq!(w.await.unwrap().len(),5);
-        assert_eq!(COLLECTION_TIMEOUT_SECONDS,45);assert_eq!(EVIDENCE_LIFETIME_SECONDS,60);
+        assert_eq!(COLLECTION_TIMEOUT_SECONDS,45);assert_eq!(EVIDENCE_LIFETIME_SECONDS,600);
     }
 
     fn newer_unsupported_receipt(older: &Value) -> Value {

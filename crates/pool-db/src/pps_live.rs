@@ -233,6 +233,14 @@ impl PoolDb {
         let mut c = self.inner().acquire().await?;
         epoch_check(&mut c, e).await
     }
+    /// Read-only: lets the lease refresh loop notice a payout-side generation
+    /// bump and start a replacement collection immediately instead of waiting
+    /// out its cadence.
+    pub async fn pps_funding_generation(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT generation FROM pps_funding_generation WHERE singleton=1")
+            .fetch_one(self.inner())
+            .await
+    }
     pub async fn credit_pps_share(
         &self,
         e: &PpsEpoch,
@@ -1028,7 +1036,7 @@ mod tests {
             let mut l = funded(&f).await;
             match kind {
                 0 => l.valid_until_unix = NOW,
-                1 => l.valid_until_unix = NOW + 91,
+                1 => l.valid_until_unix = NOW + crate::pps_funding::FUNDING_LEASE_SECONDS + 1,
                 2 => l.checked_at_unix = NOW + 1,
                 3 => l.network = "mainnet".into(),
                 4 => l.reserve_floor_zatoshis -= 1,
@@ -2162,7 +2170,7 @@ mod tests {
                 5=>lease.spendable_zatoshis-=1,
                 6=>lease.generation+=1,
                 7=>lease.valid_until_unix=NOW,
-                8=>lease.valid_until_unix=NOW+61,
+                8=>lease.valid_until_unix=NOW+crate::pps_funding::FUNDING_LEASE_SECONDS+1,
                 _=>lease.reserved_fee_allowance_zatoshis=50_000_000,
             }
             assert!(f.db.extend_testnet_pps_budget(&previous,&lease).await.is_err());

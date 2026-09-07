@@ -67,6 +67,11 @@ impl PpsConventionalIntent {
     }
 }
 
+/// Wallet-evidence collection against zecd takes ~40 s on this wallet, so the
+/// lease must outlive several collection attempts or admission can never stay
+/// armed; solvency is still re-proven from the DB inside every credit tx.
+pub const FUNDING_LEASE_SECONDS: i64 = 600;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PpsFundingLease {
     pub network: String,
@@ -177,7 +182,7 @@ async fn extension_journal_present(c: &mut SqliteConnection) -> Result<bool, Pps
 fn validate_extension_lease(snapshot: &PpsFundingSnapshot, lease: &PpsFundingLease, now: i64)
     -> Result<(), PpsDbError>
 {
-    if lease.valid_until_unix.checked_sub(lease.checked_at_unix).map_or(true, |v| v > 60) {
+    if lease.valid_until_unix.checked_sub(lease.checked_at_unix).map_or(true, |v| v > FUNDING_LEASE_SECONDS) {
         return Err(PpsDbError::FundingLeaseRequired);
     }
     validate_lease(snapshot, Some(lease), now)
@@ -766,7 +771,7 @@ pub(crate) fn validate_lease(
         || l.valid_until_unix <= l.checked_at_unix
         || l.valid_until_unix
             .checked_sub(l.checked_at_unix)
-            .map_or(true, |v| v > 90)
+            .map_or(true, |v| v > FUNDING_LEASE_SECONDS)
         || now < l.checked_at_unix
         || now >= l.valid_until_unix
         || l.spendable_zatoshis < 0

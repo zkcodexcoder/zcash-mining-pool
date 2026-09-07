@@ -40,7 +40,16 @@ struct ActivePps {
     health: crate::pps_credit_health::SharedCreditHealth,
 }
 
-const PPS_FUNDING_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const PPS_FUNDING_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
+/// Cadence after a failed collection: fast enough that a lapsed lease is
+/// re-armed within a minute, slow enough not to saturate the wallet RPC
+/// (a collection itself can take ~40 s against zecd).
+const PPS_FUNDING_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// Evidence-read failures that say nothing about solvency or integrity.
+/// The categories match pps_credit_health's fixed vocabulary.
+fn pps_transient_refresh_category(category: &str) -> bool {
+    matches!(category, "rpc_unavailable" | "wallet_not_ready" | "concurrent_change" | "deadline_exceeded")
+}
 
 fn begin_pps_funding_refresh(
     route: &crate::pps_funding::PpsFundingRoute,
@@ -59,16 +68,31 @@ fn finish_pps_funding_refresh(
     cached: &mut Option<PpsFundingLease>,
     result: Result<PpsFundingLease, crate::pps_funding::PpsFundingError>,
     elapsed: Duration,
+    category: &str,
 ) -> Duration {
-    let succeeded = result.is_ok();
-    // Never retain the old proof after failure or restamp either proof.
-    *cached = result.ok();
-    if route.holds_new_legacy_sends() && succeeded {
-        PPS_FUNDING_REFRESH_INTERVAL.saturating_sub(elapsed)
-    } else {
-        // Failed reads always back off after completion. The existing PCZT
-        // route keeps its original completion-to-start cadence on all results.
-        PPS_FUNDING_REFRESH_INTERVAL
+    match result {
+        Ok(lease) => {
+            *cached = Some(lease);
+            if route.holds_new_legacy_sends() {
+                PPS_FUNDING_REFRESH_INTERVAL.saturating_sub(elapsed)
+            } else {
+                // The existing PCZT route keeps its original
+                // completion-to-start cadence on all results.
+                PPS_FUNDING_REFRESH_INTERVAL
+            }
+        }
+        Err(_) => {
+            // On the testnet route, a transient read failure keeps the
+            // previous proof: its own valid_until, generation and spendable
+            // still gate every DB credit, so retention authorizes nothing
+            // new. Any substantive rejection (insolvency, accounting, signer,
+            // chain) still revokes immediately — and the PCZT route already
+            // cleared its cache in begin_pps_funding_refresh.
+            if !(route.holds_new_legacy_sends() && pps_transient_refresh_category(category)) {
+                *cached = None;
+            }
+            PPS_FUNDING_RETRY_INTERVAL
+        }
     }
 }
 
@@ -79,7 +103,7 @@ fn pps_refresh_retry_delay(route:&crate::pps_funding::PpsFundingRoute,
     if category=="ok" { *consecutive_failures=0; return ordinary; }
     *consecutive_failures=consecutive_failures.saturating_add(1);
     if route.holds_new_legacy_sends() && *consecutive_failures<=2
-        && matches!(category,"rpc_unavailable"|"wallet_not_ready"|"concurrent_change"|"deadline_exceeded")
+        && pps_transient_refresh_category(category)
     { Duration::from_secs(5) } else { ordinary }
 }
 
@@ -363,10 +387,19 @@ impl ShareValidator {
                     loop {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                         let started=Instant::now();
-                        let next = match crate::pps_chain::verify_pps_chain(&rpc, network).await {
-                            Ok(proof) => Some(proof),
+                        match crate::pps_chain::verify_pps_chain(&rpc, network).await {
+                            Ok(proof) => { *refresh_lease.write().await = Some(proof); }
                             Err(error) => {
                                 use crate::pps_chain::PpsChainError as E;
+                                // Affirmative disagreement (a fork, a wrong
+                                // network) revokes the previous proof at once.
+                                // A reference that is merely slow, down or
+                                // lagging keeps it: the proof's own expiry
+                                // still bounds it at credit time, and a
+                                // flaky explorer must not halt all shares.
+                                let revoke = matches!(error,
+                                    E::InvalidEvidence|E::NetworkMismatch|E::BranchMismatch
+                                    |E::TipMismatch|E::HashMismatch);
                                 let category=match error {
                                     E::Timeout=>"deadline_exceeded",E::Unavailable=>"rpc_unavailable",
                                     E::InvalidEvidence=>"invalid_evidence",E::NetworkMismatch=>"network_mismatch",
@@ -375,13 +408,14 @@ impl ShareValidator {
                                     E::StaleEvidence=>"stale_evidence",
                                 };
                                 let duration_ms=u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                warn!(stage="chain_refresh",category,duration_ms,"PPS chain evidence unavailable; new credits paused");
-                                None
+                                if revoke {
+                                    warn!(stage="chain_refresh",category,duration_ms,"PPS chain evidence rejected; new credits paused");
+                                    *refresh_lease.write().await = None;
+                                } else {
+                                    warn!(stage="chain_refresh",category,duration_ms,"PPS chain evidence unavailable; retaining prior proof until expiry");
+                                }
                             }
                         };
-                        // A newly observed failure revokes the previous proof
-                        // even if its timestamp has not expired.
-                        *refresh_lease.write().await = next;
                     }
                 },
                 async {
@@ -394,7 +428,23 @@ impl ShareValidator {
                     } else { PPS_FUNDING_REFRESH_INTERVAL };
                     let mut consecutive_failures=0;
                     loop {
-                        tokio::time::sleep(delay).await;
+                        // Sleep out the cadence, but wake early when a payout
+                        // bumps the funding generation past the cached lease:
+                        // admission then recovers after one collection instead
+                        // of one full cadence period.
+                        let wait_started = Instant::now();
+                        loop {
+                            let remaining = delay.saturating_sub(wait_started.elapsed());
+                            if remaining.is_zero() { break; }
+                            tokio::time::sleep(remaining.min(Duration::from_secs(5))).await;
+                            let cached_generation =
+                                refresh_funding.read().await.as_ref().map(|l| l.generation);
+                            if let Some(generation) = cached_generation {
+                                if matches!(db.pps_funding_generation().await,
+                                    Ok(current) if u64::try_from(current).ok() != Some(generation))
+                                { break; }
+                            }
+                        }
                         begin_pps_funding_refresh(&funding_route, &mut *refresh_funding.write().await);
                         if let Ok(mut h)=refresh_health.lock() { h.begin(chrono::Utc::now().timestamp()); }
                         let started = Instant::now();
@@ -410,7 +460,7 @@ impl ShareValidator {
                             info!(stage,category,duration_ms,"PPS credit funding refresh completed");
                         }
                         delay = finish_pps_funding_refresh(&funding_route,
-                            &mut *refresh_funding.write().await, result, elapsed);
+                            &mut *refresh_funding.write().await, result, elapsed, category);
                         if let Ok(mut h)=refresh_health.lock() { h.finish(chrono::Utc::now().timestamp(),stage,category); }
                         delay=pps_refresh_retry_delay(&funding_route,category,&mut consecutive_failures,delay);
                     }
@@ -570,7 +620,12 @@ impl ShareValidator {
                             // hardware — vardiff alone can't defend (it just
                             // ramps), and at high rates this storm can wedge
                             // the single validator task.
-                            let should_disconnect = {
+                            // A PPS admission pause is the pool refusing valid
+                            // work, not the miner misbehaving: those rejects
+                            // must not feed the flooder kick, or every pause
+                            // turns into a pool-wide disconnect/reconnect storm.
+                            let pool_side_pause = e.message.starts_with("PPS admission paused");
+                            let should_disconnect = !pool_side_pause && {
                                 let mut sessions = self.session_difficulty.write().await;
                                 if let Some(sd) = sessions.get_mut(&session_id) {
                                     match code {
@@ -1863,34 +1918,46 @@ mod tests {
     fn pps_testnet_refresh_uses_single_flight_start_to_start_success_cadence() {
         use crate::pps_funding::PpsFundingRoute;
         let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
-        for (collection_seconds,delay_seconds) in [(0,30),(10,20),(30,0),(34,0),(45,0)] {
+        for (collection_seconds,delay_seconds) in [(0,120),(10,110),(30,90),(34,86),(150,0)] {
             let mut cached = Some(refresh_test_proof());
             let mut replacement = refresh_test_proof();
             replacement.checked_at_unix = 134;
             replacement.valid_until_unix = 194;
             replacement.generation = 8;
             let delay = finish_pps_funding_refresh(&route,&mut cached,Ok(replacement.clone()),
-                Duration::from_secs(collection_seconds));
+                Duration::from_secs(collection_seconds),"ok");
             assert_eq!(delay,Duration::from_secs(delay_seconds));
             assert_eq!(cached,Some(replacement));
         }
     }
 
     #[test]
-    fn pps_testnet_refresh_failure_clears_evidence_and_backs_off_after_completion() {
+    fn pps_testnet_refresh_failure_retains_only_on_transient_categories() {
         use crate::pps_funding::{PpsFundingError, PpsFundingRoute};
         let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
-        for error in [PpsFundingError::Timeout,PpsFundingError::ConcurrentChange,
-            PpsFundingError::WalletUnavailable,PpsFundingError::InvalidEvidence]
-        {
+        let original = refresh_test_proof();
+        // A transient read failure keeps the previous proof (its own expiry
+        // and generation still gate every credit); any substantive rejection
+        // revokes it.
+        for category in ["rpc_unavailable","wallet_not_ready","concurrent_change","deadline_exceeded"] {
             for elapsed in [Duration::ZERO,Duration::from_secs(34),Duration::from_secs(45)] {
-                let mut cached = Some(refresh_test_proof());
+                let mut cached = Some(original.clone());
                 begin_pps_funding_refresh(&route,&mut cached);
                 assert!(cached.is_some());
-                assert_eq!(finish_pps_funding_refresh(&route,&mut cached,Err(error),elapsed),
+                assert_eq!(finish_pps_funding_refresh(&route,&mut cached,
+                    Err(PpsFundingError::Timeout),elapsed,category),
                     Duration::from_secs(30));
-                assert!(cached.is_none());
+                assert_eq!(cached,Some(original.clone()));
             }
+        }
+        for category in ["invalid_evidence","funding_insufficient","chain_mismatch",
+            "accounting_unavailable","identity_signer_not_proven"] {
+            let mut cached = Some(original.clone());
+            begin_pps_funding_refresh(&route,&mut cached);
+            assert_eq!(finish_pps_funding_refresh(&route,&mut cached,
+                Err(PpsFundingError::InvalidEvidence),Duration::ZERO,category),
+                Duration::from_secs(30));
+            assert!(cached.is_none());
         }
     }
 
@@ -1905,26 +1972,28 @@ mod tests {
             begin_pps_funding_refresh(&route,&mut cached);
             assert!(cached.is_none());
             assert_eq!(finish_pps_funding_refresh(&route,&mut cached,Ok(proof.clone()),
-                Duration::from_secs(34)),Duration::from_secs(30));
+                Duration::from_secs(34),"ok"),Duration::from_secs(120));
             assert_eq!(cached,Some(proof));
             begin_pps_funding_refresh(&route,&mut cached);
+            // PCZT already cleared during the read, so a transient category
+            // has nothing to retain: failures always leave it revoked.
             assert_eq!(finish_pps_funding_refresh(&route,&mut cached,
-                Err(PpsFundingError::Timeout),Duration::ZERO),Duration::from_secs(30));
+                Err(PpsFundingError::Timeout),Duration::ZERO,"deadline_exceeded"),Duration::from_secs(30));
             assert!(cached.is_none());
         }
     }
 
     #[test]
-    fn pps_credit_refresh_fast_retries_are_bounded_and_never_retain_failed_proofs() {
+    fn pps_credit_refresh_fast_retries_are_bounded_and_retain_transient_proofs() {
         use crate::pps_funding::{PpsFundingError,PpsFundingRoute};
         let route=PpsFundingRoute::ZecdConventionalTestnet {hold_new_legacy_sends:true};
         for category in ["rpc_unavailable","wallet_not_ready","concurrent_change","deadline_exceeded"] {
             let mut failures=0;
             for expected in [5,5,30,30] {
                 let mut cached=Some(refresh_test_proof());
-                let ordinary=finish_pps_funding_refresh(&route,&mut cached,Err(PpsFundingError::WalletUnavailable),Duration::ZERO);
+                let ordinary=finish_pps_funding_refresh(&route,&mut cached,Err(PpsFundingError::WalletUnavailable),Duration::ZERO,category);
                 assert_eq!(pps_refresh_retry_delay(&route,category,&mut failures,ordinary),Duration::from_secs(expected));
-                assert!(cached.is_none());
+                assert!(cached.is_some());
             }
             assert_eq!(pps_refresh_retry_delay(&route,"ok",&mut failures,Duration::ZERO),Duration::ZERO);
             assert_eq!(failures,0);

@@ -550,7 +550,23 @@ async fn main() -> Result<()> {
     let share_validator = if let Some(policy) = &config.pps {
         validate_pps_legacy_reserve(policy, config.payout.reserve_min)?;
         let network = policy.network.parse().map_err(|_| anyhow::anyhow!("invalid PPS network"))?;
-        let chain_lease = pool_core::pps_chain::verify_pps_chain(&rpc, network).await?;
+        // A transient chain-reference or wallet hiccup must not make the pool
+        // unrestartable: retry the two startup collections for up to 10
+        // minutes before giving up. Nothing is served until both succeed.
+        let chain_lease = {
+            let mut attempt = 0u32;
+            loop {
+                match pool_core::pps_chain::verify_pps_chain(&rpc, network).await {
+                    Ok(lease) => break lease,
+                    Err(error) if attempt < 40 => {
+                        attempt += 1;
+                        tracing::warn!(%error, attempt, "PPS chain evidence unavailable at startup; retrying in 15s");
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
         // Never infer that the mining node also owns spendable wallet funds.
         // PPS needs its explicit existing wallet RPC endpoint; no wallet write
         // or automatic funding transfer is performed by this read-only gate.
@@ -564,7 +580,22 @@ async fn main() -> Result<()> {
         let epoch = policy.epoch_config();
         let payout_source = config.payout.pool_address.clone()
             .context("PPS requires explicit existing shielded payout source")?;
-        let funding_lease = pool_core::pps_funding::collect_pps_credit_funding_for_route(&db, &wallet_rpc, &epoch, &payout_source, &rpc, &funding_route).await?;
+        let funding_lease = {
+            let mut attempt = 0u32;
+            loop {
+                match pool_core::pps_funding::collect_pps_credit_funding_for_route(
+                    &db, &wallet_rpc, &epoch, &payout_source, &rpc, &funding_route,
+                ).await {
+                    Ok(lease) => break lease,
+                    Err(error) if attempt < 40 => {
+                        attempt += 1;
+                        tracing::warn!(%error, attempt, "PPS funding evidence unavailable at startup; retrying in 15s");
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
         let validator = share_validator.with_pps(pool_core::share::PpsRuntime {
             epoch: epoch.clone(), chain_lease, funding_lease: funding_lease.clone(), wallet_rpc, payout_source, funding_route,
         }).map_err(anyhow::Error::msg)?;

@@ -6,7 +6,11 @@ use pool_db::{PoolDb, pps_live::PpsEpoch, pps_funding::{PpsFundingLease, PpsFund
 use std::time::Duration;
 use serde::Deserialize;
 
-pub const FUNDING_LEASE_SECONDS: i64 = 60;
+pub use pool_db::pps_funding::FUNDING_LEASE_SECONDS;
+// The wallet evidence is stamped in node-rpc and validated here and in
+// pool-db; the three crates must agree on the lifetime or every collection
+// is rejected as InvalidEvidence.
+const _: () = assert!(FUNDING_LEASE_SECONDS == node_rpc::zecd_funding::EVIDENCE_LIFETIME_SECONDS);
 
 /// An explicit protocol selection, not a wallet capability attestation. Missing
 /// configuration retains the existing PCZT route; a failed route never probes
@@ -437,7 +441,7 @@ mod tests {
         };
         assert!(finish_evidence(&s,&s,1_000_000_006,&e,100,100).is_ok());
         assert_eq!(finish_evidence(&s,&s,1_000_000_005,&e,100,100),Err(PpsFundingError::InsufficientFunding));
-        assert_eq!(finish_evidence(&s,&s,1_000_000_006,&e,100,160),Err(PpsFundingError::InvalidEvidence));
+        assert_eq!(finish_evidence(&s,&s,1_000_000_006,&e,100,100+FUNDING_LEASE_SECONDS),Err(PpsFundingError::InvalidEvidence));
         let mut changed=s.clone(); changed.generation+=1;
         assert_eq!(finish_evidence(&s,&changed,i64::MAX,&e,100,100),Err(PpsFundingError::ConcurrentChange));
         let mut changed=s.clone(); changed.required_spendable_zatoshis+=1;

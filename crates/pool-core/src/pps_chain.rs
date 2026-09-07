@@ -21,8 +21,12 @@ const QUERY_LIMIT: Duration = Duration::from_secs(10);
 const CHECK_LIMIT: Duration = Duration::from_secs(45);
 const BODY_LIMIT: usize = 65_536;
 const TIP_SPREAD: u64 = 24;
-const LEASE_SECONDS: i64 = 90;
-const RECENT_ANCHOR_MAX_AGE: i64 = 30 * 60;
+// 300 is the ceiling pool-db's credit-time validation accepts; the proof's
+// own expiry still bounds how long a revoked upstream stays undetected.
+const LEASE_SECONDS: i64 = 300;
+// Testnet block gaps regularly exceed the nominal 12-block/15-min pace; a
+// 30-min bound rejected every share exactly while the chain was slowest.
+const RECENT_ANCHOR_MAX_AGE: i64 = 90 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PpsChainError {
