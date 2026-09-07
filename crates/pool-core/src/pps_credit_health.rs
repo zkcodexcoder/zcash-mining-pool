@@ -113,9 +113,9 @@ pub fn decode_credit_health(raw: Option<&str>, now_unix: i64) -> PpsCreditHealth
         || [h.funding_expires_at_unix,h.chain_expires_at_unix]
             .into_iter().flatten().any(|v| v < 0)
         || h.funding_expires_at_unix.zip(h.funding_checked_at_unix)
-            .is_some_and(|(end,start)| end.checked_sub(start).is_none_or(|d| !(1..=60).contains(&d)))
+            .is_some_and(|(end,start)| end.checked_sub(start).is_none_or(|d| !(1..=pool_db::pps_funding::FUNDING_LEASE_SECONDS).contains(&d)))
         || h.funding_expires_at_unix.is_some() != h.funding_checked_at_unix.is_some()
-        || h.chain_expires_at_unix.is_some_and(|end| end.checked_sub(now_unix).is_none_or(|d|d>90))
+        || h.chain_expires_at_unix.is_some_and(|end| end.checked_sub(now_unix).is_none_or(|d|d>pool_db::pps_funding::CHAIN_LEASE_SECONDS))
         || h.quote_checked_at_unix.is_some_and(|v|v<0 || v>now_unix)
         || h.quote_checked_at_unix.is_some() != h.quote_expires_at_unix.is_some()
         || h.quote_expires_at_unix.zip(h.quote_checked_at_unix)
@@ -345,12 +345,12 @@ pub(crate) async fn sample_health(db:&PoolDb,epoch:&PpsEpoch,route:&PpsFundingRo
             h.funding_expires_at_unix=l.as_ref().map(|v|v.valid_until_unix);
             h.funding_expiry_valid=l.as_ref().is_some_and(|v| v.checked_at_unix>=0
                 && v.checked_at_unix<=now && now<v.valid_until_unix
-                && v.valid_until_unix.checked_sub(v.checked_at_unix).is_some_and(|d|(1..=60).contains(&d)));
+                && v.valid_until_unix.checked_sub(v.checked_at_unix).is_some_and(|d|(1..=pool_db::pps_funding::FUNDING_LEASE_SECONDS).contains(&d)));
             h.chain_expires_at_unix=c.as_ref().map(|v|v.valid_until_unix);
             h.chain_expiry_valid=c.as_ref().is_some_and(|v| v.network==epoch.network && !v.disagreement
                 && v.agreeing_references>=2 && v.checked_at_unix>=0 && v.checked_at_unix<=now
                 && now<v.valid_until_unix && v.valid_until_unix.checked_sub(v.checked_at_unix)
-                    .is_some_and(|d|(1..=90).contains(&d)));
+                    .is_some_and(|d|(1..=pool_db::pps_funding::CHAIN_LEASE_SECONDS).contains(&d)));
             assess(&mut h,epoch,route,l.as_ref(),s,now);
             if let Some(snapshot)=&s.funding {
                 assess_quote(&mut h,q.as_ref(),job.as_ref(),*quote_unchanged,
@@ -424,7 +424,8 @@ mod tests {
         assert_eq!(decode(&h,139).category,"chain_invalid");
         h=ready(); h.generation_matches=Some(false);
         assert_eq!(decode(&h,100).state,CreditAdmissionState::Unknown);
-        h=ready(); h.funding_expires_at_unix=Some(141);
+        // A lease span beyond the funding-lease ceiling is incoherent -> malformed.
+        h=ready(); h.funding_expires_at_unix=Some(80+pool_db::pps_funding::FUNDING_LEASE_SECONDS+1);
         assert_eq!(decode(&h,100).state,CreditAdmissionState::Unknown);
     }
     #[test]

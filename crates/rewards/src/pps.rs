@@ -145,22 +145,21 @@ pub fn quote_standard_pps(input: &PpsQuoteInput) -> Result<PpsQuote, PpsError> {
     if input.network_target_be > pow_limit {
         return Err(PpsError::InvalidNetworkTarget);
     }
-    // Testnet minimum-difficulty templates can make the network target easier
-    // than the fixed share target. Every submitted share is then itself a
-    // block candidate, so its expected value is exactly the subsidy: clamp the
-    // probability ratio at 1 rather than refusing all work precisely while
-    // the chain is slowest. The price can never exceed the subsidy.
-    let network_target_be = if input.assigned_share_target_be < input.network_target_be {
-        input.assigned_share_target_be
-    } else {
-        input.network_target_be
-    };
+    // A share target harder than the network target (assigned < network) only
+    // arises for testnet minimum-difficulty templates. The credit layer
+    // (pps_live.rs credit_pps_share) rejects that exact case as Invalid, so
+    // pricing rejects it here too: the two layers must agree, and fail-closed
+    // is the safe choice (crediting each such share at full subsidy would let
+    // liability accumulate one block-value per share during an easy window).
+    if input.assigned_share_target_be < input.network_target_be {
+        return Err(PpsError::ShareTargetTooHard);
+    }
 
     // Bounded exact arithmetic: 32-byte targets, <=1,250,000,000-zatoshi subsidy,
     // <=10,000 fee multiplier and fixed 10^12 scale. Intermediates need <342
     // bits. BigUint cannot machine-overflow; conversion to ledger u128 is
     // explicitly checked. The denominator is positive by target validation.
-    let network = BigUint::from_bytes_be(&network_target_be) + BigUint::one();
+    let network = BigUint::from_bytes_be(&input.network_target_be) + BigUint::one();
     let assigned = BigUint::from_bytes_be(&input.assigned_share_target_be) + BigUint::one();
     let numerator = network
         * BigUint::from(input.miner_subsidy_zats)
@@ -241,12 +240,9 @@ mod tests {
         for value in [input(0, 1), input(1, 0)] {
             assert_eq!(quote_standard_pps(&value), Err(PpsError::ZeroTarget));
         }
-        // A share target harder than the network target means every submitted
-        // share is a block candidate: the ratio clamps at 1 and the price is
-        // exactly the (fee-adjusted) subsidy — never more.
         assert_eq!(
-            quote_standard_pps(&input(3, 1)).unwrap().amount_subzatoshis,
-            125_000_000 * PPS_SCALE
+            quote_standard_pps(&input(3, 1)),
+            Err(PpsError::ShareTargetTooHard)
         );
         let mut value = input(1, 1);
         value.network_target_be = [255; 32];

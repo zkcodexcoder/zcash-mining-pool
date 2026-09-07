@@ -435,7 +435,7 @@ impl MockRpc {
                     assert_eq!(params,&json!([txid]));
                     st.wallet_history.clone().unwrap_or(Value::Null)
                 }
-                "getblock" => json!({"hash":hash,"height":HEIGHT,"confirmations":1,
+                "getblock" => json!({"hash":hash,"height":HEIGHT,"confirmations":st.confirmations,
                     "tx":if st.missing_inclusion {json!([])}else{json!([txid])}}),
                 _ => {
                     return Json(json!({"jsonrpc":"2.0","id":req["id"],"result":null,
@@ -452,7 +452,7 @@ impl MockRpc {
             missing_inclusion: false,
             wrong_chain: false,
             bad_raw: false,
-            confirmations: 1,
+            confirmations: crate::pps_conventional::PPS_SETTLE_MATURITY,
             fail_second_funding: false,
             funding_reads: 0,
             saw_durable_seal: false,
@@ -655,6 +655,38 @@ async fn conventional_reserve_seal_once_send_and_exact_confirmed_settlement() {
 }
 
 #[tokio::test]
+async fn conventional_settlement_waits_for_maturity_depth() {
+    use crate::pps_conventional::PPS_SETTLE_MATURITY;
+    let f = Fixture::new().await;
+    let rpc = MockRpc::new(&f.db).await;
+    rpc.success();
+    // The send lands but is only one block deep: reserved, not settled.
+    rpc.state.lock().unwrap().confirmations = 1;
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    assert_eq!(rpc.sends(), 1);
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!(
+        (sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis),
+        (0, CREDIT, 0)
+    );
+    let attempt = f.attempt().await;
+    // One short of the threshold: still held in `paying`.
+    rpc.state.lock().unwrap().confirmations = PPS_SETTLE_MATURITY - 1;
+    assert_eq!(reconcile(&f, &rpc, attempt.attempt_id).await.unwrap(), 0);
+    assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, CREDIT);
+    // At the threshold: settles exactly once, and no resend ever happens.
+    rpc.state.lock().unwrap().confirmations = PPS_SETTLE_MATURITY;
+    assert_eq!(reconcile(&f, &rpc, attempt.attempt_id).await.unwrap(), 1);
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!(
+        (sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis),
+        (0, 0, CREDIT)
+    );
+    assert_eq!(reconcile(&f, &rpc, attempt.attempt_id).await.unwrap(), 0);
+    assert_eq!(rpc.sends(), 1);
+}
+
+#[tokio::test]
 async fn conventional_unified_and_bare_shielded_wallet_view_settles_exactly_once() {
     for recipient in [UNIFIED_RECIPIENT,SAPLING_RECIPIENT] {
         let f = Fixture::new_for_recipient(recipient).await;
@@ -803,7 +835,7 @@ async fn conventional_saved_txid_recovers_after_wallet_forgets_operation() {
     let operation_reads = {
         let mut s = rpc.state.lock().unwrap();
         s.operation = json!([]);
-        s.confirmations = 1;
+        s.confirmations = crate::pps_conventional::PPS_SETTLE_MATURITY;
         s.calls
             .iter()
             .filter(|m| *m == "z_getoperationstatus")

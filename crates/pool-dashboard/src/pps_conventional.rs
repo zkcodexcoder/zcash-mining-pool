@@ -15,6 +15,17 @@ use std::{collections::BTreeMap, future::Future, str::FromStr, time::Instant};
 // each other's pre-seal funding work. DB fences remain the cross-process guard.
 static WORKFLOW:tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Canonical depth a payout tx must reach before it is settled paying->paid.
+/// Settling at 1 confirmation (the prior behaviour) let a reorg un-mine an
+/// already-"paid" payout with no reversal path, permanently shorting the miner
+/// (audit finding #3). There is no paid->pending reversal; instead we simply
+/// never mark paid until the tx is buried this deep in the canonical chain.
+/// OPERATOR KNOB: 10 matches the wallet's 10-confirmation note-eligibility
+/// policy and gives ~12.5 min finality; raise toward 24 (the chain-lease tip
+/// spread) for more reorg margin. No depth covers an operator-induced
+/// multi-thousand-block rollback -- that stays a manual reconciliation event.
+pub(crate) const PPS_SETTLE_MATURITY: u64 = 10;
+
 /// Classify typed failures only. Never format an error, its context, or any
 /// supplied value: even an otherwise harmless database/RPC error can carry
 /// addresses, identifiers, configuration or wallet material.
@@ -331,7 +342,9 @@ async fn reconcile_inner(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
         }
     };
     let raw=rpc(node,"getrawtransaction",json!([txid,1])).await?;
-    if raw.get("confirmations").and_then(Value::as_u64).unwrap_or(0)<1 { return Ok(0); }
+    // Stay reserved (soft return, retried next cycle) until the tx is buried
+    // PPS_SETTLE_MATURITY-deep in our node's active chain; only then settle.
+    if raw.get("confirmations").and_then(Value::as_u64).unwrap_or(0)<PPS_SETTLE_MATURITY { return Ok(0); }
     let raw_txid=raw.get("txid").and_then(Value::as_str).context("PPS raw txid missing")?;
     anyhow::ensure!(crate::wallet_operation::normalize_txid(raw_txid)?==txid,"PPS raw txid mismatch");
     let blockhash=raw.get("blockhash").and_then(Value::as_str).context("PPS block missing")?;
