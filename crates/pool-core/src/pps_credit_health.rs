@@ -49,7 +49,7 @@ pub struct PpsCreditHealth {
 const CATEGORIES: &[&str] = &[
     "unknown", "not_attempted", "ok", "missing", "malformed", "stale",
     "funding_missing", "funding_expired", "chain_invalid", "generation_changed",
-    "financial_halt", "cap_exhausted", "fee_capacity_exhausted", "funding_insufficient",
+    "financial_halt", "payout_halted", "cap_exhausted", "fee_capacity_exhausted", "funding_insufficient",
     "accounting_unavailable", "accounting_invalid", "epoch_mismatch", "legacy_recovery",
     "invalid_input", "duplicate_mismatch", "chain_lease_required", "funding_lease_required",
     "route_policy", "unsupported_recipient", "network_mismatch", "fee_contract_unavailable",
@@ -246,6 +246,7 @@ pub(crate) fn db_category(error:&PpsDbError) -> &'static str {
         PpsDbError::ChainLeaseRequired=>"chain_lease_required", PpsDbError::CapExceeded=>"cap_exhausted",
         PpsDbError::FundingLeaseRequired=>"funding_lease_required", PpsDbError::FundingInsufficient=>"funding_insufficient",
         PpsDbError::FeeBudgetExceeded=>"fee_capacity_exhausted", PpsDbError::Invariant=>"accounting_invalid",
+        PpsDbError::PayoutHalted=>"payout_halted",
         PpsDbError::Database(_)=>"accounting_unavailable",
     }
 }

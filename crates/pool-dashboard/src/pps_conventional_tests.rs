@@ -790,7 +790,8 @@ async fn conventional_missing_wallet_history_cannot_mask_raw_financial_breach() 
             PpsConventionalHalt::FeeMismatch
         } else { PpsConventionalHalt::RecipientMismatch }));
         assert!(attempt.sealed);
-        assert!(f.db.pps_funding_snapshot().await.is_err());
+        // Halt fences sending, not accounting: snapshot works, send stays blocked.
+        assert!(f.db.pps_funding_snapshot().await.is_ok());
         assert!(f.db.refund_pps_payout(attempt.attempt_id).await.is_err());
         assert!(process(&f,&rpc).await.is_err());
         assert_eq!(rpc.sends(),1);
@@ -974,11 +975,12 @@ async fn conventional_proven_recipient_or_fee_violation_is_a_durable_global_hold
             "synthetic financial-halt case fee_violation={fee_violation}: {}",
             rpc.failure_diagnostics().await
         );
-        assert!(f.db.pps_funding_snapshot().await.is_err());
+        // A halt fences SENDING only; accounting/admission/startup must survive.
+        assert!(f.db.pps_funding_snapshot().await.is_ok());
         f.reopen().await;
         let reopened = f.attempt().await;
         assert_eq!(reopened.halt_category, attempt.halt_category);
-        assert!(f.db.pps_invariant().await.is_err());
+        assert!(f.db.pps_invariant().await.is_ok());
         let row = sqlx::query("SELECT pending,paying,paid FROM pps_accounts WHERE miner_id=?1")
             .bind(f.miner)
             .fetch_one(&f.pool)

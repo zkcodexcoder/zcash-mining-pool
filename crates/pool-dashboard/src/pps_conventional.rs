@@ -70,6 +70,7 @@ fn pre_send_error_category(error: &anyhow::Error) -> &'static str {
             PpsDbError::FundingLeaseRequired => "funding_lease_required",
             PpsDbError::FundingInsufficient => "insufficient_funding",
             PpsDbError::FeeBudgetExceeded => "fee_budget_exceeded",
+            PpsDbError::PayoutHalted => "payout_halted",
             PpsDbError::Invariant => "accounting_invariant",
             PpsDbError::Database(_) => "database_unavailable",
         };

@@ -539,9 +539,13 @@ pub(crate) async fn snapshot(
     allow_absent: bool,
 ) -> Result<PpsFundingSnapshot, PpsDbError> {
     policy_check(c, e, allow_absent).await?;
-    let halted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_conventional_halts")
-        .fetch_one(&mut *c).await?;
-    if halted != 0 { return Err(PpsDbError::FundingLeaseRequired); }
+    // A financial halt no longer bricks this snapshot. Halting the SENDING of
+    // money must not also stop crediting, admission, settlement of other
+    // attempts, funding refresh, the accounting invariant, or daemon startup
+    // (all of which route through here) -- that used to convert one payout
+    // anomaly into an unrecoverable, monitoring-killing full outage. The halt
+    // is now enforced only where a NEW send is authorized (the seal's
+    // send fence below), so a halt still reliably stops sending.
     let gen: i64 =
         sqlx::query_scalar("SELECT generation FROM pps_funding_generation WHERE singleton=1")
             .fetch_one(&mut *c)
@@ -687,12 +691,10 @@ pub(crate) async fn snapshot(
             if conventional.as_ref().is_some_and(|a| a.status == "reserved" && a.canonical_intent.is_none()) {
                 return Err(PpsDbError::FundingLeaseRequired);
             }
-            if conventional
-                .as_ref()
-                .is_some_and(|a| a.excess_fee_zatoshis.is_some())
-            {
-                return Err(PpsDbError::FeeBudgetExceeded);
-            }
+            // An over-ceiling actual fee is a durable anomaly that fences new
+            // sends (see the seal), but it must not brick this accounting
+            // snapshot: the reservation is simply counted at its reserved
+            // fee_bound by the "reserved" arm below, exactly as before the send.
             if !matches!(sealed, 0 | 1)
                 || expected
                     .as_deref()
@@ -1145,6 +1147,15 @@ impl PoolDb {
             // check could race an overrun on another reserved attempt.
             // Immutable metadata for an already-sent transaction stays writable.
             let epoch = active_epoch(&mut tx).await?;
+            // Send fence: no NEW send may be authorized while any conventional
+            // halt or over-ceiling fee stands. Enforced here (not in snapshot),
+            // inside BEGIN IMMEDIATE, so it serializes against the halt-recording
+            // commit -- a halt stops sending without bricking anything else.
+            let send_blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pps_conventional_halts) \
+                 OR EXISTS(SELECT 1 FROM pps_conventional_attempts WHERE excess_fee IS NOT NULL)")
+                .fetch_one(&mut *tx).await?;
+            if send_blocked { return Err(PpsDbError::PayoutHalted); }
             let state = snapshot(&mut tx, &epoch, false).await?;
             if funding.is_some() {
                 validate_lease(&state, funding, runtime_now()?)?;
@@ -1195,9 +1206,12 @@ impl PoolDb {
         if active_epoch(&mut tx).await? != *e { return Err(PpsDbError::EpochMismatch); }
         let generation:i64=sqlx::query_scalar("SELECT generation FROM pps_funding_generation WHERE singleton=1")
             .fetch_one(&mut *tx).await?;
-        let financial_halt:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pps_conventional_halts)")
+        let financial_halt:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pps_conventional_halts) OR EXISTS(SELECT 1 FROM pps_conventional_attempts WHERE excess_fee IS NOT NULL)")
             .fetch_one(&mut *tx).await?;
-        let funding=if financial_halt { None } else { Some(snapshot(&mut tx,e,false).await?) };
+        // snapshot no longer bricks under a halt, so surface live funding even
+        // while financial_halt is set: ops can see the ledger is solvent and
+        // only SENDING is fenced. financial_halt stays a distinct health flag.
+        let funding=Some(snapshot(&mut tx,e,false).await?);
         tx.rollback().await?;
         Ok(PpsCreditReadinessSnapshot { generation:u64::try_from(generation).map_err(|_|PpsDbError::Invariant)?,
             financial_halt, funding })

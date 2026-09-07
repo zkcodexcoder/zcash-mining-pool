@@ -33,6 +33,8 @@ pub enum PpsDbError {
     FundingInsufficient,
     #[error("cumulative PPS fee or total exposure budget exceeded")]
     FeeBudgetExceeded,
+    #[error("PPS payout sending halted pending operator review")]
+    PayoutHalted,
     #[error("PPS accounting invariant failed")]
     Invariant,
     #[error("PPS database operation failed")]
@@ -1612,9 +1614,11 @@ mod tests {
         f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::RecipientMismatch).await.unwrap();
         f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::RecipientMismatch).await.unwrap();
         assert!(f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::FeeMismatch).await.is_err());
-        assert!(f.db.pps_funding_snapshot().await.is_err());
+        // Halt fences NEW sends only: snapshot + admission keep working, the
+        // seal is refused (PayoutHalted).
+        assert!(f.db.pps_funding_snapshot().await.is_ok());
         assert!(f.db.seal_pps_payout(b, &fee(b).proposal_id).await.is_err());
-        assert!(f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&funded(&f).await), NOW).await.is_err());
+        assert!(f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&funded(&f).await), NOW).await.is_ok());
         assert!(f.db.confirm_pps_conventional_payout(a, &"c".repeat(64), 7).await.is_err());
         assert!(f.db.refund_pps_payout(a).await.is_err());
         assert!(sqlx::query("DELETE FROM pps_conventional_halts").execute(f.db.inner()).await.is_err());
@@ -1623,7 +1627,7 @@ mod tests {
         let state: (i64, i64, i64) = sqlx::query_as("SELECT pending,paying,paid FROM pps_accounts WHERE miner_id=?1").bind(f.m).fetch_one(f.db.inner()).await.unwrap();
         assert_eq!(state, (1, 2, 0));
         f.db.run_migrations().await.unwrap();
-        assert!(f.db.pps_funding_snapshot().await.is_err());
+        assert!(f.db.pps_funding_snapshot().await.is_ok());
     }
     #[tokio::test]
     async fn conventional_fee_bound_actual_and_principal_are_exactly_conserved() {
@@ -1733,7 +1737,8 @@ mod tests {
             (None, Some(CONVENTIONAL_BOUND + 1))
         );
         assert_eq!(receipt.status, "reserved");
-        assert!(f.db.pps_funding_snapshot().await.is_err());
+        // Over-ceiling fee fences sends but no longer bricks accounting/admission.
+        assert!(f.db.pps_funding_snapshot().await.is_ok());
         assert!(f
             .db
             .credit_pps_share(
@@ -1744,7 +1749,7 @@ mod tests {
                 NOW
             )
             .await
-            .is_err());
+            .is_ok());
         assert!(f.db.refund_pps_payout(a).await.is_err());
         assert!(f
             .db
@@ -1773,7 +1778,7 @@ mod tests {
                 .unwrap(),
             receipt
         );
-        assert!(reopened.pps_invariant().await.is_err());
+        assert!(reopened.pps_invariant().await.is_ok());
     }
     #[tokio::test]
     async fn conventional_overrun_blocks_new_seals_on_every_reserved_pps_mode() {
@@ -1806,7 +1811,7 @@ mod tests {
             } else {
                 f.db.seal_pps_payout(b, &fee(b).proposal_id).await
             };
-            assert!(matches!(result, Err(PpsDbError::FeeBudgetExceeded)));
+            assert!(matches!(result, Err(PpsDbError::PayoutHalted)));
             let sealed: i64 = sqlx::query_scalar(
                 "SELECT sealed FROM pps_fee_reservations WHERE attempt_id=?1",
             )
