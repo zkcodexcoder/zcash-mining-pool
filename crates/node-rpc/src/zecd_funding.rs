@@ -17,6 +17,15 @@ pub const EVIDENCE_LIFETIME_SECONDS: i64 = 600;
 /// Collection remains bounded below the evidence's original-start lifetime.
 /// Slow successful reads consume validity; completing collection never renews it.
 pub const COLLECTION_TIMEOUT_SECONDS: u64 = 45;
+/// The wallet tip may advance FORWARD by up to this many blocks during the
+/// funding read. A testnet fast-block burst moves the tip every few seconds, so
+/// requiring it to hold perfectly still across the multi-RPC read pauses all
+/// crediting during such bursts. Forward-only progress is a chain extension:
+/// the closing anchor is re-proven canonical against the node, the mature
+/// (>=10-conf) eligible balance is unaffected by tip-level movement, and any
+/// deep reorg makes zecd rewind (not ready), which the readiness gate rejects.
+/// A backward move or a jump larger than this is rejected as suspect.
+pub const FUNDING_ANCHOR_MAX_DRIFT: u64 = 24;
 const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -508,7 +517,17 @@ async fn collect_money(wallet: &ZcashRpcClient, source: &str, node: &ZcashRpcCli
         probe_stage("closing_metadata_check");
         let (after_name, after_signer) = wallet_metadata(&closing_info, after.height, until)?;
         probe_stage("funding_bracket_check");
-        if before.anchor != after || before.name != after_name || before.readiness != after_signer {
+        // Allow the tip to advance FORWARD during the read (fast-block bursts),
+        // but reject any backward move or absurd jump, and require wallet
+        // identity and signer readiness to hold. Forward progress is a chain
+        // extension: `after` is re-proven canonical against the node below, the
+        // mature eligible balance is unaffected by tip-level movement, and a
+        // deep reorg would leave zecd rewinding (not ready) and fail readiness.
+        let forward = after.height.checked_sub(before.anchor.height);
+        if forward.map_or(true, |d| d > FUNDING_ANCHOR_MAX_DRIFT)
+            || before.name != after_name
+            || before.readiness != after_signer
+        {
             return Err(ZecdFundingError::ConcurrentChange);
         }
         probe_stage("node_tip_read");
@@ -885,9 +904,9 @@ mod tests {
             let (expected,stage)=match case {
                 0 => { r[1]=tip(101,"b"); r.truncate(3);
                     (ZecdFundingError::NotReady,"opening_metadata_check") },
-                1 => { r[6]=tip(101,"b"); r[7]=info(101);
+                1 => { r[6]=tip(130,"b"); r[7]=info(130);
                     (ZecdFundingError::ConcurrentChange,"funding_bracket_check") },
-                2 => { r[6]=tip(100,"b");
+                2 => { r[6]=tip(99,"b"); r[7]=info(99);
                     (ZecdFundingError::ConcurrentChange,"funding_bracket_check") },
                 3 => { r[7]["scanning"]=json!({"pending_enhancements":1});
                     (ZecdFundingError::NotReady,"closing_metadata_check") },
@@ -1067,8 +1086,10 @@ mod tests {
         for case in 0..5 {
             let mut r=responses(); let mut node_responses=vec![];
             let expected=match case {
-                0 => { r[6]=tip(100,"b"); ZecdFundingError::ConcurrentChange },
-                1 => { r[6]=tip(101,"b"); r[7]=info(101); ZecdFundingError::ConcurrentChange },
+                // A forward jump beyond the drift tolerance, and a backward
+                // move (a reorg shortening), are both rejected at the bracket.
+                0 => { r[6]=tip(125,"b"); r[7]=info(125); ZecdFundingError::ConcurrentChange },
+                1 => { r[6]=tip(99,"b"); r[7]=info(99); ZecdFundingError::ConcurrentChange },
                 2 => { r[7]["scanning"]=json!({"progress":1.0,"pending_enhancements":1}); ZecdFundingError::NotReady },
                 3 => { node_responses=vec![json!(100),json!("b".repeat(64))]; ZecdFundingError::ChainMismatch },
                 _ => { r[4]=Value::Null; r.truncate(6); ZecdFundingError::InvalidEvidence },
@@ -1271,10 +1292,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_forward_tip_advance_within_tolerance_still_produces_funding() {
+        // The wallet tip advances +5 during the read (a fast-block burst).
+        // Forward movement within FUNDING_ANCHOR_MAX_DRIFT is a chain
+        // extension, not a reorg, so it must NOT pause crediting -- the closing
+        // anchor is still canonical and the read yields evidence.
+        let mut r=responses();
+        r[6]=tip(105,"a"); r[7]=info(105);
+        let (wallet,w)=mock(r,None).await;
+        let (node,n)=mock(vec![json!(107),json!("a".repeat(64))],None).await;
+        let evidence=collect_testnet_funding(&wallet,"synthetic-source",&node).await.unwrap();
+        assert_eq!(evidence.confirmed_eligible_zatoshis,200_000_000);
+        // The node's canonical check is against the CLOSING (advanced) height.
+        assert_eq!(n.await.unwrap()[1]["params"],json!([105]));
+        w.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn wrongfork_or_midread_change_never_produces_funding() {
         for changed in [false,true] {
             let mut r=responses();
-            if changed { r[6]=tip(100,"b"); }
+            if changed { r[6]=tip(125,"b"); r[7]=info(125); }
             let (wallet,w)=mock(r,None).await;
             let (node,n)=mock(if changed {vec![]} else {vec![json!(100),json!("b".repeat(64))]},None).await;
             let error=collect_testnet_funding(&wallet,"synthetic-source",&node).await.unwrap_err();
@@ -1514,9 +1552,9 @@ mod tests {
         for case in 0..11 {
             let (src,mut wr,mut nr)=identity_receipt_responses();
             let (expected,stage)=match case {
-                0 => {wr[13]["bestblockhash"]=json!("b".repeat(64)); nr.truncate(3);
+                0 => {let h=wr[13]["blocks"].as_u64().unwrap()+30; wr[13]=tip(h,"b"); wr[12]["enhanced_through"]=json!(h); nr.truncate(3);
                     (ZecdFundingError::ConcurrentChange,"funding_bracket_check")},
-                1 => {let h=wr[13]["blocks"].as_u64().unwrap()+1; wr[13]=tip(h,"b"); wr[12]["enhanced_through"]=json!(h); nr.truncate(3);
+                1 => {let h=wr[13]["blocks"].as_u64().unwrap()-1; wr[13]=tip(h,"b"); wr[12]["enhanced_through"]=json!(h); nr.truncate(3);
                     (ZecdFundingError::ConcurrentChange,"funding_bracket_check")},
                 2 => {wr[12]["scanning"]=json!(true); nr.truncate(3);
                     (ZecdFundingError::NotReady,"closing_metadata_check")},
