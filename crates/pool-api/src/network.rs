@@ -197,7 +197,13 @@ fn identify_pool(
         return Some(n.to_string());
     }
 
-    // Coinbase text detection
+    // Coinbase self-tag detection. This is the PRIMARY (and, for a shielded
+    // coinbase that pays no transparent address, the ONLY) signal. Match a
+    // specific brand before any generic phrase.
+    if coinbase_text.contains("Luxor") || coinbase_text.contains("LuxOS") {
+        // e.g. "/Mined by Luxor - Powered by LuxOS - tag from cfg/".
+        return Some("Luxor".to_string());
+    }
     if coinbase_text.contains("2Miners") {
         return Some("2Miners".to_string());
     }
@@ -206,14 +212,49 @@ fn identify_pool(
         // identify as Foundry — same operator.
         return Some("Foundry".to_string());
     }
-    if coinbase_text.contains("Mined by") {
-        return Some("F2Pool".to_string());
-    }
     if coinbase_text.contains("/NiceHash/") {
         return Some("NiceHash".to_string());
     }
+    // F2Pool ONLY on its own brand. "Mined by" alone is generic — Luxor and
+    // others use it too — and previously mislabeled every such miner as F2Pool.
+    if coinbase_text.contains("F2Pool") || coinbase_text.contains("f2pool") {
+        return Some("F2Pool".to_string());
+    }
 
     None
+}
+
+/// A stable, human-readable tag extracted from a coinbase's printable bytes:
+/// the longest run of tag-like characters (alphanumeric, space, `- _ :`) that
+/// holds at least two letters. A coinbase scriptSig begins with the block-height
+/// push and an extranonce, which vary every block and render as `.` filler
+/// (see [`hex_to_ascii_lossy`]); the pool's self-tag is the stable printable
+/// remainder. This is the grouping identity for shielded miners, which all
+/// share the placeholder [`SHIELDED_MINER`] address and so cannot be told apart
+/// by address at all.
+fn coinbase_tag(coinbase_text: &str) -> Option<String> {
+    coinbase_text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | ':')))
+        .map(str::trim)
+        .filter(|s| s.len() >= 5 && s.chars().filter(|c| c.is_ascii_alphabetic()).count() >= 2)
+        .max_by_key(|s| s.len())
+        .map(str::to_string)
+}
+
+/// The identity a block is grouped under on the network page. Coinbase is
+/// primary: a known pool groups under its name (across transparent AND shielded
+/// blocks), an unidentified shielded miner groups under its coinbase tag (so
+/// distinct shielded pools stay separate instead of collapsing into one
+/// SHIELDED_MINER row), and only a plain transparent miner falls back to its
+/// address.
+fn block_group_key(b: &NetworkBlock) -> String {
+    if let Some(name) = &b.pool_name {
+        return name.clone();
+    }
+    if b.miner_address == SHIELDED_MINER {
+        return coinbase_tag(&b.coinbase_text).unwrap_or_else(|| SHIELDED_MINER.to_string());
+    }
+    b.miner_address.clone()
 }
 
 /// Detect zebrad by checking for the 🦓 emoji bytes (f09fa693) in coinbase hex.
@@ -450,9 +491,14 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
 
     // Build distribution.
     // Track (block_count, zebrad_count, zakura_count, tx_version_counts) per address.
-    let mut addr_stats: std::collections::HashMap<String, (u64, u64, u64, std::collections::HashMap<i32, u64>)> = std::collections::HashMap::new();
+    // Group by the coinbase-derived identity (see block_group_key), not the raw
+    // address: shielded miners all share the SHIELDED_MINER placeholder address,
+    // so grouping by address collapses every shielded pool into one row. The
+    // value also carries a representative address for display.
+    let mut group_stats: std::collections::HashMap<String, (u64, u64, u64, std::collections::HashMap<i32, u64>, String)> = std::collections::HashMap::new();
     for b in &blocks {
-        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0, 0, std::collections::HashMap::new()));
+        let key = block_group_key(b);
+        let entry = group_stats.entry(key).or_insert((0, 0, 0, std::collections::HashMap::new(), b.miner_address.clone()));
         entry.0 += 1;
         if b.is_zebrad {
             entry.1 += 1;
@@ -464,17 +510,21 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     }
 
     let total = blocks.len() as f64;
-    let mut distribution: Vec<MinerDistribution> = addr_stats
+    let mut distribution: Vec<MinerDistribution> = group_stats
         .into_iter()
-        .map(|(addr, (count, zcount, zakcount, ver_counts))| {
-            let is_our_pool = blocks.iter().any(|b| b.miner_address == addr && b.is_our_pool);
+        .map(|(key, (count, zcount, zakcount, ver_counts, addr))| {
+            let is_our_pool = blocks.iter().any(|b| block_group_key(b) == key && b.is_our_pool);
             let pool_name = if is_our_pool {
                 Some("Our Pool".to_string())
             } else {
-                // Use the first block's pool_name for this address
-                blocks.iter().find(|b| b.miner_address == addr).and_then(|b| b.pool_name.clone())
+                // Use the first block's pool_name for this identity
+                blocks.iter().find(|b| block_group_key(b) == key).and_then(|b| b.pool_name.clone())
             };
-            let label = pool_name.clone().unwrap_or_else(|| truncate_address(&addr));
+            // Friendly pool name, else the coinbase tag (shielded/unidentified),
+            // else a truncated transparent address.
+            let label = pool_name.clone().unwrap_or_else(|| {
+                if addr == SHIELDED_MINER { key.clone() } else { truncate_address(&addr) }
+            });
             let dominant_tx_version = ver_counts.into_iter()
                 .max_by_key(|&(_, c)| c)
                 .map(|(v, _)| v)
@@ -1171,5 +1221,61 @@ mod tests {
         let (addr, reward, _, _, _) = extract_coinbase_from_block(&block);
         assert_eq!(addr, SHIELDED_MINER);
         assert!((reward - 3e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn luxor_coinbase_is_identified_as_luxor_not_f2pool() {
+        let overrides = std::collections::HashMap::new();
+        // The lossy render of Luxor's shielded coinbase: height/extranonce
+        // filler, then the stable self-tag.
+        let luxor = "...B.....2/Mined by Luxor - Powered by LuxOS - tag from cfg/";
+        assert_eq!(
+            identify_pool(SHIELDED_MINER, luxor, &overrides).as_deref(),
+            Some("Luxor")
+        );
+        // A generic "Mined by <user>" with no brand no longer maps to F2Pool.
+        assert_eq!(
+            identify_pool(SHIELDED_MINER, "...../Mined by someminer/", &overrides),
+            None
+        );
+        // F2Pool only when its own brand is present.
+        assert_eq!(
+            identify_pool(SHIELDED_MINER, "...../Mined by F2Pool/", &overrides).as_deref(),
+            Some("F2Pool")
+        );
+        // An operator label override still wins over everything.
+        let mut ov = std::collections::HashMap::new();
+        ov.insert(SHIELDED_MINER.to_string(), "Named".to_string());
+        assert_eq!(identify_pool(SHIELDED_MINER, luxor, &ov).as_deref(), Some("Named"));
+    }
+
+    #[test]
+    fn coinbase_tag_extracts_the_stable_self_tag() {
+        assert_eq!(
+            coinbase_tag("...B.....2/Mined by Luxor - Powered by LuxOS - tag from cfg/").as_deref(),
+            Some("Mined by Luxor - Powered by LuxOS - tag from cfg")
+        );
+        assert_eq!(coinbase_tag(".....//NiceHash//").as_deref(), Some("NiceHash"));
+        // Only height/extranonce filler, no real tag.
+        assert_eq!(coinbase_tag("...B....."), None);
+    }
+
+    #[test]
+    fn shielded_miners_group_by_coinbase_tag_not_the_shared_placeholder() {
+        let blk = |tag: &str, name: Option<&str>| NetworkBlock {
+            height: 1, hash: "h".into(), time: 1,
+            miner_address: SHIELDED_MINER.to_string(),
+            miner_label: String::new(),
+            pool_name: name.map(str::to_string),
+            reward_zec: 1.25, is_our_pool: false,
+            coinbase_text: tag.to_string(), coinbase_hex: String::new(),
+            coinbase_tx_version: 6, is_zebrad: false, is_zakura: false,
+        };
+        // Two distinct shielded pools must not share a group key.
+        let luxor = blk("../Mined by Luxor - Powered by LuxOS/", Some("Luxor"));
+        let other = blk("../Mined by someminer/", None);
+        assert_ne!(block_group_key(&luxor), block_group_key(&other));
+        assert_eq!(block_group_key(&luxor), "Luxor");
+        assert_eq!(block_group_key(&other), "Mined by someminer");
     }
 }
