@@ -343,19 +343,31 @@ fn eligible_balance(total: &Value, outputs: &Value) -> Result<i64, ZecdFundingEr
         let vout = row.get("vout").and_then(Value::as_u64)
             .filter(|v| *v <= u32::MAX as u64).ok_or(ZecdFundingError::InvalidEvidence)?;
         if !unique.insert((pool.to_owned(), txid, vout)) { return Err(ZecdFundingError::InvalidEvidence); }
-        let depth = row.get("confirmations").and_then(Value::as_i64)
-            .filter(|d| (10..=u32::MAX as i64).contains(d)).ok_or(ZecdFundingError::InvalidEvidence)?;
-        let _ = depth;
-        if row.get("safe").and_then(Value::as_bool) != Some(true)
-            || row.get("spendable").and_then(Value::as_bool) != Some(true)
-            || row.get("solvable").and_then(Value::as_bool) != Some(true)
-            || row.get("address").and_then(Value::as_str).filter(|a| a.len() <= 2048).is_none()
-            || (pool == "transparent" && row.get("generated").and_then(Value::as_bool).is_none())
-        { return Err(ZecdFundingError::InvalidEvidence); }
         let value = amount(row.get("amount").ok_or(ZecdFundingError::InvalidEvidence)?)?;
         listed = checked_sum(listed, value)?;
-        if matches!(pool, "transparent" | "sapling") { excluded = checked_sum(excluded, value)?; }
-        else { eligible = checked_sum(eligible, value)?; }
+        // Transparent and Sapling are never eligible (they are subtracted from
+        // the total below). Count and move on.
+        if matches!(pool, "transparent" | "sapling") {
+            excluded = checked_sum(excluded, value)?;
+            continue;
+        }
+        // An Orchard/Ironwood note counts toward eligible ONLY if it is mature
+        // (>=10 confirmations) AND fully spendable. A note failing either -- e.g.
+        // a fresh payout change note still under 10 confirmations -- is simply
+        // not counted yet; it must NOT invalidate the whole funding evidence.
+        // The old hard error paused ALL share admission for ~10 blocks after
+        // every payout. Under-counting eligible is conservative: the lease still
+        // requires eligible >= required_spendable, so this can never
+        // over-authorize, only (harmlessly) undercount while a note matures.
+        let mature = row.get("confirmations").and_then(Value::as_i64)
+            .is_some_and(|d| (10..=u32::MAX as i64).contains(&d));
+        let spendable_now = row.get("safe").and_then(Value::as_bool) == Some(true)
+            && row.get("spendable").and_then(Value::as_bool) == Some(true)
+            && row.get("solvable").and_then(Value::as_bool) == Some(true)
+            && row.get("address").and_then(Value::as_str).filter(|a| a.len() <= 2048).is_some();
+        if mature && spendable_now {
+            eligible = checked_sum(eligible, value)?;
+        }
     }
     let remainder = total.checked_sub(excluded).filter(|n| *n >= 0).ok_or(ZecdFundingError::InvalidEvidence)?;
     Ok(remainder.min(eligible))
@@ -1176,8 +1188,10 @@ mod tests {
         assert_eq!(eligible_balance(&json!(8),&rows),Ok(500_000_000)); // Aggregate caps nonspendable notes.
         assert_eq!(eligible_balance(&json!(20),&rows),Ok(700_000_000)); // Listing caps aggregate too.
         assert!(eligible_balance(&json!(2),&rows).is_err());
+        // An immature note is now excluded (not counted), never an error, so a
+        // fresh payout change note cannot pause admission.
         let mut pending=note("orchard",3,"1"); pending["confirmations"]=json!(0);
-        assert!(eligible_balance(&json!(1),&json!([pending])).is_err());
+        assert_eq!(eligible_balance(&json!(1),&json!([pending])),Ok(0));
         let tiny=serde_json::from_str::<Value>("1.000000000000001").unwrap();
         assert!(eligible_balance(&tiny,&json!([])).is_err());
         assert!(eligible_balance(&Value::Null,&json!([])).is_err());
@@ -1188,9 +1202,16 @@ mod tests {
     fn enumeration_is_typed_bounded_unique_and_complete() {
         let n=note("orchard",1,"1");
         assert!(eligible_balance(&json!(2),&json!([n.clone(),n.clone()])).is_err());
-        for field in ["pool","txid","vout","address","amount","confirmations","safe","spendable","solvable"] {
+        // Structural corruption still invalidates the whole evidence:
+        for field in ["pool","txid","vout","amount"] {
             let mut bad=n.clone(); bad.as_object_mut().unwrap().remove(field);
             assert!(eligible_balance(&json!(1),&json!([bad])).is_err(),"{field}");
+        }
+        // A missing eligibility field now EXCLUDES that note (it just is not
+        // counted yet) rather than pausing all admission:
+        for field in ["address","confirmations","safe","spendable","solvable"] {
+            let mut bad=n.clone(); bad.as_object_mut().unwrap().remove(field);
+            assert_eq!(eligible_balance(&json!(1),&json!([bad])),Ok(0),"{field}");
         }
         let rows=Value::Array(vec![n;MAX_UNSPENT_OUTPUTS+1]);
         assert_eq!(eligible_balance(&json!(1),&rows),Err(ZecdFundingError::EnumerationTooLarge));
