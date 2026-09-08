@@ -7,6 +7,7 @@ use tower_http::cors::CorsLayer;
 use crate::diagnostics;
 use crate::handlers::*;
 use crate::network;
+use crate::pps;
 use crate::previews;
 use crate::sessions;
 
@@ -28,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         // authenticated. Use the admin-gated /admin/api/payout/trigger instead.
         .route("/api/pool/stats/history", get(get_stats_history))
         .route("/api/network/blocks", get(network::get_network_blocks))
+        .route("/api/pps", get(pps::get_pps_data))
         .route("/health", get(get_health))
         .route("/api/miner/{address}/diagnostics", get(diagnostics::get_miner_diagnostics))
         .route("/api/pool/info", get(get_pool_info))
@@ -38,6 +40,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/miner/{address}", get(diagnostics::miner_page))
         .route("/network", get(network::network_page))
+        .route("/pps", get(pps::pps_page))
         .route("/sessions", get(sessions::sessions_page))
         .route("/zallet", get(zallet_dashboard))
         .route("/preview1", get(previews::preview1))

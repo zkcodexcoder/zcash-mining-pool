@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod handlers;
 pub mod lwd_tip;
 pub mod network;
+pub mod pps;
 pub mod previews;
 pub mod routes;
 pub mod sessions;
