@@ -102,7 +102,8 @@ fn validate(lease: &PpsChainLease, network: &str, now: i64) -> anyhow::Result<()
             && !lease.disagreement
             && lease.checked_at_unix <= now
             && now < lease.valid_until_unix
-            && lease.valid_until_unix.saturating_sub(lease.checked_at_unix) <= 90,
+            && lease.valid_until_unix.saturating_sub(lease.checked_at_unix)
+                <= pool_db::pps_funding::CHAIN_LEASE_SECONDS,
         "current independently verified PPS chain agreement required"
     );
     Ok(())
@@ -155,7 +156,7 @@ mod tests {
                 "network" => bad.network="mainnet".into(),
                 "disagreement" => bad.disagreement=true,
                 "references" => bad.agreeing_references=1,
-                _ => bad.valid_until_unix=191,
+                _ => bad.valid_until_unix=100+pool_db::pps_funding::CHAIN_LEASE_SECONDS+1,
             }
             *gate.cached.lock().await=Some(bad);
             assert!(gate.valid_cached_lease_with_clock(||100).await.is_err());

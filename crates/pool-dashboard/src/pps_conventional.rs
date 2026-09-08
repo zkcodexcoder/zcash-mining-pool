@@ -5,7 +5,7 @@ use crate::pps_gate::PpsGate;
 use anyhow::{Context, Result};
 use node_rpc::{zecd_conventional::{ConventionalPayoutExpectation, TestnetConventionalProfile,
     verify_conventional_payout, verify_conventional_payout_with_wallet}, ZcashRpcClient};
-use pool_core::pps_funding::{PpsFundingRoute, collect_pps_funding_for_route};
+use pool_core::pps_funding::{PpsFundingError, PpsFundingRoute, collect_pps_funding_for_route};
 use pool_db::{PoolDb, pps_policy::PpsPolicy, pps_funding::{PpsConventionalIntent,
     PpsConventionalRecipient, PpsConventionalReservation, PpsFundingLease}};
 use serde_json::{Value, json};
@@ -207,6 +207,35 @@ pub(crate) async fn process(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRp
         .map_err(|_| anyhow::anyhow!("testnet PPS payout held; funding, wallet or transaction gate failed"))
 }
 
+/// zecd flips not-ready after almost every block, and a block arriving during
+/// the ~40s multi-RPC funding read bumps the funding generation, so a single
+/// fresh collection frequently fails transiently on this reorgy testnet -- the
+/// reason payouts almost never completed (they reserved, then the pre-send
+/// funding recheck failed and refunded). Retry the READ-ONLY collection a
+/// bounded number of times on transient categories before giving up the round.
+/// Real rejections (insolvency, wrong network, unproven signer, bad evidence,
+/// route/recipient) fail immediately. This moves no money: the resulting lease
+/// is still validated at reserve and at the seal under the writer lock.
+async fn collect_funding_resilient(db: &PoolDb, wallet: &ZcashRpcClient, policy: &PpsPolicy,
+    from: &str, node: &ZcashRpcClient, route: &PpsFundingRoute)
+    -> std::result::Result<PpsFundingLease, PpsFundingError>
+{
+    let mut attempt = 0u32;
+    loop {
+        match collect_pps_funding_for_route(db, wallet, &policy.epoch_config(), from, node, route).await {
+            Ok(lease) => return Ok(lease),
+            Err(error) => {
+                let transient = matches!(error,
+                    PpsFundingError::Timeout | PpsFundingError::WalletUnavailable
+                    | PpsFundingError::ConcurrentChange | PpsFundingError::AccountingUnavailable);
+                if !transient || attempt >= 4 { return Err(error); }
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
 async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
     from: &str, minimum: i64, policy: &PpsPolicy, chain: &PpsGate,
     route: &PpsFundingRoute) -> Result<usize>
@@ -263,7 +292,7 @@ async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClie
     }).await?;
     super::payout_health::note_funding_check();
     let funding = pre_send_phase("funding_before_reserve",
-        collect_pps_funding_for_route(db,wallet,&policy.epoch_config(),from,node,route)).await?;
+        collect_funding_resilient(db,wallet,policy,from,node,route)).await?;
     let items:Vec<_> = intent.items.iter().map(|p|(p.miner_id,p.amount_zatoshis)).collect();
     let total = pre_send_phase("claim_total", async {
         items.iter().try_fold(0_i64,|sum,(_,v)|sum.checked_add(*v)).context("PPS total overflow")
@@ -280,7 +309,7 @@ async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClie
         pre_send_phase("chain_before_send", chain.fresh_lease()).await?;
         pre_send_phase("wallet_idle_before_send", wallet_idle(wallet)).await?;
         let mut funding=pre_send_phase("funding_before_send",
-            collect_pps_funding_for_route(db,wallet,&policy.epoch_config(),from,node,route)).await?;
+            collect_funding_resilient(db,wallet,policy,from,node,route)).await?;
         pre_send_phase("funding_recheck", db.check_pps_funding(&funding)).await?;
         let recipients=pre_send_phase("recipient_encoding", async { encode_recipients(&intent) }).await?;
         let chain_guard=pre_send_phase("chain_before_seal", chain.valid_cached_lease()).await?;
