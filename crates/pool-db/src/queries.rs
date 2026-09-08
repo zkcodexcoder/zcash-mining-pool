@@ -1331,7 +1331,7 @@ impl PoolDb {
 
     pub async fn get_recent_payouts(&self, limit: i64) -> Result<Vec<Payout>, DbError> {
         let payouts: Vec<Payout> = sqlx::query_as(
-            "SELECT id, miner_id, txid, amount, created_at FROM payouts ORDER BY id DESC LIMIT ?1",
+            "SELECT id, miner_id, txid, amount, created_at FROM payouts UNION ALL SELECT id, miner_id, txid, amount, created_at FROM pps_payouts ORDER BY created_at DESC, id DESC LIMIT ?1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
