@@ -654,14 +654,23 @@ pub(crate) async fn snapshot(
     } else if !allow_absent {
         return Err(PpsDbError::FundingLeaseRequired);
     }
+    // Conservation is the audit rule: every credited sub-zatoshi is exactly one of
+    // outstanding (pending + paying) or paid. `gross` is the lifetime total and only
+    // ever grows.
+    //
+    // The cap bounds OUTSTANDING liability, not lifetime credits (refill model): a
+    // PPS pool's promises are backed by the block rewards it earns, so capacity must
+    // return as payouts settle and income lands. `max_liability` is therefore the
+    // pool's variance capital — how far in the hole it tolerates being before it
+    // pauses — and lifetime `gross` is expected to exceed it many times over.
     if s.pps_outstanding_subzatoshis
         .checked_add(subunits(s.paid_zatoshis, 0)?)
         != Some(s.gross_subzatoshis)
-        || s.gross_subzatoshis > s.cap_subzatoshis
+        || s.pps_outstanding_subzatoshis > s.cap_subzatoshis
     {
         return Err(PpsDbError::Invariant);
     }
-    s.unused_credit_subzatoshis = s.cap_subzatoshis - s.gross_subzatoshis;
+    s.unused_credit_subzatoshis = s.cap_subzatoshis - s.pps_outstanding_subzatoshis;
     cursor = None;
     loop {
         let rows=sqlx::query("SELECT f.*,p.attempt_id AS conventional_id,p.intent_id,p.fee_bound,p.actual_fee,p.operation_id,p.observed_txid,p.excess_fee,i.canonical_json,h.category AS halt_category FROM pps_fee_reservations f LEFT JOIN pps_conventional_attempts p ON p.attempt_id=f.attempt_id LEFT JOIN pps_conventional_intents i ON i.attempt_id=f.attempt_id LEFT JOIN pps_conventional_halts h ON h.attempt_id=f.attempt_id WHERE (?1 IS NULL OR f.attempt_id>?1) ORDER BY f.attempt_id LIMIT 256")
@@ -735,15 +744,19 @@ pub(crate) async fn snapshot(
     if bad_attribution != 0 {
         return Err(PpsDbError::Invariant);
     }
+    // Exposure is outstanding liability plus committed fees (refill model) — not
+    // lifetime gross, which is expected to grow past the cap indefinitely.
     if committed_fees > e.fee_allowance_zatoshis
-        || s.gross_subzatoshis
+        || s.pps_outstanding_subzatoshis
             .checked_add(subunits(committed_fees, 0)?)
             .map_or(true, |v| v > e.total_exposure_zatoshis as u128 * PPS_SCALE)
     {
         return Err(PpsDbError::FeeBudgetExceeded);
     }
-    // Outstanding + unused capacity is exactly credit cap - paid principal.
-    // Reserved fees stay included once; paid fees need no remaining backing.
+    // Outstanding + unused capacity is exactly the cap: the wallet must always hold
+    // its full variance capital, so any outstanding amount (≤ cap) is payable even
+    // with zero further income. Reserved fees stay included once; paid fees need no
+    // remaining backing.
     let remaining = s
         .pps_outstanding_subzatoshis
         .checked_add(s.unused_credit_subzatoshis)

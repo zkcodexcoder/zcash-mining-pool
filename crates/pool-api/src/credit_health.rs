@@ -85,12 +85,18 @@ mod tests {
                 .state,
             CreditAdmissionState::Ready
         );
-        for field in ["funding_expires_at_unix", "chain_expires_at_unix"] {
+        // A lapsed funding lease only degrades (shares still credit; sends may
+        // hold); a lapsed chain lease is a hard credit gate and pauses.
+        for (field, expected) in [
+            ("funding_expires_at_unix", CreditAdmissionState::Degraded),
+            ("chain_expires_at_unix", CreditAdmissionState::Paused),
+        ] {
             let mut h = heartbeat();
             h[field] = json!(1002);
             assert_eq!(
                 present(true, Some(&h.to_string()), 1002).unwrap().state,
-                CreditAdmissionState::Paused
+                expected,
+                "{field}"
             );
         }
     }
@@ -139,15 +145,23 @@ mod tests {
         assert_eq!(projected.category,"current_quote_insufficient");
         h["state"]=json!("paused"); h["category"]=json!("current_quote_insufficient");
         h["sampled_at_unix"]=json!(1014);
+        // Once that quote lapses its verdict is withheld (fits=None), but the
+        // sampler's recorded hard pause stands until it resamples — the reader
+        // never invents "unknown" from a mere quote-clock expiry.
         let expired=present(true,Some(&h.to_string()),1015).unwrap();
-        assert_eq!(expired.state,CreditAdmissionState::Unknown);
-        assert_eq!(expired.category,"quote_stale");
+        assert_eq!(expired.state,CreditAdmissionState::Paused);
+        assert_eq!(expired.category,"current_quote_insufficient");
+        assert!(expired.current_quote_fits.is_none());
         assert_eq!(expired.quote_expires_at_unix,Some(1015));
         assert!(expired.funding_expiry_valid); // separate evidence is still current
-        for field in ["quote_required","quote_checked_at_unix","quote_expires_at_unix","current_quote_fits","budget_low"] {
+        // Schema-required flags and a half-present quote pair are malformed.
+        for field in ["quote_required","quote_checked_at_unix","quote_expires_at_unix","budget_low"] {
             let mut h=heartbeat(); h.as_object_mut().unwrap().remove(field);
             assert_eq!(present(true,Some(&h.to_string()),1001).unwrap().state,CreditAdmissionState::Unknown, "{field}");
         }
+        // A quote with its fit verdict withheld is merely "no verdict yet" — still healthy.
+        let mut h=heartbeat(); h.as_object_mut().unwrap().remove("current_quote_fits");
+        assert_eq!(present(true,Some(&h.to_string()),1001).unwrap().state,CreditAdmissionState::Ready);
         let mut old=heartbeat(); old["version"]=json!(1);
         assert_eq!(present(true,Some(&old.to_string()),1001).unwrap().state,CreditAdmissionState::Unknown);
         let mut healthy=heartbeat(); healthy["budget_low"]=json!(true);

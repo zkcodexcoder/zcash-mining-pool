@@ -203,6 +203,10 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
   .pill.ready{color:var(--good);background:var(--good-soft)}
   .pill.paused{color:var(--crit);background:var(--crit-soft)}
   .pill.warn{color:var(--owed);background:var(--owed-soft)}
+  .pill.degraded{color:var(--owed);background:var(--owed-soft)}
+  .health-wrap{display:flex;flex-direction:column;align-items:flex-end;gap:.25rem}
+  .health-reason{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-3);letter-spacing:.02em}
+  .health-reason:empty{display:none}
   .pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
   .meta-row{display:flex;flex-wrap:wrap;gap:.4rem 2rem;margin-top:.8rem;color:var(--ink-2);font-size:.86rem}
   .meta-row b{color:var(--ink);font-weight:500}
@@ -290,7 +294,10 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
       <h1>PPS Ledger Console</h1>
     </div>
     <div class="spacer"></div>
-    <span class="pill" id="health-pill"><span class="dot"></span><span id="health-txt">loading…</span></span>
+    <div class="health-wrap">
+      <span class="pill" id="health-pill"><span class="dot"></span><span id="health-txt">loading…</span></span>
+      <span class="health-reason" id="health-reason"></span>
+    </div>
   </header>
   <div class="meta-row">
     <span>Reward mode <b>Pay-Per-Share</b></span>
@@ -301,12 +308,13 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
   <div class="navlinks"><a href="/">← Pool</a><a href="/network">Network</a></div>
 
   <section>
-    <div class="sec-head"><h2>Lifetime credit budget</h2><span class="note">crediting stops permanently for this epoch when the cap is spent</span></div>
+    <div class="sec-head"><h2>Liability cap</h2><span class="note">outstanding promises (owed + in flight) against the pool's variance capital — capacity returns as payouts settle</span></div>
     <div class="cap">
-      <div class="top"><div class="big mono"><span id="gross">—</span> <small>/ <span id="cap">—</span> TAZ credited</small></div><div class="pct" id="cap-pct">—</div></div>
-      <div class="meter" role="img" aria-label="credit cap usage"><div class="fill" id="m-used" style="width:0"></div><div class="fee" id="m-fee" style="width:0"></div></div>
-      <div class="legend"><span class="lg-used">credited to miners · <span id="lg-used">—</span> TAZ</span><span class="lg-fee">tx-fee allowance · <span id="lg-fee">—</span> TAZ</span><span class="lg-free">headroom · <span id="lg-free">—</span> TAZ</span></div>
-      <div class="warn-line" id="budget-warn" hidden>▲ Budget low — <span id="headroom">—</span> TAZ of credit headroom remains before this epoch's cap is reached and crediting halts.</div>
+      <div class="top"><div class="big mono"><span id="outstanding">—</span> <small>/ <span id="cap">—</span> TAZ outstanding</small></div><div class="pct" id="cap-pct">—</div></div>
+      <div class="meter" role="img" aria-label="liability cap usage"><div class="fill" id="m-used" style="width:0"></div><div class="fee" id="m-fee" style="width:0"></div></div>
+      <div class="legend"><span class="lg-used">outstanding to miners · <span id="lg-used">—</span> TAZ</span><span class="lg-fee">tx-fee allowance · <span id="lg-fee">—</span> TAZ</span><span class="lg-free">headroom · <span id="lg-free">—</span> TAZ</span></div>
+      <div class="legend" style="margin-top:.35rem"><span>lifetime credited · <span id="gross" class="mono">—</span> TAZ</span></div>
+      <div class="warn-line" id="budget-warn" hidden>▲ Budget low — <span id="headroom">—</span> TAZ of liability headroom remains. Crediting pauses only if outstanding reaches the cap; capacity comes back as payouts settle.</div>
     </div>
   </section>
 
@@ -395,12 +403,31 @@ const f2 = n => n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractio
 const shorttx = t => t ? t.slice(0,16) : '—';
 const shortaddr = a => a && a.length>18 ? a.slice(0,8)+'…'+a.slice(-6) : (a||'—');
 
-function setPill(state){
-  const p=$('health-pill'), t=$('health-txt');
+// Plain-language reasons for the health category shown under the pill.
+const REASON = {
+  ok:'', funding_missing:'no funding lease yet — shares still credited, payouts held until proven',
+  funding_expired:'funding lease lapsed — shares still credited, payouts held until re-proven',
+  generation_changed:'a payout just moved funds — re-proving funding (~12s), shares still credited',
+  funding_insufficient:'wallet below required cover — shares still credited, payouts held',
+  invalid_evidence:'funding evidence rejected — shares still credited, payouts held',
+  fee_capacity_exhausted:'payout fee budget spent — shares still credited, payouts held',
+  financial_halt:'operator halt — shares still credited, no sends',
+  chain_invalid:'chain-agreement lease invalid — valid shares are being REJECTED',
+  cap_exhausted:'credit cap exhausted — valid shares are being REJECTED',
+  current_quote_insufficient:'next share would exceed the cap — valid shares are being REJECTED',
+  accounting_invalid:'ledger unreadable — valid shares are being REJECTED',
+  concurrent_change:'state changed mid-sample — re-sampling',
+  missing:'no health sample published yet', malformed:'health sample unreadable',
+  stale:'health sample is stale (sampler not running?)', unknown:'sampler could not determine state',
+};
+function setPill(state, category){
+  const p=$('health-pill'), t=$('health-txt'), r=$('health-reason');
   p.className='pill';
   if(state==='ready'){p.classList.add('ready');t.textContent='ADMISSION READY';}
+  else if(state==='degraded'){p.classList.add('degraded');t.textContent='CREDITING · PAYOUTS MAY HOLD';}
   else if(state==='paused'){p.classList.add('paused');t.textContent='ADMISSION PAUSED';}
-  else {p.classList.add('warn');t.textContent=(state||'UNKNOWN').toUpperCase();}
+  else {t.textContent='TELEMETRY UNKNOWN';}
+  r.textContent = REASON[category] ?? (category||'');
 }
 function gate(name,desc,cls,val){
   return `<div class="gate"><span class="st ${cls}"></span><div><div class="gname">${name}</div><div class="gdesc">${desc}</div></div><span class="gval">${val}</span></div>`;
@@ -414,21 +441,25 @@ async function render(){
   const gross = TAZ(d.gross_whole_zat), cap = TAZ(d.cap_zat), feecap = TAZ(d.fee_cap_zat);
   const total = TAZ(d.total_cap_zat), reserve = TAZ(d.reserve_floor_zat);
   const pending = TAZ(d.pending_zat), paying = TAZ(d.paying_zat), paid = TAZ(d.paid_zat);
-  const capPct = cap>0 ? gross/cap*100 : 0;
-  const headroom = Math.max(cap-gross,0);
+  // Refill model: the cap bounds OUTSTANDING liability (owed + in flight), not
+  // lifetime credits. Capacity returns as payouts settle.
+  const outstanding = pending + paying;
+  const capPct = cap>0 ? outstanding/cap*100 : 0;
+  const headroom = Math.max(cap-outstanding,0);
 
   $('network').textContent = d.network;
   $('epoch').textContent = d.epoch;
   $('fee').textContent = d.fee_percent.toFixed(1)+'%';
   $('fee2').textContent = d.fee_percent.toFixed(1)+'%';
 
+  $('outstanding').textContent = f2(outstanding);
   $('gross').textContent = f2(gross);
   $('cap').textContent = f2(cap);
   $('cap-pct').textContent = capPct.toFixed(1)+'%';
-  // meter: scale used+fee against total exposure so the fee band reads true
-  $('m-used').style.width = (total>0?gross/total*100:0)+'%';
+  // meter: scale outstanding+fee against total exposure so the fee band reads true
+  $('m-used').style.width = (total>0?outstanding/total*100:0)+'%';
   $('m-fee').style.width = (total>0?feecap/total*100:0)+'%';
-  $('lg-used').textContent = f2(gross);
+  $('lg-used').textContent = f2(outstanding);
   $('lg-fee').textContent = f2(feecap);
   $('lg-free').textContent = f2(headroom);
   const low = d.health && d.health.budget_low;
@@ -464,13 +495,25 @@ async function render(){
   const h = d.health || {};
   const now = Math.floor(Date.now()/1000);
   const secs = (end)=> end? Math.max(end-now,0)+' s':'—';
-  setPill(h.state);
-  const admCls = h.state==='ready'?'ok':(h.state==='paused'?'bad':'warn');
+  setPill(h.state, h.category);
+  // Admission: ready and degraded both mean valid shares ARE being credited;
+  // only paused means they are being rejected.
+  const admCls = h.state==='ready'?'ok':(h.state==='degraded'?'warn':(h.state==='paused'?'bad':''));
+  const admVal = {ready:'CREDITING', degraded:'CREDITING (degraded)', paused:'REJECTING', unknown:'UNKNOWN'}[h.state] || '—';
+  // Funding gates sends, not credits: stale is a warning, never a rejection.
+  const fundVal = h.funding_expiry_valid ? 'valid · '+secs(h.funding_expires_at_unix) : 'stale — re-proving';
+  // Price telemetry: when the last share was priced (idle is normal between
+  // shares and after a new tip), and whether that price fit under the cap.
+  const pricedAgo = h.quote_checked_at_unix ? Math.max(now-h.quote_checked_at_unix,0) : null;
+  const priceCls = h.current_quote_fits===false ? 'bad' : (pricedAgo!==null && pricedAgo<=30 ? 'ok' : '');
+  const priceVal = h.current_quote_fits===false ? 'does NOT fit cap'
+    : pricedAgo===null ? 'none priced yet'
+    : (h.current_quote_fits ? 'fits · ' : 'idle · ') + 'last priced '+pricedAgo+' s ago';
   $('gates').innerHTML =
-    gate('Credit admission','shares being priced &amp; credited',admCls,(h.state||'—').toUpperCase())+
-    gate('Funding lease','wallet covers all liabilities',h.funding_expiry_valid?'ok':'bad','valid · '+secs(h.funding_expires_at_unix))+
-    gate('Chain agreement','node + references agree',h.chain_expiry_valid?'ok':'bad','valid · '+secs(h.chain_expires_at_unix))+
-    gate('Price quote','current subsidy fits the cap',h.current_quote_fits?'ok':'warn',h.current_quote_fits?'fits':'—')+
+    gate('Credit admission','valid shares priced &amp; credited',admCls,admVal)+
+    gate('Funding lease','wallet cover — gates payouts, not credits',h.funding_expiry_valid?'ok':'warn',fundVal)+
+    gate('Chain agreement','node + references agree — gates credits',h.chain_expiry_valid?'ok':'bad',h.chain_expiry_valid?'valid · '+secs(h.chain_expires_at_unix):'INVALID — rejecting shares')+
+    gate('Price quote','last priced share vs the cap',priceCls,priceVal)+
     gate('Budget','credit cap headroom',low?'warn':'ok',low?'LOW':'ok');
 
   // miners

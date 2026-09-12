@@ -12,9 +12,33 @@ pub const CREDIT_HEALTH_MAX_AGE_SECONDS: i64 = 15;
 pub const CREDIT_HEALTH_KEY: &str = "pps_credit_health";
 const QUOTE_MAX_AGE_SECONDS: i64 = 15;
 
+/// What the credit path is doing right now, as shown on the /pps page.
+///
+/// * `Ready` — shares are being priced and credited, funding and chain proofs are
+///   current.
+/// * `Degraded` — shares are STILL being credited (a valid share is never rejected
+///   for the pool's own solvency timing), but a send-side proof is stale, so
+///   payouts may be held until it recovers: a missing/expired/insufficient
+///   funding lease, a generation bump after a payout, exhausted fee capacity, or
+///   an operator halt.
+/// * `Paused` — a hard gate is actually rejecting valid shares: the chain-agreement
+///   lease is invalid, the cumulative cap is exhausted, accounting is unreadable,
+///   or the next share would not fit under the cap.
+/// * `Unknown` — the sampler could not determine the state at all (telemetry
+///   missing, malformed, stale, or a concurrent change mid-sample). A merely
+///   idle pool (no share priced in the last few seconds, or a new tip) is NOT
+///   unknown; that is surfaced as informational quote timing instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CreditAdmissionState { Ready, Paused, Unknown }
+pub enum CreditAdmissionState { Ready, Degraded, Paused, Unknown }
+
+/// Send-side reasons: crediting continues, only sending may be held. Everything
+/// else in `assess` is a hard credit gate and maps to `Paused`.
+fn degrades_only(reason: &str) -> bool {
+    matches!(reason,
+        "financial_halt" | "funding_missing" | "funding_expired" | "generation_changed"
+        | "invalid_evidence" | "funding_insufficient" | "fee_capacity_exhausted")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,23 +152,27 @@ pub fn decode_credit_health(raw: Option<&str>, now_unix: i64) -> PpsCreditHealth
     h.funding_expiry_valid &= h.funding_checked_at_unix.is_some_and(|v| v <= now_unix)
         && h.funding_expires_at_unix.is_some_and(|v| now_unix < v);
     h.chain_expiry_valid &= h.chain_expires_at_unix.is_some_and(|v| now_unix < v);
-    if h.state == CreditAdmissionState::Ready {
-        if !h.funding_expiry_valid { h.state=CreditAdmissionState::Paused; h.category="funding_expired".into(); }
-        else if !h.chain_expiry_valid { h.state=CreditAdmissionState::Paused; h.category="chain_invalid".into(); }
-        else if h.generation_matches != Some(true) || h.category != "ok" {
-            return PpsCreditHealth::unknown(now_unix,"malformed");
+    if matches!(h.state, CreditAdmissionState::Ready | CreditAdmissionState::Degraded) {
+        // A lapsed chain lease is a hard credit gate whatever the funding state.
+        if !h.chain_expiry_valid { h.state=CreditAdmissionState::Paused; h.category="chain_invalid".into(); }
+        else if h.state == CreditAdmissionState::Ready {
+            // A lapsed funding lease only degrades: shares are still credited,
+            // sends may be held until it recovers.
+            if !h.funding_expiry_valid { h.state=CreditAdmissionState::Degraded; h.category="funding_expired".into(); }
+            else if h.generation_matches != Some(true) || h.category != "ok" {
+                return PpsCreditHealth::unknown(now_unix,"malformed");
+            }
         }
     }
-    if h.quote_required && (h.state==CreditAdmissionState::Ready || h.category=="current_quote_insufficient") {
-        if h.quote_checked_at_unix.is_none() || h.current_quote_fits.is_none() {
-            h.state=CreditAdmissionState::Unknown; h.category="quote_missing".into();
-            h.current_quote_fits=None;
-        } else if h.quote_expires_at_unix.is_none_or(|end| now_unix>=end) {
-            h.state=CreditAdmissionState::Unknown; h.category="quote_stale".into();
-            h.current_quote_fits=None;
-        } else if h.current_quote_fits==Some(false) {
+    // Price telemetry is informational (when the last share was priced) and never
+    // downgrades a healthy state to Unknown. The one price gate — a fresh quote
+    // that would not fit under the cap — is a hard pause; once that quote is no
+    // longer current its verdict is unknown, not still-failing.
+    if h.quote_required {
+        if h.quote_expires_at_unix.is_none_or(|end| now_unix>=end) { h.current_quote_fits=None; }
+        if h.current_quote_fits==Some(false) {
             h.state=CreditAdmissionState::Paused; h.category="current_quote_insufficient".into();
-        } else if h.category=="current_quote_insufficient" {
+        } else if h.category=="current_quote_insufficient" && h.current_quote_fits==Some(true) {
             return PpsCreditHealth::unknown(now_unix,"malformed");
         }
     }
@@ -193,24 +221,29 @@ fn same_quote(a:Option<&QuoteObservation>,b:Option<&QuoteObservation>)->bool {
 }
 fn assess_quote(h:&mut PpsCreditHealth,quote:Option<&QuoteObservation>,job:Option<&QuoteJob>,
     context_unchanged:bool,unused:u128,now:i64,instant:Instant) {
-    // A known financial pause takes precedence over missing price telemetry.
-    if !h.quote_required || h.state!=CreditAdmissionState::Ready {return;}
-    let reason=if !context_unchanged {Some("quote_context_changed")}
-        else if let Some(q)=quote {
-            if job.is_none_or(|j|j.job_id!=q.job_id || j.prev_hash!=q.prev_hash) {Some("quote_context_changed")}
-            else if now<q.checked_at || now.checked_sub(q.checked_at).is_none_or(|v|v>=QUOTE_MAX_AGE_SECONDS)
-                || instant.checked_duration_since(q.checked).is_none_or(|v|v>=Duration::from_secs(QUOTE_MAX_AGE_SECONDS as u64))
-            {Some("quote_stale")}
-            else {
-                h.quote_checked_at_unix=Some(q.checked_at);
-                h.quote_expires_at_unix=q.checked_at.checked_add(QUOTE_MAX_AGE_SECONDS);
-                h.current_quote_fits=Some(q.amount<=unused);
-                if q.amount>unused {Some("current_quote_insufficient")} else {None}
-            }
-        } else {Some("quote_missing")};
-    if let Some(reason)=reason {
-        h.state=if reason=="current_quote_insufficient" {CreditAdmissionState::Paused} else {CreditAdmissionState::Unknown};
-        h.category=reason.into();
+    if !h.quote_required {return;}
+    // Informational: when the last share was priced. A pool that has not priced
+    // a share in the last few seconds, or whose tip just moved, is idle — never
+    // "unknown" — so this records timing only and changes no state.
+    let Some(q)=quote else {return;};
+    h.quote_checked_at_unix=Some(q.checked_at);
+    h.quote_expires_at_unix=q.checked_at.checked_add(QUOTE_MAX_AGE_SECONDS);
+    // A hard pause takes precedence over the price gate.
+    if matches!(h.state, CreditAdmissionState::Paused | CreditAdmissionState::Unknown) {return;}
+    // Only a FRESH quote for the CURRENT job says anything about the next share.
+    let fresh = context_unchanged
+        && job.is_some_and(|j| j.job_id==q.job_id && j.prev_hash==q.prev_hash)
+        && now>=q.checked_at
+        && now.checked_sub(q.checked_at).is_some_and(|v| v<QUOTE_MAX_AGE_SECONDS)
+        && instant.checked_duration_since(q.checked)
+            .is_some_and(|v| v<Duration::from_secs(QUOTE_MAX_AGE_SECONDS as u64));
+    if !fresh {return;}
+    h.current_quote_fits=Some(q.amount<=unused);
+    if q.amount>unused {
+        // The next share would not fit under the cumulative cap. That IS a hard
+        // credit gate (CapExceeded rejects it), so it pauses.
+        h.state=CreditAdmissionState::Paused;
+        h.category="current_quote_insufficient".into();
     }
 }
 
@@ -302,7 +335,11 @@ fn assess(h:&mut PpsCreditHealth, epoch:&PpsEpoch, route:&PpsFundingRoute,
                 || crate::pps_funding::validate_credit_fee_capacity(route,s).is_err() { Some("fee_capacity_exhausted") }
             else { None }
         } else { Some("accounting_invalid") };
-    h.state=if reason.is_none() { CreditAdmissionState::Ready } else { CreditAdmissionState::Paused };
+    h.state=match reason {
+        None => CreditAdmissionState::Ready,
+        Some(r) if degrades_only(r) => CreditAdmissionState::Degraded,
+        Some(_) => CreditAdmissionState::Paused,
+    };
     h.category=reason.unwrap_or("ok").into();
 }
 
@@ -418,7 +455,9 @@ mod tests {
         let mut h=ready(); h.sampled_at_unix=139;
         assert_eq!(decode(&h,139).state,CreditAdmissionState::Ready);
         let expired=decode(&h,140);
-        assert_eq!(expired.state,CreditAdmissionState::Paused);
+        // A lapsed funding lease only degrades now: shares are still credited,
+        // sends may be held. It is no longer reported as a pause.
+        assert_eq!(expired.state,CreditAdmissionState::Degraded);
         assert_eq!(expired.category,"funding_expired");
         assert_eq!(expired.funding_expires_at_unix,Some(140));
         h.chain_expires_at_unix=Some(139);
@@ -534,7 +573,11 @@ mod tests {
         }
     }
     #[test]
-    fn quote_context_missing_changed_or_original_clock_expired_is_unknown() {
+    fn quote_gaps_are_informational_and_never_unknown() {
+        // A missing quote, a quote for a different job/tip, a changed context, or
+        // an expired quote clock all mean the pool is merely idle between priced
+        // shares (or the tip moved). That is NOT unknown: the state stays as it
+        // was and only the fresh-quote verdict is withheld.
         let (quote,job)=quote_fixture();
         for case in 0..8 {
             let mut h=ready(); h.quote_required=true;
@@ -544,17 +587,28 @@ mod tests {
             assess_quote(&mut h,if case==0 {None}else{Some(&quote)},Some(&changed),case!=3,100,
                 if case==4 {115}else if case==5 {99}else{100},
                 if case==6 {quote.checked+Duration::from_secs(15)} else if case==7 {quote.checked-Duration::from_secs(1)}else{quote.checked});
-            assert_eq!(h.state,CreditAdmissionState::Unknown,"case {case}");
-            assert!(h.current_quote_fits.is_none());
+            assert_eq!(h.state,CreditAdmissionState::Ready,"case {case}");
+            assert_eq!(h.category,"ok","case {case}");
+            assert!(h.current_quote_fits.is_none(),"case {case}");
         }
         let mut h=ready(); h.quote_required=true;
         assess_quote(&mut h,Some(&quote),Some(&job),true,10,114,quote.checked+Duration::from_secs(14));
         assert_eq!(h.state,CreditAdmissionState::Ready);
-        assert_eq!(decode(&h,115).category,"quote_stale");
+        // Once the quote clock lapses at read time the verdict is withheld, but
+        // the healthy state is untouched — no "quote_stale" downgrade.
+        let lapsed=decode(&h,115);
+        assert_eq!(lapsed.state,CreditAdmissionState::Ready);
+        assert_eq!(lapsed.category,"ok");
+        assert!(lapsed.current_quote_fits.is_none());
         h.sampled_at_unix=114; // publishing again cannot restamp the quote
-        assert_eq!(decode(&h,115).state,CreditAdmissionState::Unknown);
+        assert_eq!(decode(&h,115).state,CreditAdmissionState::Ready);
+        // A recorded hard pause (next share would not fit the cap) stands after
+        // the quote lapses: the sampler's verdict is kept until it resamples.
         h.current_quote_fits=Some(false); h.state=CreditAdmissionState::Paused; h.category="current_quote_insufficient".into();
-        assert_eq!(decode(&h,115).state,CreditAdmissionState::Unknown);
+        assert_eq!(decode(&h,115).state,CreditAdmissionState::Paused);
+        // But a recorded pause that contradicts a fresh fitting quote is malformed.
+        h.current_quote_fits=Some(true);
+        assert_eq!(decode(&h,110).state,CreditAdmissionState::Unknown);
     }
     #[test]
     fn equivalent_newer_quote_does_not_invalidate_or_renew_original_observation() {
@@ -564,7 +618,9 @@ mod tests {
         let mut h=ready(); h.quote_required=true;
         assess_quote(&mut h,Some(&q),Some(&job),same_quote(Some(&q),Some(&newer)),10,114,newer.checked);
         assert_eq!(h.quote_checked_at_unix,Some(100)); assert_eq!(h.quote_expires_at_unix,Some(115));
-        assert_eq!(decode(&h,115).category,"quote_stale");
+        // The original observation lapsing is informational: still Ready, no downgrade.
+        let lapsed=decode(&h,115);
+        assert_eq!(lapsed.state,CreditAdmissionState::Ready); assert_eq!(lapsed.category,"ok");
         newer.amount+=1; assert!(!same_quote(Some(&q),Some(&newer)));
         newer=q.clone(); newer.job_id="43".into(); assert!(!same_quote(Some(&q),Some(&newer)));
         newer=q.clone(); newer.prev_hash="b".repeat(64); assert!(!same_quote(Some(&q),Some(&newer)));
@@ -573,7 +629,9 @@ mod tests {
     #[test]
     fn quote_migration_and_metadata_are_fail_closed_and_private() {
         let mut h=ready(); h.quote_required=true;
-        assert_eq!(decode(&h,100).category,"quote_missing");
+        // No quote yet is just "nothing priced yet" — healthy, not missing.
+        assert_eq!(decode(&h,100).state,CreditAdmissionState::Ready);
+        assert_eq!(decode(&h,100).category,"ok");
         let mut old=serde_json::to_value(ready()).unwrap(); old["version"]=1.into();
         assert_eq!(decode_credit_health(Some(&old.to_string()),100).state,CreditAdmissionState::Unknown);
         for field in ["quote_required","budget_low"] {

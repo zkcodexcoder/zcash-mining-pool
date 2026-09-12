@@ -1413,6 +1413,14 @@ impl ShareValidator {
                     crate::pps_credit_health::db_category(&error));
                     StratumError::other("PPS admission paused: ledger or authorization gate") })?;
             drop(latest);
+            // Never-reject: the share was credited even though the credit-path funding
+            // gate was stale (typically the ~12s window after a payout bumps the funding
+            // generation). Surface it for the operator; it is NOT a denial — the payout
+            // seal still re-proves funding hard before any money moves.
+            if let Some(category) = receipt.funding_advisory {
+                tracing::warn!(category, worker = %worker_name,
+                    "PPS share credited under a stale funding lease (advisory; send-side seal still gates payouts)");
+            }
             if receipt.duplicate && !is_block {
                 return Ok(ShareResult { is_block: false, block_height: None });
             }

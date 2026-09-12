@@ -1,8 +1,12 @@
 //! Durable PPS accounting, isolated from legacy block credits and reversals.
 //! The trusted validation caller MUST establish canonical proof identity, PoW,
 //! immutable job target, miner-only subsidy and quote provenance before calling.
-//! The cap is cumulative gross credits, including already-paid claims: neither
-//! restart, payout nor a new fee epoch replenishes this conservative loss cap.
+//! The cap (`max_liability`) bounds OUTSTANDING liability — pending + paying, i.e.
+//! promises not yet settled — never lifetime credits. Capacity refills as payouts
+//! settle, backed by the block rewards a PPS pool earns; the cap is the pool's
+//! variance capital (how far in the hole it tolerates being before pausing), and
+//! the wallet must hold it in full so any outstanding amount is always payable.
+//! `gross` remains the monotonic lifetime audit total: outstanding + paid == gross.
 pub use crate::pps_funding::{
     PpsConventionalAttempt, PpsConventionalHalt, PpsConventionalIntent, PpsConventionalRecipient,
     PpsConventionalReservation, PpsFeeReservation, PpsFundingLease,
@@ -80,6 +84,29 @@ pub struct PpsReceipt {
     pub share_id: i64,
     pub duplicate: bool,
     pub credited_subzatoshis: u128,
+    /// Set when the share was credited even though the credit-path funding gate
+    /// was stale or momentarily insufficient (e.g. the ~12s window after a payout
+    /// bumps the funding generation). The share is never rejected for this; the
+    /// payout seal re-proves funding hard before any money moves. Carries the
+    /// bypassed category so the caller can log/alert without counting a denial.
+    pub funding_advisory: Option<&'static str>,
+}
+
+/// Credit-path funding policy: a valid proof-of-work share is NEVER rejected for a
+/// stale, absent, or momentarily insufficient funding lease, nor for an exhausted
+/// fee budget. Those are send-side solvency concerns and are enforced hard where
+/// money actually moves — the payout seal re-proves the funding lease and reserves
+/// the fee before every `z_sendmany`. The cumulative cap (checked separately in the
+/// credit transaction) remains the hard bound on everything the pool can ever owe.
+/// Only accounting corruption or unavailability stays fatal here.
+fn advisory_funding(result: Result<(), PpsDbError>) -> Result<Option<&'static str>, PpsDbError> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(PpsDbError::FundingLeaseRequired) => Ok(Some("funding_lease_required")),
+        Err(PpsDbError::FundingInsufficient) => Ok(Some("funding_insufficient")),
+        Err(PpsDbError::FeeBudgetExceeded) => Ok(Some("fee_budget_exceeded")),
+        Err(other) => Err(other),
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PpsLedgerSummary {
@@ -347,6 +374,7 @@ impl PoolDb {
                 share_id: row.try_get("share_id")?,
                 duplicate: true,
                 credited_subzatoshis: s.amount_subzatoshis,
+                funding_advisory: None,
             };
             tx.commit().await?;
             return Ok(receipt);
@@ -354,7 +382,9 @@ impl PoolDb {
         epoch_check(&mut tx, e).await?;
         let l = lease.ok_or(PpsDbError::ChainLeaseRequired)?;
         let now = clock()?;
-        crate::pps_funding::check_credit(&mut tx, e, funding, now).await?;
+        // Advisory: a stale funding lease never rejects a valid share (see advisory_funding).
+        let funding_advisory = advisory_funding(
+            crate::pps_funding::check_credit(&mut tx, e, funding, now).await)?;
         if l.network != e.network
             || l.disagreement
             || l.agreeing_references < 2
@@ -371,13 +401,27 @@ impl PoolDb {
         let meta = sqlx::query("SELECT * FROM pps_meta WHERE singleton=1")
             .fetch_one(&mut *tx)
             .await?;
-        let gross = amount(
+        let gross_before = amount(
             meta.try_get("gross_whole")?,
             meta.try_get("gross_fraction")?,
-        )?
-        .checked_add(s.amount_subzatoshis)
-        .ok_or(PpsDbError::Invariant)?;
-        if gross > e.max_liability_zatoshis as u128 * PPS_SCALE {
+        )?;
+        let gross = gross_before
+            .checked_add(s.amount_subzatoshis)
+            .ok_or(PpsDbError::Invariant)?;
+        // The cap bounds OUTSTANDING liability (pending + paying = gross − paid),
+        // not lifetime credits: capacity refills as payouts settle, backed by the
+        // block rewards the pool earns. `max_liability` is the pool's variance
+        // capital. `gross` itself stays monotonic as the audit total.
+        let paid_total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(paid),0) FROM pps_accounts")
+            .fetch_one(&mut *tx)
+            .await?;
+        let outstanding_before = gross_before
+            .checked_sub(amount(paid_total, 0)?)
+            .ok_or(PpsDbError::Invariant)?;
+        let outstanding = outstanding_before
+            .checked_add(s.amount_subzatoshis)
+            .ok_or(PpsDbError::Invariant)?;
+        if outstanding > e.max_liability_zatoshis as u128 * PPS_SCALE {
             return Err(PpsDbError::CapExceeded);
         }
         if quote.is_none() {
@@ -447,12 +491,15 @@ impl PoolDb {
         {
             return Err(PpsDbError::ChainLeaseRequired);
         }
-        crate::pps_funding::check(&mut tx, e, funding, commit_now, false).await?;
+        // Advisory at commit time too: the lease may have gone stale during the write.
+        let funding_advisory = funding_advisory.or(advisory_funding(
+            crate::pps_funding::check(&mut tx, e, funding, commit_now, false).await)?);
         tx.commit().await?;
         Ok(PpsReceipt {
             share_id,
             duplicate: false,
             credited_subzatoshis: s.amount_subzatoshis,
+            funding_advisory,
         })
     }
     pub async fn pps_invariant(&self) -> Result<PpsLedgerSummary, PpsDbError> {
@@ -824,7 +871,9 @@ pub(crate) async fn reconcile(c: &mut SqliteConnection) -> Result<PpsLedgerSumma
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_events")
         .fetch_one(&mut *c)
         .await?;
-    if total != gross || count != expected || count != stored || gross > cap {
+    // Lifetime gross is audited against the event log; the cap is checked against
+    // OUTSTANDING liability once the accounts are summed below (refill model).
+    if total != gross || count != expected || count != stored {
         return Err(PpsDbError::Invariant);
     }
     let mut s = PpsLedgerSummary {
@@ -880,6 +929,14 @@ pub(crate) async fn reconcile(c: &mut SqliteConnection) -> Result<PpsLedgerSumma
             .ok_or(PpsDbError::Invariant)?;
     }
     if !per_miner.is_empty() {
+        return Err(PpsDbError::Invariant);
+    }
+    // Refill model: outstanding liability (pending + paying, incl. fractions) must
+    // never exceed the cap. Lifetime gross may — and is expected to.
+    let outstanding = amount(add(s.pending_zatoshis, s.paying_zatoshis)?, 0)?
+        .checked_add(s.fractional_subzatoshis)
+        .ok_or(PpsDbError::Invariant)?;
+    if outstanding > cap {
         return Err(PpsDbError::Invariant);
     }
     let e = crate::pps_funding::active_epoch(c).await?;
@@ -1026,34 +1083,45 @@ mod tests {
         assert!(matches!(f.db.pps_credit_readiness_snapshot(&wrong).await,Err(PpsDbError::EpochMismatch)));
     }
     #[tokio::test]
-    async fn funding_absent_stale_wrong_network_or_policy_cannot_credit() {
+    async fn funding_absent_stale_wrong_network_or_policy_still_credits_advisory() {
+        // Never-reject: a valid share is credited regardless of the funding lease.
+        // The lease is still validated in full; a failure surfaces on the receipt
+        // as `funding_advisory` (so the operator is told) instead of a rejection.
+        // Solvency is enforced hard where money moves — the payout seal.
         let f = setup(true, 10).await;
-        let share = event(&f, 1, 1);
-        assert!(matches!(
-            f.db.credit_pps_share(&f.e, &share, Some(&f.l), None, NOW)
-                .await,
-            Err(PpsDbError::FundingLeaseRequired)
-        ));
+        let r = f.db.credit_pps_share(&f.e, &event(&f, 1, 1), Some(&f.l), None, NOW)
+            .await
+            .unwrap();
+        assert!(!r.duplicate);
+        assert_eq!(r.funding_advisory, Some("funding_lease_required"));
         for kind in 0..8 {
             let mut l = funded(&f).await;
-            match kind {
-                0 => l.valid_until_unix = NOW,
-                1 => l.valid_until_unix = NOW + crate::pps_funding::FUNDING_LEASE_SECONDS + 1,
-                2 => l.checked_at_unix = NOW + 1,
-                3 => l.network = "mainnet".into(),
-                4 => l.reserve_floor_zatoshis -= 1,
-                5 => l.reserved_fee_allowance_zatoshis -= 1,
-                6 => l.generation += 1,
-                _ => l.spendable_zatoshis = 119,
-            }
-            assert!(f
+            let expected = match kind {
+                0 => { l.valid_until_unix = NOW; "funding_lease_required" }
+                1 => { l.valid_until_unix = NOW + crate::pps_funding::FUNDING_LEASE_SECONDS + 1; "funding_lease_required" }
+                2 => { l.checked_at_unix = NOW + 1; "funding_lease_required" }
+                3 => { l.network = "mainnet".into(); "funding_lease_required" }
+                4 => { l.reserve_floor_zatoshis -= 1; "funding_lease_required" }
+                5 => { l.reserved_fee_allowance_zatoshis -= 1; "funding_lease_required" }
+                6 => { l.generation += 1; "funding_lease_required" }
+                _ => { l.spendable_zatoshis = 119; "funding_insufficient" }
+            };
+            let r = f
                 .db
-                .credit_pps_share(&f.e, &share, Some(&f.l), Some(&l), NOW)
+                .credit_pps_share(&f.e, &event(&f, 10 + kind, 1), Some(&f.l), Some(&l), NOW)
                 .await
-                .is_err());
+                .unwrap();
+            assert!(!r.duplicate, "kind {kind}");
+            assert_eq!(r.funding_advisory, Some(expected), "kind {kind}");
         }
-        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 0);
-        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 0);
+        // Every one of those valid shares was credited and recorded exactly once.
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 9);
+        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 9);
+        // A fully valid lease credits with no advisory at all.
+        let r = f.db.credit_pps_share(&f.e, &event(&f, 20, 1), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        assert_eq!(r.funding_advisory, None);
     }
     #[tokio::test]
     async fn funding_rechecks_clock_before_commit_and_current_legacy_obligations() {
@@ -1062,8 +1130,10 @@ mod tests {
         let mut l = funded(&f).await;
         l.valid_until_unix = NOW + 1;
         let calls = AtomicUsize::new(0);
-        assert!(matches!(
-            f.db.credit_pps_share_with_clock(
+        // The lease is valid at the pre-write check (NOW) but the commit-time clock
+        // reads NOW+1, past its expiry. The commit-time recheck still RUNS — under
+        // never-reject it reports the lapse on the receipt rather than rejecting.
+        let r = f.db.credit_pps_share_with_clock(
                 &f.e,
                 &event(&f, 1, 1),
                 Some(&f.l),
@@ -1071,20 +1141,23 @@ mod tests {
                 NOW,
                 || Ok(NOW + calls.fetch_add(1, Ordering::SeqCst) as i64)
             )
-            .await,
-            Err(PpsDbError::FundingLeaseRequired)
-        ));
-        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 0);
+            .await
+            .unwrap();
+        assert_eq!(r.funding_advisory, Some("funding_lease_required"));
+        assert!(calls.load(Ordering::SeqCst) >= 2, "commit-time clock must be re-read");
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 1);
         l = funded(&f).await;
         l.spendable_zatoshis = 120;
         // A new legacy liability after attestation is observed inside the credit
-        // transaction, even though it has not changed wallet spend generation.
+        // transaction, even though it has not changed wallet spend generation:
+        // the wallet no longer covers required backing, so the credit carries the
+        // insufficiency advisory (and is still credited).
         f.db.credit_balance(f.m, 1).await.unwrap();
-        assert!(matches!(
-            f.db.credit_pps_share(&f.e, &event(&f, 1, 1), Some(&f.l), Some(&l), NOW)
-                .await,
-            Err(PpsDbError::FundingInsufficient)
-        ));
+        let r = f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&l), NOW)
+            .await
+            .unwrap();
+        assert_eq!(r.funding_advisory, Some("funding_insufficient"));
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 2);
     }
     #[tokio::test]
     async fn funding_generation_invalidates_all_legacy_wallet_outflow_lifecycles() {
@@ -1137,7 +1210,9 @@ mod tests {
         let s = f.db.pps_funding_snapshot().await.unwrap();
         assert_eq!((s.paid_fees_zatoshis, s.reserved_fees_zatoshis), (1, 0));
         assert_eq!(s.gross_subzatoshis, 3 * PPS_SCALE + 1);
-        assert_eq!(s.required_spendable_zatoshis, 118);
+        // Refill model: the 1 paid no longer reduces required backing (fees still
+        // never replenish; principal capacity does, but the full cap stays backed).
+        assert_eq!(s.required_spendable_zatoshis, 119);
         let mut e = f.e.clone();
         e.id = "next".into();
         f.db.initialize_pps_epoch(&e, Some(&funded(&f).await))
@@ -1209,7 +1284,7 @@ mod tests {
         assert_eq!(f.db.pps_invariant().await.unwrap().pending_zatoshis, 3);
     }
     #[tokio::test]
-    async fn funding_final_fee_can_only_cover_all_claims_then_new_credits_stop() {
+    async fn funding_final_fee_can_only_cover_all_claims_then_new_credits_carry_advisory() {
         let f = setup(true, 10).await;
         f.db.credit_pps_share(
             &f.e,
@@ -1228,17 +1303,19 @@ mod tests {
         f.db.reserve_pps_payout(a, &[(f.m, 1)], &funded(&f).await, &q)
             .await
             .unwrap();
-        assert!(matches!(
-            f.db.credit_pps_share(
+        // The reservation consumed the last of the fee allowance. Fee capacity is a
+        // send-side concern (the seal reserves fees hard); at credit time it is
+        // advisory — the share is still credited and the receipt says why.
+        let r = f.db.credit_pps_share(
                 &f.e,
                 &event(&f, 2, 1),
                 Some(&f.l),
                 Some(&funded(&f).await),
                 NOW
             )
-            .await,
-            Err(PpsDbError::FeeBudgetExceeded)
-        ));
+            .await
+            .unwrap();
+        assert_eq!(r.funding_advisory, Some("fee_budget_exceeded"));
         signed(&f, a, &"c".repeat(64)).await;
         f.db.confirm_pps_payout(a, &"c".repeat(64)).await.unwrap();
         assert_eq!(
@@ -1248,17 +1325,20 @@ mod tests {
                 .paid_fees_zatoshis,
             100
         );
-        assert!(matches!(
-            f.db.credit_pps_share(
-                &f.e,
-                &event(&f, 2, 1),
-                Some(&f.l),
-                Some(&funded(&f).await),
-                NOW
-            )
-            .await,
-            Err(PpsDbError::FeeBudgetExceeded)
-        ));
+        // The fee allowance is now fully spent. Fees never replenish, so a NEW
+        // share still credits but carries the advisory; the earlier share is an
+        // idempotent duplicate (exactly-once, no re-credit, no advisory).
+        let r = f.db.credit_pps_share(&f.e, &event(&f, 3, 1), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        assert!(!r.duplicate);
+        assert_eq!(r.funding_advisory, Some("fee_budget_exceeded"));
+        let dup = f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        assert!(dup.duplicate);
+        assert_eq!(dup.funding_advisory, None);
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 3);
     }
     #[tokio::test]
     async fn funding_signed_fence_parks_ambiguity_and_binds_expected_transaction() {
@@ -1655,7 +1735,9 @@ mod tests {
                 s.paid_zatoshis,
                 s.required_spendable_zatoshis
             ),
-            (7, 0, 1, 12 + CONVENTIONAL_BOUND * 4)
+            // Refill model: paid principal (1) no longer reduces the capital the
+            // wallet must hold — required backing is reserve + the FULL cap + fees.
+            (7, 0, 1, 13 + CONVENTIONAL_BOUND * 4)
         );
         assert_eq!(s.gross_subzatoshis, 3 * PPS_SCALE);
         let receipt = f.db.get_pps_conventional_attempt(a).await.unwrap().unwrap();
@@ -2127,7 +2209,7 @@ mod tests {
         all
     }
     #[tokio::test]
-    async fn exact_budget_extension_preserves_paid_history_and_never_refills() {
+    async fn exact_budget_extension_preserves_paid_history_and_backs_the_full_cap() {
         let f = extension_fixture().await;
         f.db.credit_balance(f.m, 17).await.unwrap();
         let attempt = f.db.create_payout_attempt(1, 1, "conventional").await.unwrap();
@@ -2139,7 +2221,10 @@ mod tests {
         let before = f.db.pps_invariant().await.unwrap();
         let history = extension_history(&f).await;
         let lease = extension_lease(&f).await;
-        assert_eq!(lease.spendable_zatoshis,100_000_000_000 - 1 - 7 + 17 + 10);
+        // Refill model: the 1 paid principal no longer reduces required capital
+        // (the full cap stays backed); only fees (7), legacy (17) and reserve (10)
+        // move the number.
+        assert_eq!(lease.spendable_zatoshis,100_000_000_000 - 7 + 17 + 10);
         assert!(f.db.verify_pps_epoch(&crate::pps_funding::testnet_budget_extension_epoch(&f.e).unwrap()).await.is_err());
         f.db.extend_testnet_pps_budget(&f.e,&lease).await.unwrap();
         assert_eq!(extension_history(&f).await,history);
@@ -2471,15 +2556,28 @@ mod tests {
             (1, 0, 2)
         );
         assert_eq!(s.gross_subzatoshis, 3 * PPS_SCALE + PPS_SCALE / 2);
+        // Refill model. Cap is 4. The 2 units already PAID freed capacity:
+        // outstanding is only 1.5 (pending 1 + 0.5 fraction), so this credit
+        // succeeds — the old lifetime cap (gross 3.5 + 1 = 4.5 > 4) rejected it.
+        f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        // The cap binds OUTSTANDING liability: fill it exactly (1.5 more -> 4.0).
+        f.db.credit_pps_share(&f.e, &event(&f, 3, PPS_SCALE + PPS_SCALE / 2), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        let s = f.db.pps_invariant().await.unwrap();
+        assert_eq!(
+            (s.pending_zatoshis, s.paying_zatoshis, s.paid_zatoshis, s.fractional_subzatoshis),
+            (4, 0, 2, 0)
+        );
+        // Lifetime gross now EXCEEDS the cap (6 > 4) while outstanding equals it —
+        // conservation (outstanding + paid == gross) holds throughout.
+        assert_eq!(s.gross_subzatoshis, 6 * PPS_SCALE);
+        // One more sub-zatoshi of outstanding liability is rejected.
         assert!(matches!(
-            f.db.credit_pps_share(
-                &f.e,
-                &event(&f, 2, PPS_SCALE),
-                Some(&f.l),
-                Some(&funded(&f).await),
-                NOW
-            )
-            .await,
+            f.db.credit_pps_share(&f.e, &event(&f, 4, 1), Some(&f.l), Some(&funded(&f).await), NOW)
+                .await,
             Err(PpsDbError::CapExceeded)
         ));
     }
