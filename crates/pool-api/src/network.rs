@@ -220,8 +220,46 @@ fn identify_pool(
     if coinbase_text.contains("F2Pool") || coinbase_text.contains("f2pool") {
         return Some("F2Pool".to_string());
     }
+    // Sluicey — self-tagged "Get Sluicey Yall sluicey.xyz" in a shielded
+    // coinbase (first seen on mainnet Sept 2026). Brand entry so it labels as
+    // "Sluicey" rather than the raw domain the generic rule below would yield.
+    if coinbase_text.to_ascii_lowercase().contains("sluicey") {
+        return Some("Sluicey".to_string());
+    }
+
+    // Generic self-tag: many pools sign their coinbase with their domain
+    // (e.g. "pool.example.com"). Label by that domain so an unlisted pool is
+    // still named instead of collapsing into the SHIELDED_MINER row. Add a
+    // brand entry above whenever a nicer display name is known.
+    if let Some(domain) = coinbase_domain(coinbase_text) {
+        return Some(domain);
+    }
 
     None
+}
+
+/// A domain-like token in a coinbase's printable text (e.g. "sluicey.xyz"),
+/// used to label a self-tagged pool that has no brand entry in
+/// [`identify_pool`]. Requires an alphabetic TLD and a letter-bearing label of
+/// at least three characters before it, so the `.` filler that
+/// [`hex_to_ascii_lossy`] emits for non-printable bytes (which can sit between
+/// two stray printable characters) cannot masquerade as a domain.
+fn coinbase_domain(coinbase_text: &str) -> Option<String> {
+    coinbase_text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))
+        .map(|t| t.trim_matches(|c| c == '.' || c == '-'))
+        .filter(|t| t.len() >= 6 && t.contains('.'))
+        .find_map(|t| {
+            let labels: Vec<&str> = t.split('.').collect();
+            let tld = labels.last()?;
+            let sld = labels.get(labels.len().checked_sub(2)?)?;
+            let well_formed = labels.iter().all(|l| {
+                !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+            let tld_ok = (2..=6).contains(&tld.len()) && tld.chars().all(|c| c.is_ascii_alphabetic());
+            let sld_ok = sld.len() >= 3 && sld.chars().filter(|c| c.is_ascii_alphabetic()).count() >= 2;
+            (well_formed && tld_ok && sld_ok).then(|| t.to_ascii_lowercase())
+        })
 }
 
 /// A stable, human-readable tag extracted from a coinbase's printable bytes:
@@ -1247,6 +1285,30 @@ mod tests {
         let mut ov = std::collections::HashMap::new();
         ov.insert(SHIELDED_MINER.to_string(), "Named".to_string());
         assert_eq!(identify_pool(SHIELDED_MINER, luxor, &ov).as_deref(), Some("Named"));
+    }
+
+    #[test]
+    fn self_tagged_shielded_pools_are_named_from_their_coinbase() {
+        let overrides = std::collections::HashMap::new();
+        // Sluicey, as rendered from its real mainnet shielded coinbase.
+        let sluicey = "...5..Get Sluicey Yall sluicey.xyz";
+        assert_eq!(
+            identify_pool(SHIELDED_MINER, sluicey, &overrides).as_deref(),
+            Some("Sluicey")
+        );
+        // An unlisted pool that signs with its domain is labeled by that domain
+        // instead of vanishing into the shared "shielded" row.
+        assert_eq!(
+            identify_pool(SHIELDED_MINER, "..7...mined @ pool.example.com fast", &overrides).as_deref(),
+            Some("pool.example.com")
+        );
+        // The `.` filler for non-printable bytes must not fabricate a domain,
+        // and version-ish tokens are not domains either.
+        assert_eq!(coinbase_domain("...5..ab.cd..x"), None);
+        assert_eq!(coinbase_domain("v1.2.3 build"), None);
+        assert_eq!(coinbase_domain("...../Mined by someminer/"), None);
+        // Still nothing for a plain untagged shielded coinbase.
+        assert_eq!(identify_pool(SHIELDED_MINER, "..<B.🌸", &overrides), None);
     }
 
     #[test]
