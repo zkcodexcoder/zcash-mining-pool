@@ -295,6 +295,19 @@ fn block_group_key(b: &NetworkBlock) -> String {
     b.miner_address.clone()
 }
 
+/// Pools that mine through more than one node implementation get one
+/// distribution row per node. Luxor runs both Zakura (🌸) and zebrad (🦓), and
+/// the operator tracks those separately; every other pool keeps a single row.
+/// Because [`block_group_key`] groups by `pool_name`, returning a distinct name
+/// per node is what splits the row.
+fn split_by_node_software(name: String, is_zakura: bool, is_zebrad: bool) -> String {
+    match (name.as_str(), is_zakura, is_zebrad) {
+        ("Luxor", true, _) => "Luxor (Zakura)".to_string(),
+        ("Luxor", _, true) => "Luxor (zebra)".to_string(),
+        _ => name,
+    }
+}
+
 /// Detect zebrad by checking for the 🦓 emoji bytes (f09fa693) in coinbase hex.
 fn is_zebrad_block(coinbase_hex: &str) -> bool {
     coinbase_hex.contains("f09fa693")
@@ -501,14 +514,15 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
         if is_our_pool && miner_address == SHIELDED_MINER && !our_mining_address.is_empty() {
             miner_address = our_mining_address.clone();
         }
+        let is_zebrad = is_zebrad_block(&coinbase_hex);
+        let is_zakura = is_zakura_block(&coinbase_hex);
         let pool_name = if is_our_pool {
             Some("Our Pool".to_string())
         } else {
             identify_pool(&miner_address, &coinbase_text, &label_overrides)
+                .map(|name| split_by_node_software(name, is_zakura, is_zebrad))
         };
         let miner_label = pool_name.clone().unwrap_or_else(|| truncate_address(&miner_address));
-        let is_zebrad = is_zebrad_block(&coinbase_hex);
-        let is_zakura = is_zakura_block(&coinbase_hex);
 
         blocks.push(NetworkBlock {
             height: *height,
@@ -1309,6 +1323,18 @@ mod tests {
         assert_eq!(coinbase_domain("...../Mined by someminer/"), None);
         // Still nothing for a plain untagged shielded coinbase.
         assert_eq!(identify_pool(SHIELDED_MINER, "..<B.🌸", &overrides), None);
+    }
+
+    #[test]
+    fn luxor_gets_one_row_per_node_software() {
+        let s = |n: &str, zak, zeb| split_by_node_software(n.to_string(), zak, zeb);
+        assert_eq!(s("Luxor", true, false), "Luxor (Zakura)");
+        assert_eq!(s("Luxor", false, true), "Luxor (zebra)");
+        // No marker at all: keep the plain brand rather than inventing a node.
+        assert_eq!(s("Luxor", false, false), "Luxor");
+        // Every other pool stays a single row regardless of node.
+        assert_eq!(s("ViaBTC", true, false), "ViaBTC");
+        assert_eq!(s("Sluicey", false, true), "Sluicey");
     }
 
     #[test]
