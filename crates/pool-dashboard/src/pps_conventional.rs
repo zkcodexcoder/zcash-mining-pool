@@ -237,6 +237,22 @@ async fn collect_funding_resilient(db: &PoolDb, wallet: &ZcashRpcClient, policy:
     }
 }
 
+/// Most batches one payout round sends. Each batch still runs its own funding
+/// proof, exact reservation and one-shot durable seal before its single send.
+const MAX_BATCHES_PER_ROUND: usize = 5;
+/// No new batch starts once a round has run this long, so the reconciler, which
+/// shares WORKFLOW, is not starved.
+const ROUND_BUDGET: std::time::Duration = std::time::Duration::from_secs(240);
+/// How long a round waits for zecd to finish one batch before starting the next.
+#[cfg(not(test))]
+const OPERATION_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+#[cfg(test)]
+const OPERATION_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+#[cfg(not(test))]
+const OPERATION_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const OPERATION_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
     from: &str, minimum: i64, policy: &PpsPolicy, chain: &PpsGate,
     route: &PpsFundingRoute) -> Result<usize>
@@ -251,16 +267,67 @@ async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClie
     pre_send_phase("epoch", db.verify_pps_epoch(&policy.epoch_config())).await?;
     pre_send_phase("accounting_invariant", db.pps_invariant()).await?;
     pre_send_phase("unresolved_attempts", async {
+        // A conventional attempt that is still settling, or stuck, holds only its own
+        // principal and fee (they stay in paying); it no longer holds every other
+        // miner. A financial halt still refuses every new seal. PCZT and legacy
+        // attempts spend from the same wallet outside this journal, so they still
+        // hold new sends.
         anyhow::ensure!(db.get_reserved_pps_attempts(None).await?.is_empty()
-            && db.get_reserved_pps_conventional_attempts(100).await?.is_empty()
             && db.get_reserved_attempts(None).await?.is_empty(),
-            "PPS or legacy payout unresolved; new sends held");
+            "PPS PCZT or legacy payout unresolved; new sends held");
         Ok::<_,anyhow::Error>(())
     }).await?;
+    // Pay every due balance: one batch at a time, each after zecd has finished the
+    // previous send, until nothing is due, the batch or time budget is spent, or a
+    // send is still in progress. Each sent batch is checked at once, so a proven
+    // recipient or fee violation halts before another batch is sent.
+    let started = Instant::now();
+    let mut settled = 0;
+    for batch in 0..MAX_BATCHES_PER_ROUND {
+        if batch > 0 && started.elapsed() >= ROUND_BUDGET { break; }
+        // Boxed: the batch and reconcile futures are large, and holding both inline
+        // in this loop's state overflowed a 2 MB stack.
+        let Some((attempt, opid)) =
+            Box::pin(send_batch(db,wallet,node,from,minimum,policy,chain,route,batch == 0)).await?
+        else { break };
+        let finished = operation_succeeded(wallet, &opid).await;
+        settled += Box::pin(reconcile_inner(db,wallet,node,policy,chain,attempt)).await?;
+        if !finished { break; }
+    }
+    Ok(settled)
+}
+
+/// Polls one wallet operation until it succeeds, fails or `OPERATION_WAIT` passes.
+/// True only for success; anything else ends the round and leaves the attempt to
+/// the reconciler.
+async fn operation_succeeded(wallet: &ZcashRpcClient, opid: &str) -> bool {
+    let deadline = Instant::now() + OPERATION_WAIT;
+    loop {
+        if let Ok(response) = rpc(wallet, "z_getoperationstatus", json!([[opid]])).await {
+            let status = response.as_array()
+                .filter(|s| s.len() == 1 && s[0].get("id").and_then(Value::as_str) == Some(opid))
+                .and_then(|s| s[0].get("status").and_then(Value::as_str).map(str::to_owned));
+            match status.as_deref() {
+                Some("success") => return true,
+                Some("queued" | "executing") => {}
+                _ => return false,
+            }
+        }
+        if Instant::now() >= deadline { return false; }
+        tokio::time::sleep(OPERATION_POLL).await;
+    }
+}
+
+/// Selects, reserves, seals and sends one batch. Returns its attempt and wallet
+/// operation, or None when nothing (more) is due.
+async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
+    from: &str, minimum: i64, policy: &PpsPolicy, chain: &PpsGate,
+    route: &PpsFundingRoute, first: bool) -> Result<Option<(i64, String)>>
+{
     let pending = pre_send_phase("pending_claims", db.get_pending_pps_payouts(minimum)).await?;
     if pending.is_empty() {
-        super::payout_health::note_no_payout_due();
-        return Ok(0);
+        if first { super::payout_health::note_no_payout_due(); }
+        return Ok(None);
     }
     pre_send_phase("initial_wallet_idle", wallet_idle(wallet)).await?;
     let mut selected = pre_send_phase("recipient_selection", async {
@@ -296,7 +363,7 @@ async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClie
         }
         Ok::<_,anyhow::Error>(selected)
     }).await?;
-    if selected.is_empty() { return Ok(0); }
+    if selected.is_empty() { return Ok(None); }
     selected.sort_by_key(|p|p.miner_id);
     let tip = pre_send_phase("node_tip", async {
         node.get_block_count().await.map_err(|_|anyhow::anyhow!("PPS node tip unavailable"))
@@ -342,7 +409,7 @@ async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClie
     let sent=rpc(wallet,"z_sendmany",json!([from,recipients,10,null,"AllowRevealedRecipients"])).await?;
     let opid=sent.as_str().filter(|v|valid_opid(v)).context("PPS operation ID invalid")?;
     db.record_pps_conventional_operation(attempt,&bound.intent_id,opid).await?;
-    reconcile_inner(db,wallet,node,policy,chain,attempt).await
+    Ok(Some((attempt, opid.to_string())))
 }
 
 /// Returns recipient count only after canonical block inclusion and exact raw
@@ -487,6 +554,9 @@ mod tests {
 
     #[test]
     fn pre_send_phase_logs_only_fixed_metadata_and_preserves_results_and_order() {
+        // The conventional fixture tests call pre_send_phase on other threads, and tracing
+        // caches each callsite's interest process-wide; capture the log lines while none run.
+        let _serial = super::super::pps_conventional_tests::FIXTURE_LIFETIME.blocking_lock();
         use std::{fmt, io::Write, sync::{Arc,Mutex}};
         #[derive(Clone)]
         struct Buffer(Arc<Mutex<Vec<u8>>>);

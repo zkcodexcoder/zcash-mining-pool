@@ -542,7 +542,21 @@ impl PoolDb {
         if min_amount <= 0 {
             return Err(PpsDbError::Invalid);
         }
-        let rows=sqlx::query("SELECT p.miner_id,m.address,m.created_at,p.pending FROM pps_accounts p JOIN miners m ON m.id=p.miner_id WHERE p.pending>=?1 ORDER BY p.miner_id").bind(min_amount).fetch_all(self.inner()).await?;
+        // Least recently paid first (never-paid miners lead), counting payouts still in
+        // flight, so one large low-id balance can no longer take every batch.
+        let rows = sqlx::query(
+            "SELECT p.miner_id,m.address,m.created_at,p.pending, \
+                    NULLIF(MAX( \
+                        COALESCE((SELECT MAX(pa.created_at) FROM pps_payout_items pi \
+                            JOIN payout_attempts pa ON pa.id=pi.attempt_id WHERE pi.miner_id=p.miner_id),''), \
+                        COALESCE((SELECT MAX(pp.created_at) FROM pps_payouts pp \
+                            WHERE pp.miner_id=p.miner_id),'')),'') last_paid \
+             FROM pps_accounts p JOIN miners m ON m.id=p.miner_id WHERE p.pending>=?1 \
+             ORDER BY last_paid IS NOT NULL, last_paid, p.pending DESC, p.miner_id",
+        )
+        .bind(min_amount)
+        .fetch_all(self.inner())
+        .await?;
         Ok(rows
             .into_iter()
             .map(|r| PendingPayout {
@@ -2465,6 +2479,29 @@ mod tests {
             Err(PpsDbError::DuplicateMismatch)
         ));
         assert_eq!(f.db.get_total_shares_count().await.unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn pending_payouts_come_least_recently_paid_first() {
+        let f = setup(true, 1_000_000).await;
+        let never = f.db.get_or_create_miner("never-paid").await.unwrap().id;
+        let recent = f.db.get_or_create_miner("paid-recently").await.unwrap().id;
+        let in_flight = f.db.get_or_create_miner("paid-long-ago-but-in-flight").await.unwrap().id;
+        let txid = |c: char| c.to_string().repeat(64);
+        let fixture = format!(
+            "INSERT INTO pps_accounts(miner_id,pending) VALUES({recent},500),({in_flight},100),({never},100);
+             INSERT INTO payout_attempts(id,status,created_at) VALUES
+               (901,'confirmed','2026-09-01 00:00:00'),(902,'confirmed','2026-09-12 00:00:00'),
+               (903,'sent','2026-09-13 00:00:00');
+             INSERT INTO pps_payouts(attempt_id,miner_id,txid,amount,created_at) VALUES
+               (901,{in_flight},'{a}',5,'2026-09-01 00:00:00'),(902,{recent},'{b}',5,'2026-09-12 00:00:00');
+             INSERT INTO pps_payout_items(attempt_id,miner_id,amount) VALUES(903,{in_flight},1);",
+            a = txid('a'), b = txid('b'),
+        );
+        sqlx::raw_sql(&fixture).execute(f.db.inner()).await.unwrap();
+        let order: Vec<i64> = f.db.get_pending_pps_payouts(1).await.unwrap()
+            .into_iter().map(|p| p.miner_id).collect();
+        // Never paid leads; a payout still in flight counts as the most recent one.
+        assert_eq!(order, vec![never, recent, in_flight]);
     }
     #[tokio::test]
     async fn share_target_harder_than_network_is_credited_but_zero_target_is_refused() {

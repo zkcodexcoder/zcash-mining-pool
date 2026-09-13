@@ -78,7 +78,7 @@ async fn funding(db: &PoolDb, p: &PpsPolicy) -> PpsFundingLease {
 // The runtime has one process-wide conventional WORKFLOW. Serialize complete
 // synthetic fixtures before starting their unchanged 10-second operation
 // deadlines, so those deadlines do not include unrelated test-fixture queues.
-static FIXTURE_LIFETIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static FIXTURE_LIFETIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Fixture {
     db: PoolDb,
@@ -310,6 +310,11 @@ struct MockState {
     raw_override: Option<(String, String)>,
     wallet_history: Option<Value>,
     history_readiness: Option<Value>,
+    /// When set, a send may pay any one of these (address, zatoshis) instead of
+    /// exactly `recipient` and `expected_amount`.
+    expected_payments: Option<Vec<(String, i64)>>,
+    /// Per-operation status overrides; other operations use `operation`.
+    operations: std::collections::HashMap<String, Value>,
 }
 struct MockRpc {
     client: Arc<ZcashRpcClient>,
@@ -355,8 +360,13 @@ impl MockRpc {
             };
             let result = match method {
                 "getnetworkinfo" => json!({"version":700,"subversion":"/zecd:0.7.0/"}),
-                "getblockchaininfo" => json!({"chain":"test","blocks":HEIGHT-1,"headers":HEIGHT-1,
-                    "initialblockdownload":false,"bestblockhash":hash}),
+                "getblockchaininfo" => {
+                    // Same one-block advance as getblockcount and getwalletinfo after a
+                    // send, so a funding proof taken between batches stays consistent.
+                    let tip = if st.calls.iter().any(|m| m == "z_sendmany") { HEIGHT } else { HEIGHT - 1 };
+                    json!({"chain":"test","blocks":tip,"headers":tip,
+                        "initialblockdownload":false,"bestblockhash":hash})
+                }
                 "getwalletinfo" => {
                     let submitted=st.calls.iter().any(|m|m == "z_sendmany");
                     if submitted && st.history_readiness.is_some() {
@@ -398,21 +408,46 @@ impl MockRpc {
                     if params.as_array().is_some_and(|p| p.is_empty()) {
                         json!([])
                     } else {
-                        st.operation.clone()
+                        let requested = params[0][0].as_str().unwrap_or("opid-synthetic-1").to_string();
+                        if let Some(operation) = st.operations.get(&requested) {
+                            operation.clone()
+                        } else if requested == "opid-synthetic-1" {
+                            st.operation.clone()
+                        } else {
+                            // Later sends mirror the configured status under their own
+                            // operation id, each with a distinct transaction id.
+                            let mut operation = st.operation.clone();
+                            if let Some(first) = operation.get_mut(0) {
+                                first["id"] = json!(requested);
+                                if first.get("result").is_some() {
+                                    let n: u64 = requested.rsplit('-').next()
+                                        .and_then(|v| v.parse().ok()).unwrap_or(0);
+                                    first["result"] = json!({"txids":[format!("{n:064x}")]});
+                                }
+                            }
+                            operation
+                        }
                     }
                 }
                 "z_sendmany" => {
                     assert_eq!(params[0], SOURCE);
                     assert_eq!(params[1].as_array().unwrap().len(), 1);
-                    assert_eq!(params[1][0]["address"], st.recipient);
-                    assert_eq!(
+                    let amount_text =
+                        |zats: i64| format!("{}.{:08}", zats / 100_000_000, zats % 100_000_000);
+                    let paid = (
+                        params[1][0]["address"].as_str().unwrap_or("").to_string(),
                         params[1][0]["amount"].to_string(),
-                        format!(
-                            "{}.{:08}",
-                            st.expected_amount / 100_000_000,
-                            st.expected_amount % 100_000_000
-                        )
                     );
+                    match &st.expected_payments {
+                        Some(expected) => assert!(
+                            expected.iter().any(|(a, z)| *a == paid.0 && amount_text(*z) == paid.1),
+                            "unexpected synthetic payment {paid:?}"
+                        ),
+                        None => {
+                            assert_eq!(paid.0, st.recipient);
+                            assert_eq!(paid.1, amount_text(st.expected_amount));
+                        }
+                    }
                     assert_eq!(params[2], 10);
                     assert!(params[3].is_null());
                     assert_eq!(params[4], "AllowRevealedRecipients");
@@ -423,7 +458,8 @@ impl MockRpc {
                     if st.invalid_opid {
                         json!({"bad":"operation"})
                     } else {
-                        json!("opid-synthetic-1")
+                        let n = st.calls.iter().filter(|m| *m == "z_sendmany").count();
+                        json!(format!("opid-synthetic-{n}"))
                     }
                 }
                 "getrawtransaction" => {
@@ -461,6 +497,8 @@ impl MockRpc {
             raw_override: None,
             wallet_history: None,
             history_readiness: None,
+            expected_payments: None,
+            operations: std::collections::HashMap::new(),
         }));
         let listener =
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -742,7 +780,8 @@ async fn conventional_shielded_incomplete_history_holds_then_recovers_persisted_
         assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis,CREDIT);
         assert_eq!(f.db.pps_funding_snapshot().await.unwrap().reserved_fees_zatoshis,28_410_000);
         assert!(f.db.refund_pps_payout(before.attempt_id).await.is_err());
-        assert!(process(&f,&rpc).await.is_err());
+        // A held attempt no longer fails later rounds; nothing is due and nothing is resent.
+        assert_eq!(process(&f,&rpc).await.unwrap(),0);
         if failure < 2 {
             assert!(!rpc.state.lock().unwrap().calls.iter().any(|m|m == "gettransaction"));
         }
@@ -792,7 +831,7 @@ async fn conventional_missing_wallet_history_cannot_mask_raw_financial_breach() 
         // Halt fences sending, not accounting: snapshot works, send stays blocked.
         assert!(f.db.pps_funding_snapshot().await.is_ok());
         assert!(f.db.refund_pps_payout(attempt.attempt_id).await.is_err());
-        assert!(process(&f,&rpc).await.is_err());
+        assert_eq!(process(&f,&rpc).await.unwrap(),0);
         assert_eq!(rpc.sends(),1);
         let state = rpc.state.lock().unwrap();
         let send_index = state.calls.iter().position(|m|m == "z_sendmany").unwrap();
@@ -872,7 +911,7 @@ async fn conventional_ambiguous_send_or_lost_opid_is_never_refunded_or_retried()
         assert!(attempt.operation_id.is_none());
         f.reopen().await;
         assert!(reconcile(&f, &rpc, attempt.attempt_id).await.is_err());
-        assert!(process(&f, &rpc).await.is_err());
+        assert_eq!(process(&f, &rpc).await.unwrap(), 0);
         assert_eq!(rpc.sends(), 1);
         let sum = f.db.pps_invariant().await.unwrap();
         assert_eq!(
@@ -998,7 +1037,10 @@ async fn conventional_proven_recipient_or_fee_violation_is_a_durable_global_hold
             )
         );
         assert!(reconcile(&f, &rpc, attempt.attempt_id).await.is_err());
-        assert!(process(&f, &rpc).await.is_err());
+        // With a balance still due the halt refuses the new seal; with nothing due the
+        // round is simply idle. Either way nothing more is sent.
+        let second = process(&f, &rpc).await;
+        if fee_violation { assert_eq!(second.unwrap(), 0); } else { assert!(second.is_err()); }
         assert!(f.db.refund_pps_payout(attempt.attempt_id).await.is_err());
         assert_eq!(rpc.sends(), 1);
         assert_eq!(f.legacy().await, legacy);
@@ -1101,7 +1143,8 @@ async fn conventional_final_preparation_failures_release_only_definitely_unseale
             assert_eq!((sum.pending_zatoshis,sum.paying_zatoshis,sum.paid_zatoshis),(0,CREDIT,0));
             assert_eq!(fees,bound.fee_upper_bound_zatoshis);
             assert!(f.db.refund_pps_payout(attempt).await.is_err());
-            assert!(process(&f,&rpc).await.is_err());
+            // The held attempt no longer fails later rounds; nothing is due, nothing is sent.
+            assert_eq!(process(&f,&rpc).await.unwrap(),0);
             assert_eq!(rpc.sends(),0);
         } else {
             assert!(!row.sealed);
@@ -1154,5 +1197,92 @@ async fn conventional_legacy_inflight_and_wrong_route_prevent_new_sends() {
     .await
     .is_err());
     assert_eq!(rpc.sends(), 0);
+    assert_eq!(rpc.forbidden_calls(), 0);
+}
+
+
+async fn credit_second_miner(f: &Fixture, address: &str, proof: char) -> i64 {
+    let miner = f.db.get_or_create_miner(address).await.unwrap();
+    let worker = f.db.get_or_create_worker(miner.id, "synthetic-worker-2").await.unwrap();
+    let now = Utc::now().timestamp();
+    f.db.credit_pps_share(
+        &f.policy.epoch_config(),
+        &PpsCredit {
+            proof_id: proof.to_string().repeat(64),
+            quote_id: "c".repeat(64),
+            worker_id: worker.id,
+            job_id: "synthetic-job".into(),
+            session_id: "synthetic-session-2".into(),
+            difficulty: 1.0,
+            is_block: false,
+            amount_subzatoshis: CREDIT as u128 * PPS_SCALE,
+            accepted_at_unix: now,
+            quote_height: HEIGHT as u64,
+            network_target_be: [1; 32],
+            assigned_share_target_be: [2; 32],
+            miner_subsidy_zats: 125_000_000,
+        },
+        Some(&chain_lease_at(now)),
+        Some(&funding(&f.db, &f.policy).await),
+        now,
+    )
+    .await
+    .unwrap();
+    miner.id
+}
+
+#[tokio::test]
+async fn conventional_round_pays_every_due_balance_in_separate_batches() {
+    let f = Fixture::new().await;
+    let second = credit_second_miner(&f, SAPLING_RECIPIENT, 'f').await;
+    let rpc = MockRpc::new(&f.db).await;
+    {
+        let mut s = rpc.state.lock().unwrap();
+        s.expected_payments = Some(vec![(RECIPIENT.into(), CREDIT), (SAPLING_RECIPIENT.into(), CREDIT)]);
+        // Both sends land but are not yet buried, so both stay reserved.
+        s.confirmations = 0;
+    }
+    rpc.success();
+    // max_payout_zatoshis is CREDIT, so each balance needs its own batch.
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    assert_eq!(rpc.sends(), 2);
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!((sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis), (0, 2 * CREDIT, 0));
+    let attempts = f.db.get_reserved_pps_conventional_attempts(100).await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|a| a.sealed && a.operation_id.is_some()));
+    let paid: std::collections::BTreeSet<i64> = attempts
+        .iter()
+        .map(|a| a.intent().unwrap().unwrap().items[0].miner_id)
+        .collect();
+    assert_eq!(paid, [f.miner, second].into_iter().collect());
+    assert_eq!(rpc.forbidden_calls(), 0);
+}
+
+#[tokio::test]
+async fn conventional_stuck_attempt_is_quarantined_while_other_miners_are_paid() {
+    let f = Fixture::new().await;
+    let rpc = MockRpc::new(&f.db).await;
+    // The first send never completes, so its attempt stays held.
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    let stuck = f.attempt().await;
+    rpc.state.lock().unwrap().operations.insert(
+        "opid-synthetic-1".into(),
+        json!([{"id":"opid-synthetic-1","status":"failed"}]),
+    );
+    assert!(reconcile(&f, &rpc, stuck.attempt_id).await.is_err());
+    // Another miner's balance becomes due; the stuck attempt no longer holds it.
+    let second = credit_second_miner(&f, SAPLING_RECIPIENT, 'f').await;
+    rpc.state.lock().unwrap().expected_payments = Some(vec![(SAPLING_RECIPIENT.into(), CREDIT)]);
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    assert_eq!(rpc.sends(), 2);
+    let latest = f.attempt().await;
+    assert_ne!(latest.attempt_id, stuck.attempt_id);
+    assert_eq!(latest.intent().unwrap().unwrap().items[0].miner_id, second);
+    assert_eq!(latest.operation_id.as_deref(), Some("opid-synthetic-2"));
+    // The stuck attempt keeps its principal and fee held: never refunded or resent.
+    assert!(f.db.refund_pps_payout(stuck.attempt_id).await.is_err());
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!((sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis), (0, 2 * CREDIT, 0));
     assert_eq!(rpc.forbidden_calls(), 0);
 }
