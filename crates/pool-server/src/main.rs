@@ -454,9 +454,6 @@ async fn main() -> Result<()> {
             pool_core::difficulty::difficulty_to_target_hex(initial_difficulty),
         ),
     );
-    if config.pps.is_some() {
-        stratum.set_fixed_share_target(stratum::FixedShareTarget::new(pool_target)?)?;
-    }
     let stratum = Arc::new(stratum);
 
     // Stall detection: last time we got a block template (unix ms)

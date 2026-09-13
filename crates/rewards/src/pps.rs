@@ -96,8 +96,6 @@ pub enum PpsError {
     ZeroTarget,
     #[error("PPS network target exceeds the network PoW limit")]
     InvalidNetworkTarget,
-    #[error("PPS assigned share target must not be harder than the network target")]
-    ShareTargetTooHard,
     #[error("PPS quote would round to zero; reject this pricing configuration")]
     ZeroQuote,
     #[error("PPS monetary arithmetic overflow")]
@@ -145,22 +143,19 @@ pub fn quote_standard_pps(input: &PpsQuoteInput) -> Result<PpsQuote, PpsError> {
     if input.network_target_be > pow_limit {
         return Err(PpsError::InvalidNetworkTarget);
     }
-    // A share target harder than the network target (assigned < network) only
-    // arises for testnet minimum-difficulty templates. The credit layer
-    // (pps_live.rs credit_pps_share) rejects that exact case as Invalid, so
-    // pricing rejects it here too: the two layers must agree, and fail-closed
-    // is the safe choice (crediting each such share at full subsidy would let
-    // liability accumulate one block-value per share during an easy window).
-    if input.assigned_share_target_be < input.network_target_be {
-        return Err(PpsError::ShareTargetTooHard);
-    }
+    // A share target harder than the network target (assigned < network) makes
+    // every such share a block, so its block probability is 1: price it at
+    // exactly one block, min(1, (N+1)/(A+1)), never more. Per-session
+    // difficulty produces this on testnet minimum-difficulty templates and on
+    // high-difficulty ports.
+    let priced_target_be = input.assigned_share_target_be.max(input.network_target_be);
 
     // Bounded exact arithmetic: 32-byte targets, <=1,250,000,000-zatoshi subsidy,
     // <=10,000 fee multiplier and fixed 10^12 scale. Intermediates need <342
     // bits. BigUint cannot machine-overflow; conversion to ledger u128 is
     // explicitly checked. The denominator is positive by target validation.
     let network = BigUint::from_bytes_be(&input.network_target_be) + BigUint::one();
-    let assigned = BigUint::from_bytes_be(&input.assigned_share_target_be) + BigUint::one();
+    let assigned = BigUint::from_bytes_be(&priced_target_be) + BigUint::one();
     let numerator = network
         * BigUint::from(input.miner_subsidy_zats)
         * BigUint::from(BPS - input.fee_bps)
@@ -236,14 +231,16 @@ mod tests {
         }
     }
     #[test]
-    fn zero_harder_and_out_of_network_targets_fail_closed() {
+    fn zero_and_out_of_network_targets_fail_closed_and_harder_targets_price_one_block() {
         for value in [input(0, 1), input(1, 0)] {
             assert_eq!(quote_standard_pps(&value), Err(PpsError::ZeroTarget));
         }
-        assert_eq!(
-            quote_standard_pps(&input(3, 1)),
-            Err(PpsError::ShareTargetTooHard)
-        );
+        // A share target harder than the network target is itself a block: it is
+        // priced at exactly one block, the same as a share at the network target.
+        let one_block = 125_000_000 * PPS_SCALE;
+        assert_eq!(quote_standard_pps(&input(3, 1)).unwrap().amount_subzatoshis, one_block);
+        assert_eq!(quote_standard_pps(&input(3, 3)).unwrap().amount_subzatoshis, one_block);
+        assert!(!quote_standard_pps(&input(3, 1)).unwrap().fractional_subzatoshi_discarded);
         let mut value = input(1, 1);
         value.network_target_be = [255; 32];
         value.assigned_share_target_be = [255; 32];

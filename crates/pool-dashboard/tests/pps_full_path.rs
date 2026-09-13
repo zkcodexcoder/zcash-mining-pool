@@ -73,11 +73,8 @@ mod actual_validator {
                 .expect("official public block must pass real Equihash");
             let latest = Arc::new(RwLock::new(Some(job.to_notify(true))));
             let (events, _events_rx) = mpsc::channel(16);
-            let (mut server, _notify_rx) =
+            let (server, _notify_rx) =
                 StratumServer::new_with_latest_notify(4, events, Arc::clone(&latest));
-            server
-                .set_fixed_share_target(stratum::FixedShareTarget::new(target).unwrap())
-                .unwrap();
             let jobs = Arc::new(RwLock::new(HashMap::from([(
                 job.job_id.clone(),
                 Arc::new(job.clone()),

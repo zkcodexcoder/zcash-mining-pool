@@ -337,7 +337,7 @@ impl PoolDb {
         let subsidy = i64::try_from(s.miner_subsidy_zats).map_err(|_| PpsDbError::Invalid)?;
         if subsidy <= 0
             || s.network_target_be == [0; 32]
-            || s.assigned_share_target_be < s.network_target_be
+            || s.assigned_share_target_be == [0; 32]
         {
             return Err(PpsDbError::Invalid);
         }
@@ -2465,6 +2465,29 @@ mod tests {
             Err(PpsDbError::DuplicateMismatch)
         ));
         assert_eq!(f.db.get_total_shares_count().await.unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn share_target_harder_than_network_is_credited_but_zero_target_is_refused() {
+        let f = setup(true, 10).await;
+        let funding = funded(&f).await;
+        // Per-session difficulty can assign a target harder than the network
+        // target. Such a share is itself a block; pricing caps it at one block.
+        let mut harder = event(&f, 1, PPS_SCALE);
+        harder.assigned_share_target_be = [0; 32];
+        harder.assigned_share_target_be[31] = 1;
+        assert!(harder.assigned_share_target_be < harder.network_target_be);
+        let receipt = f.db
+            .credit_pps_share(&f.e, &harder, Some(&f.l), Some(&funding), NOW)
+            .await
+            .unwrap();
+        assert!(!receipt.duplicate);
+        let mut zero = event(&f, 2, 2 * PPS_SCALE);
+        zero.assigned_share_target_be = [0; 32];
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &zero, Some(&f.l), Some(&funding), NOW).await,
+            Err(PpsDbError::Invalid)
+        ));
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 1);
     }
     #[tokio::test]
     async fn stale_forked_and_missing_chain_proof_credit_with_a_chain_warning() {

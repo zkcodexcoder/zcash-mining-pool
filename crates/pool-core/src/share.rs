@@ -164,6 +164,14 @@ const SHARE_DEDUP_HISTORY: usize = 1024;
 /// Any miner still submitting at a target older than this is malfunctioning.
 const GRACE_TARGET_MAX_AGE: Duration = Duration::from_secs(60);
 
+/// PPS only: how long a replaced target still applies. PPS pays every share, so
+/// a share is checked and priced against the easiest of the session's current
+/// target and the targets replaced within this window, chosen without looking
+/// at the share's hash (see `pps_assigned_target`). Kept short: a miner that
+/// switches to a harder target at once is paid at the easier one until the
+/// window closes.
+const PPS_GRACE_TARGET_MAX_AGE: Duration = Duration::from_secs(10);
+
 /// Audit #15: how often a cached worker's last_seen is bumped. Between
 /// touches, accepted shares cost ONE insert instead of the old five-statement
 /// resolve+touch round-trip.
@@ -350,9 +358,6 @@ impl ShareValidator {
     }
 
     pub fn with_pps(mut self, runtime: PpsRuntime) -> Result<Self, String> {
-        if self.stratum.fixed_share_target().is_none() {
-            return Err("PPS requires one immutable announced target".into());
-        }
         if runtime.epoch.network.parse::<PpsNetwork>().is_err()
             || runtime.chain_lease.as_ref().is_some_and(|l| l.network != runtime.epoch.network)
             || runtime.epoch.fee_bps >= 10_000
@@ -482,13 +487,6 @@ impl ShareValidator {
     }
 
     fn make_target_for_difficulty(&self, difficulty: f64) -> ([u8; 32], VardiffTracker) {
-        if let Some(fixed) = self.stratum.fixed_share_target() {
-            return (fixed.target_be(), VardiffTracker::new(
-                self.vardiff_config.target_shares_per_minute,
-                self.vardiff_config.retarget_interval_secs,
-                fixed.display_difficulty(),
-            ));
-        }
         let tracker = VardiffTracker::new(
             self.vardiff_config.target_shares_per_minute,
             self.vardiff_config.retarget_interval_secs,
@@ -674,7 +672,7 @@ impl ShareValidator {
                             // (5090-class) thrash: rate-limit ramps diff up, a
                             // burst of in-flight shares at old diff fails as
                             // low_diff, hits 10 streak, resets to diff 1, repeat.
-                            if is_low_diff && self.stratum.fixed_share_target().is_none() {
+                            if is_low_diff {
                                 let mut sessions = self.session_difficulty.write().await;
                                 if let Some(sd) = sessions.get_mut(&session_id) {
                                     sd.low_diff_streak += 1;
@@ -746,9 +744,7 @@ impl ShareValidator {
 
                     // Priority: password-requested > per-port > default
                     let requested_diff = parse_difficulty_from_password(&password);
-                    let initial_diff = self.stratum.fixed_share_target()
-                        .map(|fixed| fixed.display_difficulty())
-                        .or(requested_diff).or(Some(port_base));
+                    let initial_diff = requested_diff.or(Some(port_base));
                     let (target, tracker, init_source) = if let Some(diff) = initial_diff {
                         let source = if requested_diff.is_some() { "password" }
                             else { "port" };
@@ -852,7 +848,6 @@ impl ShareValidator {
 
     /// Check if a session needs retargeting after an accepted share.
     async fn maybe_retarget(&self, session_id: &str) {
-        if self.stratum.fixed_share_target().is_some() { return; }
         let result = {
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
@@ -868,7 +863,6 @@ impl ShareValidator {
 
     /// Force an immediate retarget, bypassing the vardiff interval gate.
     async fn force_retarget_session(&self, session_id: &str) {
-        if self.stratum.fixed_share_target().is_some() { return; }
         let result = {
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
@@ -884,7 +878,6 @@ impl ShareValidator {
 
     /// Apply a retarget with a reason string for logging/display.
     async fn apply_retarget(&self, session_id: &str, diff: f64, reason: &str) {
-        if self.stratum.fixed_share_target().is_some() { return; }
         let target_hex = difficulty_to_target_hex(diff);
         let new_target = parse_target(&target_hex).unwrap_or(self.default_target);
         {
@@ -1257,28 +1250,33 @@ impl ShareValidator {
         // the current target, fall back to the grace window: in-flight shares
         // generated against an older (easier) target should still be credited
         // at that older difficulty rather than being rejected as low_diff.
-        let difficulty = if let Some(fixed) = self.stratum.fixed_share_target() {
-            if !fixed.accepts_hash_le(&hash_bytes) {
+        let (difficulty, assigned_target) = if self.pps.is_some() {
+            // PPS pays every share, so its target must not be chosen by its hash
+            // (the grace walk below would pay an in-flight share at whichever
+            // easier target it happens to meet). Check and price against one
+            // target picked from the session's timeline alone.
+            let assigned = pps_assigned_target(pool_target, &grace_targets);
+            if !meets_target(&hash_bytes, &assigned) {
                 return Err(StratumError::low_difficulty());
             }
-            fixed.display_difficulty()
+            (target_to_difficulty(&assigned), assigned)
         } else if meets_target(&hash_bytes, &pool_target) {
-            current_difficulty
+            (current_difficulty, pool_target)
         } else {
             // Walk grace targets newest-first, accept the first that matches
             // and is recent enough.
-            let mut matched: Option<f64> = None;
+            let mut matched: Option<(f64, [u8; 32])> = None;
             for gt in grace_targets.iter().rev() {
                 if gt.set_at.elapsed() > GRACE_TARGET_MAX_AGE {
                     continue;
                 }
                 if meets_target(&hash_bytes, &gt.target) {
-                    matched = Some(gt.difficulty);
+                    matched = Some((gt.difficulty, gt.target));
                     break;
                 }
             }
             match matched {
-                Some(d) => d,
+                Some(found) => found,
                 None => return Err(StratumError::low_difficulty()),
             }
         };
@@ -1349,8 +1347,7 @@ impl ShareValidator {
           // returning early, so a share that solves a block still reaches
           // submitblock below. Only that share's credit is withheld.
           let admission: Result<(u64, bool), StratumError> = async {
-            // The fixed target is identical for every issued job. Reject work
-            // superseded by a new tip rather than buying stale-chain shares.
+            // Reject work superseded by a new tip rather than buying stale-chain shares.
             let latest = self.latest_notify.read().await;
             match latest.as_ref() {
                 Some(ServerMessage::Notify { prev_hash, .. }) if prev_hash == &job.prev_hash_hex => {},
@@ -1379,15 +1376,12 @@ impl ShareValidator {
                     subsidy
                 }
             };
-            let fixed = self.stratum.fixed_share_target()
-                .ok_or_else(|| { crate::pps_credit_health::denial(&pps.health,"target","fixed_target_unavailable");
-                    StratumError::other("PPS fixed target unavailable") })?;
             crate::pps_economics::validate_template_target(&job.template.bits, &network_target)
                 .map_err(|_| { crate::pps_credit_health::denial(&pps.health,"target","target_invalid");
                     StratumError::other("PPS admission paused: inconsistent consensus target") })?;
             let quote = quote_standard_pps(&PpsQuoteInput {
                 network, height: job.template.height, network_target_be: network_target,
-                assigned_share_target_be: fixed.target_be(), miner_subsidy_zats: subsidy,
+                assigned_share_target_be: assigned_target, miner_subsidy_zats: subsidy,
                 fee_bps: pps.epoch.fee_bps,
             }).map_err(|_| { crate::pps_credit_health::denial(&pps.health,"quote","quote_invalid");
                 StratumError::other("PPS admission paused: invalid price") })?;
@@ -1397,7 +1391,7 @@ impl ShareValidator {
             let quote_checked=Instant::now();
             let (proof_id, quote_id) = pps_credit_identity(
                 &pps.epoch, job.template.height, subsidy, &network_target,
-                &fixed.target_be(), &full_header,
+                &assigned_target, &full_header,
             );
             // RPC may have taken long enough to cross a tip or lease expiry.
             // Recheck after it, and keep the current-job guard until commit.
@@ -1422,7 +1416,7 @@ impl ShareValidator {
                 proof_id, quote_id, worker_id, job_id: job_id.to_string(),
                 session_id: session_id.to_string(), difficulty, is_block,
                 quote_height: job.template.height, network_target_be: network_target,
-                assigned_share_target_be: fixed.target_be(), miner_subsidy_zats: subsidy,
+                assigned_share_target_be: assigned_target, miner_subsidy_zats: subsidy,
                 amount_subzatoshis: quote.amount_subzatoshis, accepted_at_unix: now,
             }, lease.as_ref(), funding.as_ref(), now).await
                 .map_err(|error| { crate::pps_credit_health::denial(&pps.health,"ledger_credit",
@@ -1755,6 +1749,19 @@ fn build_header_input(job: &MiningJob, time_hex: &str) -> Result<Vec<u8>, Stratu
 /// Check if hash <= target for PoW validity.
 /// SHA-256d output is interpreted as a little-endian 256-bit integer
 /// (byte[31] is MSB, byte[0] is LSB). The target from getblocktemplate
+/// PPS: the target a share is checked and priced against. It is the easiest of
+/// the session's current target and any target replaced within
+/// `PPS_GRACE_TARGET_MAX_AGE`, and depends only on the session's timeline, never
+/// on the share's hash. A share is therefore never paid more than the target it
+/// was checked against; a miner that switched to a harder target early is paid
+/// at the easier one until the window closes.
+fn pps_assigned_target(current: [u8; 32], grace: &[GraceTarget]) -> [u8; 32] {
+    grace
+        .iter()
+        .filter(|gt| gt.set_at.elapsed() <= PPS_GRACE_TARGET_MAX_AGE)
+        .fold(current, |easiest, gt| easiest.max(gt.target))
+}
+
 /// Save the session's current target to the grace window. Called right
 /// before replacing `sd.target` with a new value. The old difficulty is
 /// derived from the old target bytes (since `vardiff.current_difficulty()`
@@ -2097,6 +2104,26 @@ mod tests {
         assert_eq!(hash.len(), 32);
         let expected = "9595c9df90075148eb06860365df33584b75bff782a510c6cd4883a419833d50";
         assert_eq!(hex::encode(hash), expected);
+    }
+
+    #[test]
+    fn pps_assigned_target_is_the_easiest_recent_target_never_chosen_by_hash() {
+        let t = |b: u8| { let mut x = [0u8; 32]; x[1] = b; x };
+        let grace = |target: [u8; 32], age_secs: u64| GraceTarget {
+            target, difficulty: 1.0,
+            set_at: Instant::now().checked_sub(Duration::from_secs(age_secs)).unwrap(),
+        };
+        // No history: the current target.
+        assert_eq!(pps_assigned_target(t(4), &[]), t(4));
+        // Difficulty just raised (current is harder): the easier old target applies.
+        assert_eq!(pps_assigned_target(t(4), &[grace(t(8), 1)]), t(8));
+        // Difficulty just lowered (current is easier): the current target applies.
+        assert_eq!(pps_assigned_target(t(8), &[grace(t(4), 1)]), t(8));
+        // Replaced longer ago than the window: no longer applies.
+        let expired = PPS_GRACE_TARGET_MAX_AGE.as_secs() + 1;
+        assert_eq!(pps_assigned_target(t(4), &[grace(t(8), expired)]), t(4));
+        // Several steps inside the window: the easiest of them.
+        assert_eq!(pps_assigned_target(t(2), &[grace(t(8), 5), grace(t(4), 2)]), t(8));
     }
 
     #[test]
