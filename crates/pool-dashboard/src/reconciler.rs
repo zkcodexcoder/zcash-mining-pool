@@ -40,6 +40,12 @@ const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
 /// Attempts younger than this are considered still in flight and skipped.
 const STALE_ATTEMPT_MINUTES: i64 = 10;
 
+/// Audit B24: newest settled PPS payout transactions re-checked every sweep.
+const PPS_AUDIT_NEWEST: i64 = 100;
+/// Audit B24: older settled PPS payout transactions re-checked per sweep, rotating.
+const PPS_AUDIT_OLDER: i64 = 100;
+/// pool_status key holding the rotation cursor (a pps_payouts id).
+const PPS_AUDIT_CURSOR_KEY: &str = "pps_payout_audit_cursor";
 /// Window for the phantom-payout chain check.
 const PHANTOM_CHECK_HOURS: i64 = 24;
 
@@ -916,38 +922,85 @@ impl Reconciler {
         }
     }
 
+    /// Audit B24: every settled PPS payout is re-checked over time, not only the
+    /// last 24 hours. Each sweep covers the newest settled transactions plus a
+    /// rotating slice of older ones (cursor in pool_status). A payout the node no
+    /// longer shows confirmed, or cannot find at all, is alerted for manual review,
+    /// and the wallet says whether it conflicted. Alert only: nothing is reversed,
+    /// refunded or resent.
     async fn check_pps_phantom_payouts(&self, summary: &mut SweepSummary) {
         if self.pps_policy.is_none() { return; }
-        let recent: Result<Vec<(String,)>, _> = sqlx::query_as(
-            "SELECT DISTINCT txid FROM pps_payouts WHERE created_at>=datetime('now','-24 hours') ORDER BY txid LIMIT 1001",
-        ).fetch_all(self.db.inner()).await;
-        let recent = match recent {
+        let newest: Result<Vec<(String, i64)>, _> = sqlx::query_as(
+            "SELECT txid, MAX(id) m FROM pps_payouts GROUP BY txid ORDER BY m DESC LIMIT ?1",
+        ).bind(PPS_AUDIT_NEWEST).fetch_all(self.db.inner()).await;
+        let newest = match newest {
             Ok(v) => v,
             Err(_) => { summary.alerts.push("PPS payout verification query failed".into()); return; }
         };
-        if recent.len() > 1000 {
-            summary.alerts.push("PPS payout verification coverage exceeded 1000 transactions; manual review required".into());
-        }
+        let cursor = match self.db.get_pool_status(PPS_AUDIT_CURSOR_KEY).await {
+            Ok(Some((value, _))) => value.parse::<i64>().unwrap_or(i64::MAX),
+            _ => i64::MAX,
+        };
+        // Older slice: below both the cursor and the newest window.
+        let below = newest.iter().map(|(_, m)| *m).min().unwrap_or(i64::MAX).min(cursor);
+        let older: Result<Vec<(String, i64)>, _> = sqlx::query_as(
+            "SELECT txid, MAX(id) m FROM pps_payouts GROUP BY txid HAVING m < ?1 ORDER BY m DESC LIMIT ?2",
+        ).bind(below).bind(PPS_AUDIT_OLDER).fetch_all(self.db.inner()).await;
+        let older = match older {
+            Ok(v) => v,
+            Err(_) => { summary.alerts.push("PPS payout verification query failed".into()); return; }
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let mut absent = 0;
-        let mut unknown = 0;
-        for (txid,) in recent.into_iter().take(1000) {
+        let (mut unmined, mut absent, mut conflicted, mut unknown) = (0, 0, 0, 0);
+        let mut completed = true;
+        for (txid, _) in newest.iter().chain(older.iter()) {
             if tokio::time::Instant::now() >= deadline {
                 summary.alerts.push("PPS payout verification time budget exhausted; coverage incomplete".into());
+                completed = false;
                 break;
             }
-            match tokio::time::timeout(Duration::from_secs(1), self.node_rpc.get_raw_transaction(&txid, 1)).await {
-                Ok(Ok(_)) => {},
-                Ok(Err(e)) if e.is_definitely_not_found() => absent += 1,
+            match tokio::time::timeout(Duration::from_secs(1), self.node_rpc.get_raw_transaction(txid, 1)).await {
+                Ok(Ok(raw)) => {
+                    if raw.get("confirmations").and_then(|c| c.as_i64()).unwrap_or(0) < 1 {
+                        unmined += 1;
+                        if self.pps_wallet_conflicted(txid).await { conflicted += 1; }
+                    }
+                }
+                Ok(Err(e)) if e.is_definitely_not_found() => {
+                    absent += 1;
+                    if self.pps_wallet_conflicted(txid).await { conflicted += 1; }
+                }
                 _ => unknown += 1,
             }
+        }
+        if completed {
+            // Move down through older payouts; wrap to the newest once none are left.
+            let next = older.iter().map(|(_, m)| *m).min().unwrap_or(i64::MAX);
+            if self.db.set_pool_status(PPS_AUDIT_CURSOR_KEY, &next.to_string()).await.is_err() {
+                summary.alerts.push("PPS payout verification cursor not saved".into());
+            }
+        }
+        if unmined > 0 {
+            summary.alerts.push(format!("PPS settled payouts no longer confirmed on the node: {unmined}; reorg review required, no automatic refund or resend"));
         }
         if absent > 0 {
             summary.alerts.push(format!("PPS paid transactions not visible: {absent}; manual reorg/expiry review required, no automatic refund or resend"));
         }
+        if conflicted > 0 {
+            summary.alerts.push(format!("PPS settled payouts the wallet reports conflicted: {conflicted}; those miners were not paid, manual reconciliation required"));
+        }
         if unknown > 0 {
             summary.alerts.push(format!("PPS paid transaction visibility unknown: {unknown}; no automatic action"));
         }
+    }
+
+    /// True when the payout wallet reports the transaction conflicted (-1 confirmations).
+    async fn pps_wallet_conflicted(&self, txid: &str) -> bool {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1),
+                self.wallet_rpc.zecd_conventional_rpc("gettransaction", serde_json::json!([txid]))).await,
+            Ok(Ok(v)) if v.get("confirmations").and_then(|c| c.as_i64()).is_some_and(|c| c < 0)
+        )
     }
 }
 
@@ -1443,6 +1496,81 @@ pub(crate) mod tests {
             "falls back to alert-only: {:?}",
             s.alerts
         );
+    }
+
+    fn pps_audit_policy() -> PpsPolicy {
+        PpsPolicy {
+            network: "testnet".into(), epoch: "audit-test".into(), fee_bps: 100,
+            max_liability_zatoshis: 1_000, total_exposure_zatoshis: 2_000,
+            fee_allowance_zatoshis: 10, reserve_min_zatoshis: 1, max_payout_zatoshis: 100,
+        }
+    }
+
+    async fn seed_pps_payout(pool: &sqlx::SqlitePool, id: i64, txid: &str, age_days: i64) {
+        let rows = format!(
+            "INSERT OR IGNORE INTO miners(id,address) VALUES(1,'utest1ppsaudit');
+             INSERT INTO payout_attempts(id,status,created_at) VALUES({id},'confirmed',datetime('now','-{age_days} days'));
+             INSERT INTO pps_payouts(id,attempt_id,miner_id,txid,amount,created_at)
+               VALUES({id},{id},1,'{txid}',5,datetime('now','-{age_days} days'));"
+        );
+        sqlx::raw_sql(&rows).execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pps_settled_payout_audit_covers_old_payouts_and_classifies_reorgs() {
+        let (db, pool) = setup_db().await;
+        // Settled 30 days ago: outside the former 24-hour window.
+        seed_pps_payout(&pool, 1, &"a".repeat(64), 30).await;
+        // The node shows it back in the mempool; the wallet reports it conflicted.
+        let node = mock_rpc(HashMap::from([("getrawtransaction", serde_json::json!({"confirmations":0}))])).await;
+        let wallet = mock_rpc(HashMap::from([("gettransaction", serde_json::json!({"confirmations":-1}))])).await;
+        let mut r = reconciler(db, &node, &wallet);
+        r.pps_policy = Some(pps_audit_policy());
+        let mut s = SweepSummary::default();
+        r.check_pps_phantom_payouts(&mut s).await;
+        assert!(s.alerts.iter().any(|a| a.contains("no longer confirmed")), "alerts: {:?}", s.alerts);
+        assert!(s.alerts.iter().any(|a| a.contains("conflicted: 1")), "alerts: {:?}", s.alerts);
+    }
+
+    #[tokio::test]
+    async fn pps_settled_payout_audit_is_quiet_when_confirmed_and_alerts_when_absent() {
+        let (db, pool) = setup_db().await;
+        seed_pps_payout(&pool, 1, &"b".repeat(64), 2).await;
+        let wallet = mock_rpc(HashMap::new()).await;
+        let confirmed = mock_rpc(HashMap::from([("getrawtransaction", serde_json::json!({"confirmations":12}))])).await;
+        let mut r = reconciler(db.clone(), &confirmed, &wallet);
+        r.pps_policy = Some(pps_audit_policy());
+        let mut s = SweepSummary::default();
+        r.check_pps_phantom_payouts(&mut s).await;
+        assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
+        // Node answers -5: not visible; the wallet does not know it either, so not "conflicted".
+        let absent = mock_rpc(HashMap::new()).await;
+        let mut r = reconciler(db, &absent, &wallet);
+        r.pps_policy = Some(pps_audit_policy());
+        let mut s = SweepSummary::default();
+        r.check_pps_phantom_payouts(&mut s).await;
+        assert!(s.alerts.iter().any(|a| a.contains("not visible: 1")), "alerts: {:?}", s.alerts);
+        assert!(!s.alerts.iter().any(|a| a.contains("conflicted")), "alerts: {:?}", s.alerts);
+    }
+
+    #[tokio::test]
+    async fn pps_settled_payout_audit_rotates_through_older_payouts() {
+        let (db, pool) = setup_db().await;
+        for id in 1..=205 {
+            seed_pps_payout(&pool, id, &format!("{id:064x}"), 1).await;
+        }
+        let node = mock_rpc(HashMap::from([("getrawtransaction", serde_json::json!({"confirmations":12}))])).await;
+        let wallet = mock_rpc(HashMap::new()).await;
+        let mut r = reconciler(db.clone(), &node, &wallet);
+        r.pps_policy = Some(pps_audit_policy());
+        // Newest window is ids 106..=205; the older slices walk 6..=105, then 1..=5, then wrap.
+        for expected in ["6", "1", &i64::MAX.to_string()] {
+            let mut s = SweepSummary::default();
+            r.check_pps_phantom_payouts(&mut s).await;
+            assert!(s.alerts.is_empty(), "alerts: {:?}", s.alerts);
+            let cursor = db.get_pool_status(PPS_AUDIT_CURSOR_KEY).await.unwrap().unwrap().0;
+            assert_eq!(cursor, expected);
+        }
     }
 
     #[tokio::test]
