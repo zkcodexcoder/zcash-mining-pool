@@ -142,6 +142,12 @@ mod actual_validator {
                 .await
         }
 
+        pub(super) async fn prefetch_subsidy(&self) -> bool {
+            let network = self.validator.pps.as_ref().unwrap().epoch.network
+                .parse::<PpsNetwork>().unwrap();
+            prefetch_pps_subsidy(&self.validator.rpc, network, &self.validator.jobs,
+                &self.validator.pps_subsidies).await
+        }
         pub(super) async fn invalidate_lease(&self) {
             *self.validator.pps.as_ref().unwrap().lease.write().await = None;
         }
@@ -471,6 +477,12 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
     )
     .await;
 
+    // Audit B15: the background prefetch prices the job height before any share,
+    // once per height.
+    assert!(harness.prefetch_subsidy().await);
+    assert!(!harness.prefetch_subsidy().await);
+    assert_eq!(node.calls("getblocksubsidy").len(), 1);
+
     // Correct header-hash difficulty cannot make invalid Equihash billable.
     let bad = harness.invalid_equihash_meeting_target();
     let rejected = harness.submit("bad-proof", &bad).await;
@@ -486,6 +498,8 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
         .unwrap();
     assert!(result.is_block);
     assert_eq!(result.block_height, Some(1));
+    // Priced from the prefetched subsidy: the share path made no subsidy RPC.
+    assert_eq!(node.calls("getblocksubsidy").len(), 1);
     let accepted = db.pps_invariant().await.unwrap();
     assert_eq!(accepted.accepted_events, 1);
     assert_eq!(

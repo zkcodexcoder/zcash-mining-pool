@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,13 @@ const PPS_FUNDING_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 /// re-armed within a minute, slow enough not to saturate the wallet RPC
 /// (a collection itself can take ~40 s against zecd).
 const PPS_FUNDING_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// Audit B15: how often the background task looks for a new job height to price.
+const PPS_SUBSIDY_PREFETCH_POLL: Duration = Duration::from_secs(1);
+/// Bound on one subsidy lookup (getblockchaininfo + getblocksubsidy).
+const PPS_SUBSIDY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// Heights kept in the PPS subsidy cache. A height's miner subsidy is fixed by
+/// consensus, so entries never expire; only the oldest heights are dropped.
+const PPS_SUBSIDY_CACHE_HEIGHTS: usize = 16;
 /// Evidence-read failures that say nothing about solvency or integrity.
 /// The categories match pps_credit_health's fixed vocabulary.
 fn pps_transient_refresh_category(category: &str) -> bool {
@@ -244,7 +251,8 @@ pub struct SessionSnapshot {
 pub struct ShareValidator {
     pps: Option<ActivePps>,
     pps_refresh_task: Option<tokio::task::JoinHandle<()>>,
-    pps_subsidies: RwLock<HashMap<u64, (u64, Instant)>>,
+    /// Audit B15: validated miner subsidy per height, normally filled before shares arrive.
+    pps_subsidies: Arc<RwLock<BTreeMap<u64, u64>>>,
     db: PoolDb,
     stratum: Arc<StratumServer>,
     jobs: Arc<RwLock<HashMap<String, std::sync::Arc<MiningJob>>>>,
@@ -320,7 +328,7 @@ impl ShareValidator {
         Self {
             pps: None,
             pps_refresh_task: None,
-            pps_subsidies: RwLock::new(HashMap::new()),
+            pps_subsidies: Arc::new(RwLock::new(BTreeMap::new())),
             db,
             stratum,
             jobs,
@@ -379,6 +387,8 @@ impl ShareValidator {
         let health=Arc::new(std::sync::Mutex::new(crate::pps_credit_health::CreditHealthTracker::default()));
         let refresh_health=Arc::clone(&health);
         let refresh_latest=Arc::clone(&self.latest_notify);
+        let prefetch_jobs = Arc::clone(&self.jobs);
+        let prefetch_subsidies = Arc::clone(&self.pps_subsidies);
         let refresh_lease = Arc::clone(&lease);
         let refresh_funding = Arc::clone(&funding);
         let rpc = Arc::clone(&self.rpc);
@@ -476,6 +486,14 @@ impl ShareValidator {
                 },
                 crate::pps_credit_health::publish_loop(&db,&epoch,&funding_route,
                     &refresh_lease,&refresh_funding,&refresh_health,&refresh_latest),
+                async {
+                    // Audit B15: price each new height before its first share, so
+                    // share validation normally finds the subsidy cached.
+                    loop {
+                        tokio::time::sleep(PPS_SUBSIDY_PREFETCH_POLL).await;
+                        prefetch_pps_subsidy(&rpc, network, &prefetch_jobs, &prefetch_subsidies).await;
+                    }
+                },
             );
         }));
         self.pps = Some(ActivePps { epoch: runtime.epoch, funding_route: runtime.funding_route, lease, funding, health });
@@ -1358,11 +1376,13 @@ impl ShareValidator {
             let network = pps.epoch.network.parse::<PpsNetwork>()
                 .map_err(|_| { crate::pps_credit_health::denial(&pps.health,"network","network_mismatch");
                     StratumError::other("PPS network invalid") })?;
+            // Audit B15: a height's subsidy never changes, so a cached value is final.
+            // The background prefetch normally fills it; this lookup is the fallback.
             let cached = self.pps_subsidies.read().await.get(&job.template.height).copied();
             let subsidy = match cached {
-                Some((subsidy, checked)) if checked.elapsed() < Duration::from_secs(15) => subsidy,
-                _ => {
-                    let subsidy = tokio::time::timeout(Duration::from_secs(5),
+                Some(subsidy) => subsidy,
+                None => {
+                    let subsidy = tokio::time::timeout(PPS_SUBSIDY_RPC_TIMEOUT,
                         crate::pps_economics::validated_miner_subsidy(
                             &self.rpc, network, job.template.height,
                         ),
@@ -1370,9 +1390,7 @@ impl ShareValidator {
                         StratumError::other("PPS admission paused: subsidy evidence timeout") })?
                         .map_err(|_| { crate::pps_credit_health::denial(&pps.health,"subsidy","subsidy_unavailable");
                             StratumError::other("PPS admission paused: subsidy evidence unavailable") })?;
-                    let mut cache = self.pps_subsidies.write().await;
-                    if cache.len() > 16 { cache.clear(); }
-                    cache.insert(job.template.height, (subsidy, Instant::now()));
+                    remember_pps_subsidy(&mut *self.pps_subsidies.write().await, job.template.height, subsidy);
                     subsidy
                 }
             };
@@ -1933,9 +1951,62 @@ pub fn parse_target(target_hex: &str) -> Result<[u8; 32], String> {
     Ok(padded)
 }
 
+/// Audit B15: remember a validated miner subsidy. A height's subsidy is fixed by
+/// consensus, so entries never expire; only the oldest heights are dropped.
+fn remember_pps_subsidy(cache: &mut BTreeMap<u64, u64>, height: u64, subsidy: u64) {
+    cache.insert(height, subsidy);
+    while cache.len() > PPS_SUBSIDY_CACHE_HEIGHTS {
+        cache.pop_first();
+    }
+}
+
+/// Audit B15: price the newest job height ahead of its first share. Returns true
+/// when it fetched and cached a subsidy. A failure is left to the share path,
+/// which retries the lookup and records the denial.
+async fn prefetch_pps_subsidy(
+    rpc: &ZcashRpcClient,
+    network: PpsNetwork,
+    jobs: &RwLock<HashMap<String, std::sync::Arc<MiningJob>>>,
+    cache: &RwLock<BTreeMap<u64, u64>>,
+) -> bool {
+    let Some(height) = jobs.read().await.values().map(|job| job.template.height).max() else {
+        return false;
+    };
+    if cache.read().await.contains_key(&height) {
+        return false;
+    }
+    match tokio::time::timeout(
+        PPS_SUBSIDY_RPC_TIMEOUT,
+        crate::pps_economics::validated_miner_subsidy(rpc, network, height),
+    )
+    .await
+    {
+        Ok(Ok(subsidy)) => {
+            remember_pps_subsidy(&mut *cache.write().await, height, subsidy);
+            true
+        }
+        _ => {
+            debug!(height, "PPS subsidy prefetch failed; the share path will retry");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pps_subsidy_cache_never_expires_and_keeps_the_newest_heights() {
+        let mut cache = BTreeMap::new();
+        for height in 1..=20 {
+            remember_pps_subsidy(&mut cache, height, 1_000 + height);
+        }
+        assert_eq!(cache.len(), PPS_SUBSIDY_CACHE_HEIGHTS);
+        assert_eq!(cache.keys().next(), Some(&5));
+        assert_eq!(cache.get(&20), Some(&1_020));
+        assert!(!cache.contains_key(&4));
+    }
 
     fn refresh_test_proof() -> PpsFundingLease {
         PpsFundingLease { network:"testnet".into(),checked_at_unix:100,valid_until_unix:160,
