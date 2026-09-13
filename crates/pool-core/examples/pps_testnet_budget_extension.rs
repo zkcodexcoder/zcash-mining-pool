@@ -6,6 +6,8 @@
 //! do not blindly retry or restore the predecessor accounting state. The owner
 //! must stop both runtime writers and hold the DB path/parent directories
 //! stable; the metadata check is not a kernel-enforced NOFOLLOW SQLite open.
+//! --extend refuses while pool_status shows writes from the last 15 minutes, so
+//! wait that long after stopping pool-server and the dashboard.
 use node_rpc::ZcashRpcClient;
 use pool_core::pps_funding::{collect_pps_testnet_budget_extension_funding, PpsFundingError};
 use pool_db::{PoolDb, pps_policy::PpsPolicy};
@@ -86,6 +88,14 @@ fn funding_category(error:PpsFundingError)->&'static str {
         PpsFundingError::ConcurrentChange=>"concurrent_change",
         _=>"funding_unverified" }
 }
+/// Audit B20: true when pool_status shows a write in the last 15 minutes. pool-server
+/// refreshes its rows every few seconds; the dashboard writes after each payout round
+/// and reconciler sweep (600 s by default). An unreadable table counts as active,
+/// so the extension fails closed.
+async fn runtime_writers_active(db:&PoolDb)->bool {
+    sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM pool_status WHERE updated_at >= datetime('now','-15 minutes'))")
+        .fetch_one(db.inner()).await.unwrap_or(true)
+}
 async fn execute(input:&Input,mode:Mode,report:&mut Report) {
     report.input_valid=true;
     // Reject a currently visible symlink, never create a DB or run general
@@ -101,6 +111,11 @@ async fn execute(input:&Input,mode:Mode,report:&mut Report) {
         Ok(pool)=>pool,Err(_)=>{report.error_category="database_unavailable";return}
     };
     let db=PoolDb::new(pool);
+    // Extending while pool-server or the dashboard still writes makes every credit fail
+    // its epoch check (and, before audit B1, discarded found blocks).
+    if mode==Mode::Extend && runtime_writers_active(&db).await {
+        report.error_category="runtime_writers_active"; return;
+    }
     let (wallet,node)=match (client(&input.wallet.rpc_url,&input.wallet.rpc_user,&input.wallet.rpc_password),
         client(&input.node.rpc_url,&input.node.rpc_user,&input.node.rpc_password)) {
         (Ok(wallet),Ok(node))=>(wallet,node),_=>{report.error_category="transport_unavailable";return}
@@ -291,6 +306,19 @@ mod tests {
                 "fee_allowance_zatoshis":50000000,"reserve_min_zatoshis":10,"max_payout_zatoshis":100},
             "hold_new_legacy_sends":true,"wallet":{"rpc_url":"http://127.0.0.1:28232","source":"synthetic-source"},
             "node":{"rpc_url":node,"rpc_url_sha256":format!("{:x}",Sha256::digest(node.as_bytes()))}})
+    }
+    #[tokio::test]
+    async fn extension_refuses_while_runtime_writers_are_active() {
+        let pool=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        let db=PoolDb::new(pool);
+        db.run_migrations().await.unwrap();
+        assert!(!runtime_writers_active(&db).await);
+        db.set_pool_status("last_template_at_ms","1").await.unwrap();
+        assert!(runtime_writers_active(&db).await);
+        sqlx::query("UPDATE pool_status SET updated_at=datetime('now','-20 minutes')")
+            .execute(db.inner()).await.unwrap();
+        assert!(!runtime_writers_active(&db).await);
     }
     #[test]
     fn exact_explicit_modes_only() {
