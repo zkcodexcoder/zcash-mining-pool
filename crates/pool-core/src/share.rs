@@ -25,8 +25,10 @@ use rewards::pps::{quote_standard_pps, PpsNetwork, PpsQuoteInput};
 #[derive(Clone)]
 pub struct PpsRuntime {
     pub epoch: PpsEpoch,
-    pub chain_lease: PpsChainLease,
-    pub funding_lease: PpsFundingLease,
+    /// Audit B12: either lease may be absent at startup (wallet down, explorer
+    /// out). The background refresh loops acquire them; mining never waits.
+    pub chain_lease: Option<PpsChainLease>,
+    pub funding_lease: Option<PpsFundingLease>,
     pub wallet_rpc: Arc<ZcashRpcClient>,
     pub payout_source: String,
     pub funding_route: crate::pps_funding::PpsFundingRoute,
@@ -352,7 +354,7 @@ impl ShareValidator {
             return Err("PPS requires one immutable announced target".into());
         }
         if runtime.epoch.network.parse::<PpsNetwork>().is_err()
-            || runtime.epoch.network != runtime.chain_lease.network
+            || runtime.chain_lease.as_ref().is_some_and(|l| l.network != runtime.epoch.network)
             || runtime.epoch.fee_bps >= 10_000
             || runtime.payout_source.is_empty() || runtime.payout_source.len() > 2048
         {
@@ -362,11 +364,13 @@ impl ShareValidator {
             .map_err(|_| "invalid PPS network".to_string())?;
         runtime.funding_route.validate(&runtime.epoch)
             .map_err(|_| "invalid PPS funding route policy".to_string())?;
-        crate::pps_funding::validate_funding_lease(&runtime.funding_lease,
-            &runtime.epoch, chrono::Utc::now().timestamp())
-            .map_err(|_| "invalid PPS startup funding evidence".to_string())?;
-        let lease = Arc::new(RwLock::new(Some(runtime.chain_lease)));
-        let funding = Arc::new(RwLock::new(Some(runtime.funding_lease)));
+        if let Some(funding) = &runtime.funding_lease {
+            crate::pps_funding::validate_funding_lease(funding,
+                &runtime.epoch, chrono::Utc::now().timestamp())
+                .map_err(|_| "invalid PPS startup funding evidence".to_string())?;
+        }
+        let lease = Arc::new(RwLock::new(runtime.chain_lease));
+        let funding = Arc::new(RwLock::new(runtime.funding_lease));
         let health=Arc::new(std::sync::Mutex::new(crate::pps_credit_health::CreditHealthTracker::default()));
         let refresh_health=Arc::clone(&health);
         let refresh_latest=Arc::clone(&self.latest_notify);
@@ -1163,15 +1167,21 @@ impl ShareValidator {
             raw_solution.hash(&mut h);
             h.finish()
         };
-        if self.pps.is_none() {
+        {
+            // Audit B8: refuse exact replays in EVERY mode, before Equihash. In PPS
+            // mode the fingerprint is recorded only after a successful credit (see
+            // the admission match below), so a share refused by admission is not
+            // poisoned for a legitimate resubmission.
             let mut sessions = self.session_difficulty.write().await;
             if let Some(sd) = sessions.get_mut(session_id) {
                 if sd.recent_share_fps.contains(&share_fp) {
                     return Err(StratumError::duplicate_share());
                 }
-                sd.recent_share_fps.push_back(share_fp);
-                if sd.recent_share_fps.len() > SHARE_DEDUP_HISTORY {
-                    sd.recent_share_fps.pop_front();
+                if self.pps.is_none() {
+                    sd.recent_share_fps.push_back(share_fp);
+                    if sd.recent_share_fps.len() > SHARE_DEDUP_HISTORY {
+                        sd.recent_share_fps.pop_front();
+                    }
                 }
             }
         }
@@ -1333,6 +1343,12 @@ impl ShareValidator {
 
         let mut pps_reward = None;
         if let Some(pps) = &self.pps {
+          // Audit B1: a found block must never depend on share accounting. Every PPS
+          // admission step (stale job, subsidy RPC, pricing, chain lease, cap,
+          // database) runs inside this block; a failure is captured instead of
+          // returning early, so a share that solves a block still reaches
+          // submitblock below. Only that share's credit is withheld.
+          let admission: Result<(u64, bool), StratumError> = async {
             // The fixed target is identical for every issued job. Reject work
             // superseded by a new tip rather than buying stale-chain shares.
             let latest = self.latest_notify.read().await;
@@ -1421,10 +1437,29 @@ impl ShareValidator {
                 tracing::warn!(category, worker = %worker_name,
                     "PPS share credited under a stale funding lease (advisory; send-side seal still gates payouts)");
             }
-            if receipt.duplicate && !is_block {
-                return Ok(ShareResult { is_block: false, block_height: None });
+            Ok::<(u64, bool), StratumError>((subsidy, receipt.duplicate))
+          }.await;
+          match admission {
+            Ok((subsidy, duplicate)) => {
+                // Audit B8: remember the credited share so an exact replay is
+                // refused before Equihash from now on.
+                if let Some(sd) = self.session_difficulty.write().await.get_mut(session_id) {
+                    sd.recent_share_fps.push_back(share_fp);
+                    if sd.recent_share_fps.len() > SHARE_DEDUP_HISTORY {
+                        sd.recent_share_fps.pop_front();
+                    }
+                }
+                if duplicate && !is_block {
+                    return Ok(ShareResult { is_block: false, block_height: None });
+                }
+                pps_reward = Some(subsidy as i64);
             }
-            pps_reward = Some(subsidy as i64);
+            Err(error) if is_block => {
+                error!(height = job.template.height, reason = %error.message,
+                    "PPS admission failed for a BLOCK-solving share; submitting the block anyway (share credit withheld)");
+            }
+            Err(error) => return Err(error),
+          }
         } else {
             self.db.record_share(worker_id, job_id, difficulty, is_block, session_id).await
                 .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;

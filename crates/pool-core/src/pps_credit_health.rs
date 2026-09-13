@@ -237,7 +237,16 @@ fn assess_quote(h:&mut PpsCreditHealth,quote:Option<&QuoteObservation>,job:Optio
         && now.checked_sub(q.checked_at).is_some_and(|v| v<QUOTE_MAX_AGE_SECONDS)
         && instant.checked_duration_since(q.checked)
             .is_some_and(|v| v<Duration::from_secs(QUOTE_MAX_AGE_SECONDS as u64));
-    if !fresh {return;}
+    if !fresh {
+        // Audit B14: headroom below the price of one share rejects EVERY share
+        // (CapExceeded) even though unused is not exactly zero. At a fixed target the
+        // last observed price is a sound proxy for the next share, fresh or not.
+        if q.amount>unused {
+            h.state=CreditAdmissionState::Paused;
+            h.category="cap_exhausted".into();
+        }
+        return;
+    }
     h.current_quote_fits=Some(q.amount<=unused);
     if q.amount>unused {
         // The next share would not fit under the cumulative cap. That IS a hard
@@ -321,15 +330,21 @@ fn assess(h:&mut PpsCreditHealth, epoch:&PpsEpoch, route:&PpsFundingRoute,
         s.cap_subzatoshis>0 && s.unused_credit_subzatoshis
             < s.cap_subzatoshis/5 + u128::from(s.cap_subzatoshis%5!=0));
     h.generation_matches=lease.map(|l| l.generation==snapshot.generation);
-    let reason=if snapshot.financial_halt { Some("financial_halt") }
+    // Audit B14: report the WORST state. Gates that actually reject valid shares
+    // (chain lease, unreadable accounting, exhausted cap) are evaluated before the
+    // send-side reasons that only degrade, so a funding warning can never mask a
+    // hard rejection.
+    let funding=snapshot.funding.as_ref();
+    let reason=if !h.chain_expiry_valid { Some("chain_invalid") }
+        else if funding.is_none() { Some("accounting_invalid") }
+        else if funding.is_some_and(|s| s.unused_credit_subzatoshis==0) { Some("cap_exhausted") }
+        else if snapshot.financial_halt { Some("financial_halt") }
         else if lease.is_none() { Some("funding_missing") }
         else if !h.funding_expiry_valid { Some("funding_expired") }
-        else if !h.chain_expiry_valid { Some("chain_invalid") }
         else if h.generation_matches != Some(true) { Some("generation_changed") }
-        else if let (Some(l),Some(s))=(lease,snapshot.funding.as_ref()) {
+        else if let (Some(l),Some(s))=(lease,funding) {
             if crate::pps_funding::validate_funding_lease(l,epoch,now).is_err() { Some("invalid_evidence") }
             else if l.spendable_zatoshis < s.required_spendable_zatoshis { Some("funding_insufficient") }
-            else if s.unused_credit_subzatoshis==0 { Some("cap_exhausted") }
             else if s.paid_fees_zatoshis.checked_add(s.reserved_fees_zatoshis)
                 .is_none_or(|v|v>=s.fee_allowance_zatoshis)
                 || crate::pps_funding::validate_credit_fee_capacity(route,s).is_err() { Some("fee_capacity_exhausted") }
@@ -523,8 +538,26 @@ mod tests {
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
         s.funding.as_mut().unwrap().reserved_fees_zatoshis=4_980_000_000;
         assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"fee_capacity_exhausted");
-        s.financial_halt=true; s.funding=None;
-        assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"financial_halt");
+        s.funding.as_mut().unwrap().reserved_fees_zatoshis=0;
+        // A halt fences sends only: crediting continues, so it degrades.
+        s.financial_halt=true;
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"financial_halt"));
+        // Audit B14: the WORST state is reported. Gates that actually reject shares
+        // win over send-side reasons that only degrade.
+        s.funding.as_mut().unwrap().unused_credit_subzatoshis=0;
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"cap_exhausted"));
+        s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
+        s.funding.as_mut().unwrap().required_spendable_zatoshis+=1;
+        h.chain_expiry_valid=false;
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"chain_invalid"));
+        h.chain_expiry_valid=true;
+        // Unreadable accounting rejects credits, so it outranks a halt too.
+        s.funding=None;
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"accounting_invalid"));
     }
     #[tokio::test]
     async fn credit_refresh_diagnostics_keep_exact_failure_before_collapse_and_are_task_local() {

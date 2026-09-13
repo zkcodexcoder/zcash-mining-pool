@@ -195,14 +195,24 @@ impl PoolDb {
             .execute(&mut *c)
             .await?;
         let mut tx = c.begin_with("BEGIN IMMEDIATE").await?;
-        crate::pps_funding::check(
+        // Audit B12: activating a NEW epoch still requires fresh funding evidence.
+        // Restarting an EXISTING epoch does not: crediting is advisory on funding
+        // and the payout seal re-proves it before any send, so a wallet that is
+        // down or rescanning must not stop the pool from starting.
+        let existing: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pps_meta WHERE singleton=1 AND active_epoch=?1)")
+            .bind(&e.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let pre = crate::pps_funding::check(
             &mut tx,
             e,
             funding,
             crate::pps_funding::runtime_now()?,
             true,
         )
-        .await?;
+        .await;
+        if existing { let _ = advisory_funding(pre)?; } else { pre?; }
         crate::pps_funding::persist_policy(&mut tx, e).await?;
         let meta = sqlx::query("SELECT * FROM pps_meta WHERE singleton=1")
             .fetch_optional(&mut *tx)
@@ -247,14 +257,15 @@ impl PoolDb {
             .await?;
         epoch_check(&mut tx, e).await?;
         reconcile(&mut tx).await?;
-        crate::pps_funding::check(
+        let post = crate::pps_funding::check(
             &mut tx,
             e,
             funding,
             crate::pps_funding::runtime_now()?,
             false,
         )
-        .await?;
+        .await;
+        if existing { let _ = advisory_funding(post)?; } else { post?; }
         tx.commit().await?;
         Ok(())
     }
@@ -503,7 +514,10 @@ impl PoolDb {
         })
     }
     pub async fn pps_invariant(&self) -> Result<PpsLedgerSummary, PpsDbError> {
-        let mut tx = self.inner().begin_with("BEGIN IMMEDIATE").await?;
+        // Audit B21: the full ledger audit is read-only. A deferred transaction gives
+        // it a consistent WAL snapshot without holding the writer lock, so a long
+        // replay can no longer stall share crediting.
+        let mut tx = self.inner().begin().await?;
         let s = reconcile(&mut tx).await?;
         tx.commit().await?;
         Ok(s)
@@ -1041,9 +1055,10 @@ mod tests {
             (s.legacy_pending_zatoshis, s.legacy_paying_zatoshis),
             (25, 15)
         );
-        assert_eq!(s.required_spendable_zatoshis, 160);
+        // Audit B3: required = legacy 40 + floor + OUTSTANDING (0) + fees — no cap.
+        assert_eq!(s.required_spendable_zatoshis, 150);
         let mut l = funded(&f).await;
-        l.spendable_zatoshis = 159;
+        l.spendable_zatoshis = 149;
         assert!(matches!(
             f.db.initialize_pps_epoch(&f.e, Some(&l)).await,
             Err(PpsDbError::FundingInsufficient)
@@ -1059,7 +1074,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 0);
-        l.spendable_zatoshis = 160;
+        l.spendable_zatoshis = 150;
         f.db.initialize_pps_epoch(&f.e, Some(&l)).await.unwrap();
         f.db.check_pps_funding(&l).await.unwrap();
     }
@@ -1096,6 +1111,7 @@ mod tests {
         assert_eq!(r.funding_advisory, Some("funding_lease_required"));
         for kind in 0..8 {
             let mut l = funded(&f).await;
+            let required = f.db.pps_funding_snapshot().await.unwrap().required_spendable_zatoshis;
             let expected = match kind {
                 0 => { l.valid_until_unix = NOW; "funding_lease_required" }
                 1 => { l.valid_until_unix = NOW + crate::pps_funding::FUNDING_LEASE_SECONDS + 1; "funding_lease_required" }
@@ -1104,7 +1120,7 @@ mod tests {
                 4 => { l.reserve_floor_zatoshis -= 1; "funding_lease_required" }
                 5 => { l.reserved_fee_allowance_zatoshis -= 1; "funding_lease_required" }
                 6 => { l.generation += 1; "funding_lease_required" }
-                _ => { l.spendable_zatoshis = 119; "funding_insufficient" }
+                _ => { l.spendable_zatoshis = required - 1; "funding_insufficient" }
             };
             let r = f
                 .db
@@ -1147,7 +1163,7 @@ mod tests {
         assert!(calls.load(Ordering::SeqCst) >= 2, "commit-time clock must be re-read");
         assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 1);
         l = funded(&f).await;
-        l.spendable_zatoshis = 120;
+        l.spendable_zatoshis = f.db.pps_funding_snapshot().await.unwrap().required_spendable_zatoshis;
         // A new legacy liability after attestation is observed inside the credit
         // transaction, even though it has not changed wallet spend generation:
         // the wallet no longer covers required backing, so the credit carries the
@@ -1210,9 +1226,9 @@ mod tests {
         let s = f.db.pps_funding_snapshot().await.unwrap();
         assert_eq!((s.paid_fees_zatoshis, s.reserved_fees_zatoshis), (1, 0));
         assert_eq!(s.gross_subzatoshis, 3 * PPS_SCALE + 1);
-        // Refill model: the 1 paid no longer reduces required backing (fees still
-        // never replenish; principal capacity does, but the full cap stays backed).
-        assert_eq!(s.required_spendable_zatoshis, 119);
+        // Audit B3: required backs what is OWED — outstanding 2 zat + 1 sub-zat rounds
+        // up to 3 — plus floor and unspent fees; the cap is no longer collateral.
+        assert_eq!(s.required_spendable_zatoshis, 112);
         let mut e = f.e.clone();
         e.id = "next".into();
         f.db.initialize_pps_epoch(&e, Some(&funded(&f).await))
@@ -1455,7 +1471,7 @@ mod tests {
                 s.legacy_paying_zatoshis,
                 s.required_spendable_zatoshis
             ),
-            (299, 1, 420)
+            (299, 1, 410)
         );
         sqlx::query("UPDATE balances SET paying=0 WHERE miner_id=?1")
             .bind(last)
@@ -1735,9 +1751,9 @@ mod tests {
                 s.paid_zatoshis,
                 s.required_spendable_zatoshis
             ),
-            // Refill model: paid principal (1) no longer reduces the capital the
-            // wallet must hold — required backing is reserve + the FULL cap + fees.
-            (7, 0, 1, 13 + CONVENTIONAL_BOUND * 4)
+            // Audit B3: required backing is reserve + OUTSTANDING (2 of 3 credited
+            // remain after 1 paid) + unspent fees — not the full cap.
+            (7, 0, 1, 5 + CONVENTIONAL_BOUND * 4)
         );
         assert_eq!(s.gross_subzatoshis, 3 * PPS_SCALE);
         let receipt = f.db.get_pps_conventional_attempt(a).await.unwrap().unwrap();
@@ -2221,10 +2237,10 @@ mod tests {
         let before = f.db.pps_invariant().await.unwrap();
         let history = extension_history(&f).await;
         let lease = extension_lease(&f).await;
-        // Refill model: the 1 paid principal no longer reduces required capital
-        // (the full cap stays backed); only fees (7), legacy (17) and reserve (10)
-        // move the number.
-        assert_eq!(lease.spendable_zatoshis,100_000_000_000 - 7 + 17 + 10);
+        // Audit B3: projected backing = legacy 17 + floor 10 + outstanding (3 zat + 7
+        // sub-zat credited, 1 paid -> rounds up to 3) + the next epoch's unspent fee
+        // allowance (5e9 - 7 paid). Raising the cap adds no collateral.
+        assert_eq!(lease.spendable_zatoshis, 5_000_000_000 - 7 + 17 + 10 + 3);
         assert!(f.db.verify_pps_epoch(&crate::pps_funding::testnet_budget_extension_epoch(&f.e).unwrap()).await.is_err());
         f.db.extend_testnet_pps_budget(&f.e,&lease).await.unwrap();
         assert_eq!(extension_history(&f).await,history);

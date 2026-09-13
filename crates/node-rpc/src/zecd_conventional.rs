@@ -285,6 +285,22 @@ impl TryFromAddress for RecipientAddress {
         Ok(decoded)
     }
 }
+/// Audit B6: stable keys for every receiver inside a testnet payout recipient, so
+/// the payout selector can skip a recipient that overlaps one already selected
+/// (for example a wallet's bare t-address and its UA) instead of letting the batch
+/// builder reject the whole round.
+pub fn recipient_receiver_keys(address: &str) -> Result<Vec<Vec<u8>>, ConventionalError> {
+    Ok(decode_recipient(address)?
+        .receivers
+        .into_iter()
+        .map(|receiver| match receiver {
+            RecipientReceiver::Transparent(script) => [&[0u8][..], &script[..]].concat(),
+            RecipientReceiver::Sapling(raw) => [&[1u8][..], &raw[..]].concat(),
+            RecipientReceiver::Orchard(raw) => [&[2u8][..], &raw[..]].concat(),
+        })
+        .collect())
+}
+
 fn decode_recipient(address: &str) -> Result<RecipientAddress, ConventionalError> {
     let decoded = canonical(address)?
         .convert_if_network::<RecipientAddress>(NetworkType::Test)

@@ -25,9 +25,13 @@ pub(crate) async fn process(
     db.pps_invariant().await?;
     // Unknown signer/extraction/broadcast outcomes retain both liability and
     // fees. Never select new notes while such an attempt exists.
+    // Audit B17: one wallet, one in-flight send of ANY kind (PCZT, conventional or
+    // legacy) — the same serialization gate as the conventional route.
     anyhow::ensure!(
-        db.get_reserved_pps_attempts(None).await?.is_empty(),
-        "PPS prior payout unresolved; new proposals held"
+        db.get_reserved_pps_attempts(None).await?.is_empty()
+            && db.get_reserved_pps_conventional_attempts(100).await?.is_empty()
+            && db.get_reserved_attempts(None).await?.is_empty(),
+        "PPS or legacy payout unresolved; new proposals held"
     );
     let pending = db.get_pending_pps_payouts(minimum).await?;
     if pending.is_empty() {
@@ -50,7 +54,13 @@ pub(crate) async fn process(
     let mut items = Vec::new();
     let mut destinations: BTreeMap<String, i64> = BTreeMap::new();
     for payout in pending {
-        pczt::validate_pps_recipient(network, &payout.address)?;
+        // Audit B6: skip (and keep the balance of) a recipient this route cannot pay,
+        // instead of failing the whole round for every other miner.
+        if pczt::validate_pps_recipient(network, &payout.address).is_err() {
+            tracing::warn!(miner_id = payout.miner_id,
+                "PPS payout recipient unsupported by the PCZT route; skipped, balance retained");
+            continue;
+        }
         let amount = payout.amount.min(remaining);
         if amount < minimum {
             continue;
@@ -153,17 +163,9 @@ pub(crate) async fn process(
     db.update_payout_attempt(attempt, "sent", None, Some(transaction.txid()), None)
         .await?;
     transaction.broadcast(node).await?;
-    if node
-        .get_raw_transaction(transaction.txid(), 1)
-        .await
-        .is_err()
-    {
-        return Ok(0);
-    }
-    chain.fresh_lease().await?;
-    db.verify_pps_epoch(&epoch).await?;
-    let count = db.confirm_pps_payout(attempt, transaction.txid()).await?;
-    db.update_payout_attempt(attempt, "confirmed", None, Some(transaction.txid()), None)
-        .await?;
-    Ok(usize::try_from(count)?)
+    // Audit B2: mempool visibility is not payment. The attempt stays reserved and
+    // the reconciler settles it only once the transaction is PPS_SETTLE_MATURITY
+    // confirmations deep, the same bar as the conventional route. Until then the
+    // serialization gate above holds new proposals.
+    Ok(0)
 }

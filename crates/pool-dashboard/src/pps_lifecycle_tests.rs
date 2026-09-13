@@ -341,9 +341,28 @@ async fn pps_seeded_sealed_exact_txid_recovery_confirms_once_without_wallet_send
         .await
         .unwrap();
     let wallet = wallet(serde_json::json!({"txids": [TXID]})).await;
+    // Audit B2: a transaction short of PPS_SETTLE_MATURITY confirmations (or merely
+    // in the mempool) is not payment — the attempt must stay reserved.
+    let shallow = mock_rpc(HashMap::from([(
+        "getrawtransaction",
+        serde_json::json!({"height": 1,
+            "confirmations": crate::pps_conventional::PPS_SETTLE_MATURITY - 1}),
+    )]))
+    .await;
+    let mut r = crate::reconciler::tests::reconciler(db.clone(), &shallow, &wallet);
+    r.pps_policy = Some(policy.clone());
+    r.pps_gate = Some(gate(&shallow, Utc::now().timestamp()));
+    r.reconcile_reserved_payouts_once(None).await;
+    let summary = db.pps_invariant().await.unwrap();
+    assert_eq!(
+        (summary.pending_zatoshis, summary.paying_zatoshis, summary.paid_zatoshis),
+        (0, CREDIT, 0)
+    );
+    // At maturity it settles, exactly once.
     let node = mock_rpc(HashMap::from([(
         "getrawtransaction",
-        serde_json::json!({"height": 1}),
+        serde_json::json!({"height": 1,
+            "confirmations": crate::pps_conventional::PPS_SETTLE_MATURITY}),
     )]))
     .await;
     let mut r = crate::reconciler::tests::reconciler(db.clone(), &node, &wallet);

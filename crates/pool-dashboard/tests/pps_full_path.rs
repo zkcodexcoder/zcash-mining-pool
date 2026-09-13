@@ -110,8 +110,8 @@ mod actual_validator {
             )
             .with_pps(PpsRuntime {
                 epoch,
-                chain_lease: lease,
-                funding_lease,
+                chain_lease: Some(lease),
+                funding_lease: Some(funding_lease),
                 wallet_rpc,
                 payout_source: "synthetic-source".into(),
                 funding_route,
@@ -682,8 +682,9 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
         .unwrap();
     assert_eq!(pps_payouts, 1);
 
-    // Failure injection into the genuine acceptance path: no successful
-    // validator result, partial share, or partial liability may survive.
+    // Failure injection into the genuine acceptance path: no partial share or
+    // partial liability may survive a refused credit, and (audit B1) the found
+    // block is submitted whatever PPS admission decides.
     for failure in ["cap", "lease", "funding", "database"] {
         let (fdb, fpool) = reconciler::tests::setup_db().await;
         let mut fpolicy = policy.clone();
@@ -717,15 +718,18 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
                 .execute(&fpool).await.unwrap();
         }
         let submits_before = node.calls("submitblock").len();
-        assert!(
-            failing
-                .submit("failure-session", &block[143..1487])
-                .await
-                .is_err(),
-            "{failure}"
-        );
-        assert_uncredited(&fdb).await;
-        assert_eq!(node.calls("submitblock").len(), submits_before);
+        let outcome = failing.submit("failure-session", &block[143..1487]).await;
+        if failure == "funding" {
+            // Never-reject: a stale funding lease is advisory at credit time.
+            assert!(outcome.is_ok(), "{failure}: advisory funding must still credit");
+        } else {
+            // Credit refused (cap, chain lease, database), but the block-solving
+            // share is still accepted and nothing partial is credited.
+            assert!(outcome.as_ref().is_ok_and(|r| r.is_block), "{failure}: block must be accepted");
+            assert_uncredited(&fdb).await;
+        }
+        assert_eq!(node.calls("submitblock").len(), submits_before + 1,
+            "{failure}: a found block must be submitted");
     }
     quote_health_actual_validator_case(&node,&wallet,&block).await;
     drop(restarted);
@@ -762,9 +766,12 @@ async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:
             Arc::new(ZcashRpcClient::new(&wallet.url)),epoch,synthetic_lease(),block.to_vec(),
             pool_core::pps_funding::PpsFundingRoute::ZecdConventionalTestnet{hold_new_legacy_sends:true}).await;
         let before=harness.credit_health().await;
-        assert_eq!(before.state,CreditAdmissionState::Unknown); assert_eq!(before.category,"quote_missing");
+        // No share priced yet is not "unknown": the gates themselves are healthy.
+        assert_eq!(before.state,CreditAdmissionState::Ready); assert_eq!(before.category,"ok");
         let result=harness.submit("quote-observation",&block[143..1487]).await;
-        assert_eq!(result.is_err(),cap_rejected);
+        // Audit B1: this share solves a block, so it is accepted and its block
+        // submitted even when the cap refuses its credit.
+        assert!(result.as_ref().is_ok_and(|r| r.is_block), "cap_rejected={cap_rejected}");
         let health=harness.credit_health().await;
         assert_eq!(health.state,if cap_rejected {CreditAdmissionState::Paused}else{CreditAdmissionState::Ready});
         assert_eq!(health.current_quote_fits,Some(!cap_rejected));
@@ -795,11 +802,14 @@ async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:
                 assert_eq!(sampled.quote_checked_at_unix,health.quote_checked_at_unix);
                 assert_eq!(sampled.quote_expires_at_unix,health.quote_expires_at_unix);
             } else {
-                assert_eq!(sampled.state,CreditAdmissionState::Unknown);
-                assert_eq!(sampled.category,"quote_context_changed");
+                // A changed price or tip is informational: the state stays what the
+                // gates say, and headroom below the last observed price stays a pause.
+                assert_eq!(sampled.state,if cap_rejected {CreditAdmissionState::Paused}else{CreditAdmissionState::Ready});
+                assert_eq!(sampled.category,if cap_rejected {"cap_exhausted"}else{"ok"});
+                assert_eq!(sampled.current_quote_fits,None);
             }
         }
-        assert_eq!(harness.credit_health().await.category,"quote_context_changed");
+        assert_eq!(harness.credit_health().await.category,if cap_rejected {"cap_exhausted"}else{"ok"});
         assert!(wallet.calls("z_sendmany").is_empty());
         drop(harness); pool.close().await;
     }

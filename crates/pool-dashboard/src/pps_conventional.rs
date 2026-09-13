@@ -181,9 +181,16 @@ fn bind_wallet_history(wallet: &Value, txid: &str, raw_hex: &str, blockhash: &st
 }
 
 fn wallet_history_ready(info: &Value, payout_height: u64) -> Result<()> {
-    anyhow::ensure!(info.get("scanning").and_then(Value::as_bool) == Some(false)
-        && info.get("enhanced_through").and_then(Value::as_u64)
-            .is_some_and(|height|height >= payout_height),
+    let scanned = info.get("scanning").and_then(Value::as_bool) == Some(false);
+    let enhanced = info.get("enhanced_through").and_then(Value::as_u64)
+        .is_some_and(|height|height >= payout_height);
+    // Audit B5: under `[sync] fetch_memos = false` (zecd 0.8.x) the wallet keeps no
+    // memo-enhancement watermark, so enhanced_through is null by design. zecd still
+    // enhances the wallet's OWN spends in that mode, and the gettransaction checks
+    // that follow verify the payout's full history, so a finished scan suffices.
+    let memoless = info.get("fetch_memos").and_then(Value::as_bool) == Some(false)
+        && matches!(info.get("enhanced_through"), None | Some(Value::Null));
+    anyhow::ensure!(scanned && (enhanced || memoless),
         "PPS wallet enhancement incomplete for confirmed payout; held");
     Ok(())
 }
@@ -265,10 +272,29 @@ async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClie
     let mut selected = pre_send_phase("recipient_selection", async {
         let mut remaining = policy.max_payout_zatoshis;
         let mut selected = Vec::new();
+        let mut selected_receivers = std::collections::BTreeSet::new();
         for p in pending {
-            route.validate_recipient("testnet", &p.address)?;
+            // Audit B6: one unpayable row (for example a recipient the active route
+            // cannot pay after a route change) must not block every other miner.
+            if route.validate_recipient("testnet", &p.address).is_err() {
+                tracing::warn!(miner_id = p.miner_id,
+                    "PPS payout recipient unsupported by the active route; skipped, balance retained");
+                continue;
+            }
             let amount = p.amount.min(remaining);
             if amount < minimum { continue; }
+            // Audit B6: a recipient sharing a receiver with one already in this batch
+            // would make the builder reject the whole round; defer it to a later round.
+            let Ok(keys) = node_rpc::zecd_conventional::recipient_receiver_keys(&p.address) else {
+                tracing::warn!(miner_id = p.miner_id, "PPS payout recipient undecodable; skipped, balance retained");
+                continue;
+            };
+            if keys.iter().any(|k| selected_receivers.contains(k)) {
+                tracing::warn!(miner_id = p.miner_id,
+                    "PPS payout recipient overlaps another recipient in this batch; deferred, balance retained");
+                continue;
+            }
+            selected_receivers.extend(keys);
             selected.push(PpsConventionalRecipient { miner_id:p.miner_id,
                 address:p.address, amount_zatoshis:amount });
             remaining -= amount;
@@ -608,5 +634,12 @@ mod tests {
             json!({"scanning":false,"enhanced_through":-1}),
             json!({"scanning":false,"enhanced_through":"100"})]
         { assert!(wallet_history_ready(&bad,100).is_err()); }
+        // zecd 0.8 with fetch_memos=false: no watermark exists; a finished scan is ready.
+        assert!(wallet_history_ready(&json!({"scanning":false,"fetch_memos":false,"enhanced_through":null}),100).is_ok());
+        assert!(wallet_history_ready(&json!({"scanning":false,"fetch_memos":false}),100).is_ok());
+        // ...but never while scanning, and never without the explicit memoless flag.
+        assert!(wallet_history_ready(&json!({"scanning":true,"fetch_memos":false,"enhanced_through":null}),100).is_err());
+        assert!(wallet_history_ready(&json!({"scanning":false,"enhanced_through":null}),100).is_err());
+        assert!(wallet_history_ready(&json!({"scanning":false,"fetch_memos":true,"enhanced_through":null}),100).is_err());
     }
 }

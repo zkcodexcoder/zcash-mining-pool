@@ -219,11 +219,31 @@ impl Reconciler {
                 // grants refund/replan/broadcast authority.
                 let Some(expected) = txid.as_deref()
                     .and_then(|t|crate::wallet_operation::normalize_txid(t).ok()) else {
-                    summary.alerts.push("PPS signed proposal unresolved; principal and fee held".into());
+                    // Audit B11: no recorded txid. An UNSEALED reservation was never
+                    // signed and is safe to release. The database refuses to release a
+                    // sealed one (settle_fee plus CHECK(status<>'released' OR sealed=0)),
+                    // so a sealed attempt stays held exactly as before.
+                    match self.db.refund_pps_payout(id).await {
+                        Ok(n) if n > 0 => {
+                            let _ = self.db.update_payout_attempt(id,"failed",None,None,
+                                Some("PPS unsealed reservation released; nothing was signed")).await;
+                            summary.attempts_resolved += 1;
+                        }
+                        _ => summary.alerts.push(format!(
+                            "PPS attempt {id}: sealed without a recorded txid; principal and fee held")),
+                    }
                     continue;
                 };
-                if self.node_rpc.get_raw_transaction(&expected,1).await.is_err() {
-                    summary.alerts.push("PPS fixed transaction not proven visible; principal and fee held".into());
+                // Audit B2: settle only at PPS_SETTLE_MATURITY confirmations on our
+                // node's active chain — never on mere mempool visibility.
+                let confirmations = match self.node_rpc.get_raw_transaction(&expected,1).await {
+                    Ok(raw) => raw.get("confirmations").and_then(|c| c.as_u64()).unwrap_or(0),
+                    Err(_) => {
+                        summary.alerts.push("PPS fixed transaction not proven visible; principal and fee held".into());
+                        continue;
+                    }
+                };
+                if confirmations < crate::pps_conventional::PPS_SETTLE_MATURITY {
                     continue;
                 }
                 if !self.pps_decision_gate(ledger,summary).await { continue; }

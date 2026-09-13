@@ -19,29 +19,45 @@ assert.equal(view(ready).state, 'ready');
 assert.equal(view(ready).label, 'Ready (sampled)');
 assert.equal(view(null).state, 'unknown');
 assert.equal(view({}).state, 'unknown');
-assert.equal(view(ready, 999).state, 'unknown');
+assert.equal(view(ready, 999).state, 'unknown');            // sample from the future
 assert.equal(view(ready, 1014).state, 'ready');
-assert.equal(view(ready, 1015).category, 'quote_stale');
-assert.equal(view(ready, 1016).state, 'unknown');
+// An expired quote is only an idle gap between priced shares, never unknown.
+assert.equal(view(ready, 1015).state, 'ready');
+assert.equal(view(ready, 1015).category, 'ok');
+assert.equal(view(ready, 1016).state, 'unknown');            // sample older than 15 s
+assert.equal(view(ready, 1016).category, 'stale');
 assert.equal(view({...ready, state: 'unknown', category: 'malformed'}).state, 'unknown');
+assert.equal(view({...ready, state: 'bogus'}).state, 'unknown');
 assert.equal(view({...ready, generation_matches: false}).state, 'unknown');
 assert.equal(view({...ready, category: 'invalid'}).state, 'unknown');
+// A lapsed funding lease only degrades: shares are still credited.
+assert.equal(view({...ready, funding_expires_at_unix: 1001}).state, 'degraded');
 assert.equal(view({...ready, funding_expires_at_unix: 1001}).category, 'funding_expired');
+assert.equal(view({...ready, funding_expiry_valid: false}).state, 'degraded');
+// A lapsed chain lease rejects shares.
+assert.equal(view({...ready, chain_expires_at_unix: 1001}).state, 'paused');
 assert.equal(view({...ready, chain_expires_at_unix: 1001}).category, 'chain_invalid');
-assert.equal(view({...ready, funding_expiry_valid: false}).state, 'paused');
 assert.equal(view({...ready, chain_expiry_valid: false}).state, 'paused');
-const blocked = {...ready, state: 'paused', category: 'generation_changed', generation_matches: false};
+const degradedGen = {...ready, state: 'degraded', category: 'generation_changed', generation_matches: false};
+assert.equal(view(degradedGen).state, 'degraded');
+assert.equal(view(degradedGen).label, 'Crediting (payouts may hold)');
+assert.equal(view(degradedGen, 1016).state, 'unknown');
+assert.equal(view({...degradedGen, chain_expiry_valid: false}).state, 'paused');   // worst state wins
+assert.equal(view({...ready, state: 'paused', category: 'cap_exhausted'}).category, 'cap_exhausted');
 const successfulIdlePayout = {consecutive_payout_failures: 0,
     pps_payout_cycle: {outcome: 'no_payout_due', funding_check: 'not_checked_no_payout_due'}};
 assert.equal(successfulIdlePayout.consecutive_payout_failures, 0);
-assert.equal(view(blocked).state, 'paused');
-assert.equal(view(blocked, 1016).state, 'unknown');
 assert.equal(view({...ready, current_quote_fits: false}).category, 'current_quote_insufficient');
+assert.equal(view({...ready, current_quote_fits: false}, 1015).state, 'ready');   // a stale quote says nothing
 assert.equal(view({...ready, version: 1}).state, 'unknown');
-for (const field of ['quote_required', 'quote_checked_at_unix', 'quote_expires_at_unix', 'current_quote_fits', 'budget_low']) {
+for (const field of ['quote_required', 'budget_low']) {
     const h = {...ready}; delete h[field]; assert.equal(view(h).state, 'unknown', field);
 }
-assert.equal(view({...ready, sampled_at_unix: 1014}, 1015).state, 'unknown');
+for (const field of ['quote_checked_at_unix', 'quote_expires_at_unix']) {
+    const h = {...ready}; delete h[field]; assert.equal(view(h).category, 'malformed', field);
+}
+{ const h = {...ready}; delete h.current_quote_fits; assert.equal(view(h).state, 'ready'); }
+assert.equal(view({...ready, sampled_at_unix: 1014}, 1015).state, 'ready');
 assert.equal(view({...ready, sampled_at_unix: 1014}, 1015).funding, 'Current (sampled)');
 assert.equal(view({...ready, state: 'unknown', category: 'quote_context_changed'}).funding, 'Current (sampled)');
 assert.equal(view({...ready, budget_low: true}).warning, true);

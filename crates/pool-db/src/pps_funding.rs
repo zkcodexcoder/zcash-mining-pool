@@ -155,8 +155,10 @@ async fn extension_snapshot(c: &mut SqliteConnection, previous: &PpsEpoch)
         .checked_add(credit_delta as u128 * PPS_SCALE).ok_or(PpsDbError::Invariant)?;
     projected.fee_allowance_zatoshis = next.fee_allowance_zatoshis;
     projected.total_exposure_zatoshis = next.total_exposure_zatoshis;
+    // Required backing is outstanding + floor + unspent fee allowance, so raising
+    // the cap adds nothing to it; only a larger fee allowance does.
     projected.required_spendable_zatoshis = plus(projected.required_spendable_zatoshis,
-        next.total_exposure_zatoshis - previous.total_exposure_zatoshis)?;
+        next.fee_allowance_zatoshis - previous.fee_allowance_zatoshis)?;
     Ok(projected)
 }
 
@@ -753,14 +755,12 @@ pub(crate) async fn snapshot(
     {
         return Err(PpsDbError::FeeBudgetExceeded);
     }
-    // Outstanding + unused capacity is exactly the cap: the wallet must always hold
-    // its full variance capital, so any outstanding amount (≤ cap) is payable even
-    // with zero further income. Reserved fees stay included once; paid fees need no
-    // remaining backing.
-    let remaining = s
-        .pps_outstanding_subzatoshis
-        .checked_add(s.unused_credit_subzatoshis)
-        .ok_or(PpsDbError::Invariant)?;
+    // Audit B3: the wallet must cover what is actually OWED (outstanding, rounded up
+    // to whole zatoshis) plus the reserve floor and the unspent fee allowance — not
+    // the full cap. The cap bounds how much outstanding liability may accrue;
+    // demanding it as permanent collateral stalled payouts in every drought.
+    // reserve_floor is the variance buffer. Paid fees need no remaining backing.
+    let remaining = s.pps_outstanding_subzatoshis;
     let remaining = i64::try_from(
         remaining
             .checked_add(PPS_SCALE - 1)

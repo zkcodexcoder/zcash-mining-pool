@@ -101,13 +101,20 @@ pub async fn get_pps_data(State(state): State<AppState>) -> Result<Json<PpsData>
     .await
     .map_err(oops)?;
 
-    let health: serde_json::Value = sqlx::query_scalar::<_, String>(
+    // Audit B23: decode and re-validate the sampler heartbeat server-side (schema,
+    // sample age, lease deadlines) so a dead sampler reads Unknown/stale instead of
+    // leaving a frozen READY on the page.
+    let raw_health: Option<String> = sqlx::query_scalar::<_, String>(
         "SELECT value FROM pool_status WHERE key='pps_credit_health'",
     )
     .fetch_optional(db)
     .await
-    .map_err(oops)?
-    .and_then(|s| serde_json::from_str(&s).ok())
+    .map_err(oops)?;
+    let health: serde_json::Value = serde_json::to_value(crate::credit_health::present(
+        true,
+        raw_health.as_deref(),
+        chrono::Utc::now().timestamp(),
+    ))
     .unwrap_or(serde_json::Value::Null);
 
     let miners = miner_rows
@@ -349,7 +356,7 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
           <div class="step"><div class="rail"><div class="marker">1</div></div><div><h3>Share arrives</h3><p>A miner submits valid proof-of-work against the pool's fixed difficulty‑1000 target.</p><span class="tag">stratum · fixed share target</span></div></div>
           <div class="step"><div class="rail"><div class="marker">2</div></div><div><h3>Priced instantly</h3><p>Quoted against the current block subsidy and network difficulty, minus the fee. A share of difficulty D at network difficulty N is worth <span class="mono">D/N × subsidy</span> — its exact expected value as a block.</p><span class="tag">rewards::pps · exact big-integer math</span></div></div>
           <div class="step"><div class="rail"><div class="marker">3</div></div><div><h3>Credited to the ledger</h3><p>Added to the miner's <b>pending</b> balance in one atomic transaction, counting against the lifetime cap. De-duplicated by proof hash — credited exactly once.</p><span class="tag">pps_events → pps_accounts.pending</span></div></div>
-          <div class="step"><div class="rail"><div class="marker">4</div></div><div><h3>Admission gate</h3><p>Every credit requires a live <b>funding lease</b> — fresh proof the wallet holds enough mature shielded notes to cover all liabilities. If it can't, crediting pauses rather than over-promise.</p><span class="tag">fail-closed · 600 s lease</span></div></div>
+          <div class="step"><div class="rail"><div class="marker">4</div></div><div><h3>Admission gate</h3><p>Every valid share is priced and credited. A live <b>funding lease</b> — fresh proof the wallet holds enough mature shielded notes to cover what is owed — must pass before any payout is sent. While it is stale, shares still credit and payouts wait.</p><span class="tag">credits never wait · sends re-prove funding</span></div></div>
           <div class="step"><div class="rail"><div class="marker">5</div></div><div><h3>Paid out</h3><p>A batch moves <b>pending → paying</b>, is sealed durably, sent via one <span class="mono">z_sendmany</span>, then settles to <b>paid</b> only after 10 confirmations. The durable seal makes a double-pay impossible.</p><span class="tag">reserve · seal · send · settle</span></div></div>
         </div>
         <div class="formula">
@@ -477,7 +484,11 @@ async function render(){
   $('k-paying').textContent = f2(paying);
   $('k-paid').textContent = f2(paid);
   $('k-paidn').textContent = d.payout_count;
-  $('conserve').textContent = f2(pending)+' + '+f2(paying)+' + '+f2(paid)+' = '+f2(pending+paying+paid)+' TAZ';
+  // Audit B23: actually compare. Whole-zatoshi account balances may trail the
+  // gross total by each account's sub-zatoshi fraction carry, never more.
+  const diffZat = Math.abs((d.pending_zat + d.paying_zat + d.paid_zat) - d.gross_whole_zat);
+  $('conserve').textContent = f2(pending)+' + '+f2(paying)+' + '+f2(paid)+' = '+f2(pending+paying+paid)+' TAZ '
+    + (diffZat <= 1000 ? '✓' : '✗ off by ' + diffZat + ' zat');
   $('events2').textContent = d.event_count.toLocaleString('en-US');
 
   $('events').textContent = d.event_count.toLocaleString('en-US');
@@ -496,6 +507,10 @@ async function render(){
   const now = Math.floor(Date.now()/1000);
   const secs = (end)=> end? Math.max(end-now,0)+' s':'—';
   setPill(h.state, h.category);
+  if (Number.isSafeInteger(h.sampled_at_unix)) {
+    const age = Math.max(now - h.sampled_at_unix, 0);
+    $('health-reason').textContent += ($('health-reason').textContent ? ' · ' : '') + 'sampled ' + age + ' s ago';
+  }
   // Admission: ready and degraded both mean valid shares ARE being credited;
   // only paused means they are being rejected.
   const admCls = h.state==='ready'?'ok':(h.state==='degraded'?'warn':(h.state==='paused'?'bad':''));

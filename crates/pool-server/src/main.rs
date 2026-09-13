@@ -550,20 +550,25 @@ async fn main() -> Result<()> {
     let share_validator = if let Some(policy) = &config.pps {
         validate_pps_legacy_reserve(policy, config.payout.reserve_min)?;
         let network = policy.network.parse().map_err(|_| anyhow::anyhow!("invalid PPS network"))?;
-        // A transient chain-reference or wallet hiccup must not make the pool
-        // unrestartable: retry the two startup collections for up to 10
-        // minutes before giving up. Nothing is served until both succeed.
+        // Audit B12: a wallet or chain-reference outage must never stop mining.
+        // Try each startup collection briefly; if it is still unavailable, start
+        // anyway without that lease. The background refresh loops acquire it;
+        // until then crediting follows its normal gates (chain lease required,
+        // funding advisory) and found blocks are still submitted.
         let chain_lease = {
             let mut attempt = 0u32;
             loop {
                 match pool_core::pps_chain::verify_pps_chain(&rpc, network).await {
-                    Ok(lease) => break lease,
-                    Err(error) if attempt < 40 => {
+                    Ok(lease) => break Some(lease),
+                    Err(error) if attempt < 4 => {
                         attempt += 1;
                         tracing::warn!(%error, attempt, "PPS chain evidence unavailable at startup; retrying in 15s");
                         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        tracing::error!(%error, "PPS chain evidence still unavailable; starting without it (background refresh continues)");
+                        break None;
+                    }
                 }
             }
         };
@@ -586,23 +591,26 @@ async fn main() -> Result<()> {
                 match pool_core::pps_funding::collect_pps_credit_funding_for_route(
                     &db, &wallet_rpc, &epoch, &payout_source, &rpc, &funding_route,
                 ).await {
-                    Ok(lease) => break lease,
-                    Err(error) if attempt < 40 => {
+                    Ok(lease) => break Some(lease),
+                    Err(error) if attempt < 4 => {
                         attempt += 1;
                         tracing::warn!(%error, attempt, "PPS funding evidence unavailable at startup; retrying in 15s");
                         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        tracing::error!(%error, "PPS funding evidence still unavailable; starting without it (background refresh continues)");
+                        break None;
+                    }
                 }
             }
         };
         let validator = share_validator.with_pps(pool_core::share::PpsRuntime {
             epoch: epoch.clone(), chain_lease, funding_lease: funding_lease.clone(), wallet_rpc, payout_source, funding_route,
         }).map_err(anyhow::Error::msg)?;
-        // Activate the durable mode boundary only after fixed target, runtime
-        // configuration, independent chain proof and fresh funding have passed.
-        // Activation rechecks funding under its own SQLite write lock.
-        db.initialize_pps_epoch(&epoch, Some(&funding_lease)).await?;
+        // Activate the durable mode boundary. Activating a NEW epoch still
+        // requires fresh funding evidence (and fails without it); restarting an
+        // existing epoch treats funding as advisory, like crediting does.
+        db.initialize_pps_epoch(&epoch, funding_lease.as_ref()).await?;
         db.pps_invariant().await?;
         validator
     } else { share_validator };
