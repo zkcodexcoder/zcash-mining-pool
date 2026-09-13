@@ -542,16 +542,16 @@ impl PoolDb {
         if min_amount <= 0 {
             return Err(PpsDbError::Invalid);
         }
-        // Least recently paid first (never-paid miners lead), counting payouts still in
-        // flight, so one large low-id balance can no longer take every batch.
+        // Least recently paid first (never-paid miners lead), so one large low-id balance
+        // can no longer take every batch. A miner whose last payout is still in flight is
+        // skipped until it settles; otherwise every batch and every round would pay the
+        // same miner again as soon as new credits reach the minimum.
         let rows = sqlx::query(
             "SELECT p.miner_id,m.address,m.created_at,p.pending, \
-                    NULLIF(MAX( \
-                        COALESCE((SELECT MAX(pa.created_at) FROM pps_payout_items pi \
-                            JOIN payout_attempts pa ON pa.id=pi.attempt_id WHERE pi.miner_id=p.miner_id),''), \
-                        COALESCE((SELECT MAX(pp.created_at) FROM pps_payouts pp \
-                            WHERE pp.miner_id=p.miner_id),'')),'') last_paid \
-             FROM pps_accounts p JOIN miners m ON m.id=p.miner_id WHERE p.pending>=?1 \
+                    (SELECT MAX(pp.created_at) FROM pps_payouts pp WHERE pp.miner_id=p.miner_id) last_paid \
+             FROM pps_accounts p JOIN miners m ON m.id=p.miner_id \
+             WHERE p.pending>=?1 \
+               AND NOT EXISTS (SELECT 1 FROM pps_payout_items pi WHERE pi.miner_id=p.miner_id) \
              ORDER BY last_paid IS NOT NULL, last_paid, p.pending DESC, p.miner_id",
         )
         .bind(min_amount)
@@ -2496,7 +2496,7 @@ mod tests {
         assert_eq!(stale, vec![801]);
     }
     #[tokio::test]
-    async fn pending_payouts_come_least_recently_paid_first() {
+    async fn pending_payouts_come_least_recently_paid_first_and_skip_payouts_in_flight() {
         let f = setup(true, 1_000_000).await;
         let never = f.db.get_or_create_miner("never-paid").await.unwrap().id;
         let recent = f.db.get_or_create_miner("paid-recently").await.unwrap().id;
@@ -2515,8 +2515,9 @@ mod tests {
         sqlx::raw_sql(&fixture).execute(f.db.inner()).await.unwrap();
         let order: Vec<i64> = f.db.get_pending_pps_payouts(1).await.unwrap()
             .into_iter().map(|p| p.miner_id).collect();
-        // Never paid leads; a payout still in flight counts as the most recent one.
-        assert_eq!(order, vec![never, recent, in_flight]);
+        // Never paid leads. The miner paid longest ago would come next, but its latest
+        // payout is still in flight, so it waits for that payout to settle.
+        assert_eq!(order, vec![never, recent]);
     }
     #[tokio::test]
     async fn share_target_harder_than_network_is_credited_but_zero_target_is_refused() {

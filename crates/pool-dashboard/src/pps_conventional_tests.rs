@@ -1037,10 +1037,12 @@ async fn conventional_proven_recipient_or_fee_violation_is_a_durable_global_hold
             )
         );
         assert!(reconcile(&f, &rpc, attempt.attempt_id).await.is_err());
-        // With a balance still due the halt refuses the new seal; with nothing due the
-        // round is simply idle. Either way nothing more is sent.
-        let second = process(&f, &rpc).await;
-        if fee_violation { assert_eq!(second.unwrap(), 0); } else { assert!(second.is_err()); }
+        // The miner whose payout is held is not offered again, even with a balance
+        // still due, so the next round is idle.
+        assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+        // Another miner's due balance meets the halt, which refuses the new seal.
+        credit_second_miner(&f, SAPLING_RECIPIENT, 'f').await;
+        assert!(process(&f, &rpc).await.is_err());
         assert!(f.db.refund_pps_payout(attempt.attempt_id).await.is_err());
         assert_eq!(rpc.sends(), 1);
         assert_eq!(f.legacy().await, legacy);
@@ -1287,6 +1289,35 @@ async fn conventional_stuck_attempt_is_quarantined_while_other_miners_are_paid()
     assert_eq!(rpc.forbidden_calls(), 0);
 }
 
+
+#[tokio::test]
+async fn conventional_miner_with_a_payout_in_flight_is_not_paid_again_until_it_settles() {
+    use crate::pps_conventional::PPS_SETTLE_MATURITY;
+    let f = Fixture::new().await;
+    let rpc = MockRpc::new(&f.db).await;
+    rpc.success();
+    // The send lands but is not yet buried, so the payout stays in flight.
+    rpc.state.lock().unwrap().confirmations = 0;
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    assert_eq!(rpc.sends(), 1);
+    let first = f.attempt().await;
+    // The miner keeps earning. Later rounds must not pay it again while that payout
+    // is in flight (testnet paid one miner in every batch of every round this way).
+    assert_eq!(credit_second_miner(&f, RECIPIENT, 'f').await, f.miner);
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    assert_eq!(rpc.sends(), 1);
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!((sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis), (CREDIT, CREDIT, 0));
+    // Once the first payout settles, the new balance is paid.
+    rpc.state.lock().unwrap().confirmations = PPS_SETTLE_MATURITY;
+    assert_eq!(reconcile(&f, &rpc, first.attempt_id).await.unwrap(), 1);
+    rpc.state.lock().unwrap().confirmations = 0;
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    assert_eq!(rpc.sends(), 2);
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!((sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis), (0, CREDIT, CREDIT));
+    assert_eq!(rpc.forbidden_calls(), 0);
+}
 
 #[tokio::test]
 async fn conventional_held_reconciliation_reports_its_step_without_details() {
