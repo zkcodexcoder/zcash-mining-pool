@@ -431,8 +431,10 @@ async fn main() -> Result<()> {
         "solo" => RewardMode::Solo,
         "pplns" => RewardMode::Pplns,
         other => {
-            tracing::warn!(mode = other, "Unknown [pplns] mode, defaulting to pplns");
-            RewardMode::Pplns
+            // Audit B9: never guess a reward scheme. A build that does not know the
+            // configured mode (for example this PPLNS/solo build started against a
+            // PPS database) would otherwise pay PPLNS over shares already credited.
+            anyhow::bail!("unsupported [pplns] mode {other:?}: this build supports only \"pplns\" and \"solo\"");
         }
     };
     tracing::info!(?reward_mode, pplns_window, fee_percent = config.pool.fee_percent, "Reward calculator initialized");
