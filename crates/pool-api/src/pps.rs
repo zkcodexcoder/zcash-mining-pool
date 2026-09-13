@@ -48,6 +48,179 @@ pub struct PpsData {
     health: serde_json::Value,
     miners: Vec<MinerRow>,
     recent_payouts: Vec<PayoutRow>,
+    pnl: PnlData,
+}
+
+/// Days of per-day P&L rows returned to the page.
+const PNL_DAYS: i64 = 14;
+const SUBZAT_PER_ZAT: f64 = 1_000_000_000_000.0;
+
+/// One period of the pool's profit and loss under PPS. Amounts in zatoshis.
+#[derive(Serialize, Debug, Clone, Default, PartialEq)]
+pub struct PnlPeriod {
+    label: String,
+    blocks_confirmed: i64,
+    blocks_maturing: i64,
+    blocks_orphaned: i64,
+    /// Rewards of confirmed blocks: the pool's income.
+    income_zat: i64,
+    /// Rewards of found blocks not yet confirmed; income once they confirm.
+    maturing_zat: i64,
+    /// Rewards lost to orphaned blocks.
+    orphaned_zat: i64,
+    /// What the pool owes miners for their shares (net of the fee).
+    credited_zat: i64,
+    /// Payout transaction fees paid by the pool.
+    tx_fees_zat: i64,
+    /// income - credited - payout fees.
+    net_zat: i64,
+    /// Block value the credited work was expected to find: credited / (1 - fee).
+    expected_zat: i64,
+    /// Blocks found (confirmed + maturing) / expected; None when nothing was credited.
+    luck: Option<f64>,
+}
+
+impl PnlPeriod {
+    /// Derive the net result, expected block value and luck from the raw totals.
+    fn finish(mut self, fee_bps: i64) -> Self {
+        self.net_zat = self.income_zat - self.credited_zat - self.tx_fees_zat;
+        let kept_bps = 10_000 - fee_bps.clamp(0, 9_999);
+        self.expected_zat = (i128::from(self.credited_zat) * 10_000 / i128::from(kept_bps)) as i64;
+        self.luck = (self.expected_zat > 0)
+            .then(|| (self.income_zat + self.maturing_zat) as f64 / self.expected_zat as f64);
+        self
+    }
+
+    fn add(&mut self, other: &PnlPeriod) {
+        self.blocks_confirmed += other.blocks_confirmed;
+        self.blocks_maturing += other.blocks_maturing;
+        self.blocks_orphaned += other.blocks_orphaned;
+        self.income_zat += other.income_zat;
+        self.maturing_zat += other.maturing_zat;
+        self.orphaned_zat += other.orphaned_zat;
+        self.credited_zat += other.credited_zat;
+        self.tx_fees_zat += other.tx_fees_zat;
+    }
+
+    fn add_blocks(&mut self, status: &str, count: i64, reward_zat: i64) {
+        match status {
+            "confirmed" => {
+                self.blocks_confirmed += count;
+                self.income_zat += reward_zat;
+            }
+            "orphaned" => {
+                self.blocks_orphaned += count;
+                self.orphaned_zat += reward_zat;
+            }
+            _ => {
+                self.blocks_maturing += count;
+                self.maturing_zat += reward_zat;
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct PnlData {
+    fee_bps: i64,
+    /// Today, the last 7 days and the whole epoch (UTC calendar days).
+    periods: Vec<PnlPeriod>,
+    /// The last `PNL_DAYS` UTC days, newest first.
+    daily: Vec<PnlPeriod>,
+}
+
+/// Pool profit and loss for the active epoch. Income is the reward of every
+/// block found under the epoch, credits are the PPS liabilities its shares
+/// created, and fees are settled payout transaction fees. Read-only.
+pub(crate) async fn read_pnl(
+    db: &sqlx::SqlitePool,
+    epoch: &str,
+    fee_bps: i64,
+    gross_whole_zat: i64,
+    today: chrono::NaiveDate,
+) -> Result<PnlData, sqlx::Error> {
+    let first = today - chrono::Duration::days(PNL_DAYS - 1);
+    let first_unix = first.and_hms_opt(0, 0, 0).map_or(0, |t| t.and_utc().timestamp());
+    let mut days: std::collections::BTreeMap<String, PnlPeriod> = (0..PNL_DAYS)
+        .map(|i| {
+            let label = (first + chrono::Duration::days(i)).to_string();
+            (label.clone(), PnlPeriod { label, ..Default::default() })
+        })
+        .collect();
+    let mut epoch_total = PnlPeriod { label: "Epoch".into(), ..Default::default() };
+
+    let blocks = sqlx::query(
+        "SELECT date(b.created_at) d, b.status s, COUNT(*) n, \
+                COALESCE(SUM(COALESCE(b.actual_reward, b.reward)), 0) v \
+         FROM blocks b JOIN pps_block_markers m ON m.block_id = b.id \
+         WHERE m.epoch_id = ?1 GROUP BY d, s",
+    )
+    .bind(epoch)
+    .fetch_all(db)
+    .await?;
+    for row in &blocks {
+        let day: Option<String> = row.get("d");
+        let status: String = row.get("s");
+        let (count, reward): (i64, i64) = (row.get("n"), row.get("v"));
+        epoch_total.add_blocks(&status, count, reward);
+        if let Some(period) = day.as_ref().and_then(|d| days.get_mut(d)) {
+            period.add_blocks(&status, count, reward);
+        }
+    }
+
+    // Sub-zatoshi fractions are summed as a float: the error is under one zatoshi a day.
+    let credits = sqlx::query(
+        "SELECT date(accepted_at, 'unixepoch') d, COALESCE(SUM(amount_whole), 0) w, \
+                TOTAL(amount_fraction) f \
+         FROM pps_events WHERE epoch_id = ?1 AND accepted_at >= ?2 GROUP BY d",
+    )
+    .bind(epoch)
+    .bind(first_unix)
+    .fetch_all(db)
+    .await?;
+    for row in &credits {
+        let day: Option<String> = row.get("d");
+        let (whole, fraction): (i64, f64) = (row.get("w"), row.get("f"));
+        if let Some(period) = day.as_ref().and_then(|d| days.get_mut(d)) {
+            period.credited_zat += whole + (fraction / SUBZAT_PER_ZAT).floor() as i64;
+        }
+    }
+    epoch_total.credited_zat = gross_whole_zat;
+
+    // A settled conventional payout carries its actual fee; a PCZT payout's fee
+    // is exact once its reservation is paid. Unsettled fees are not costs yet.
+    let fees = sqlx::query(
+        "SELECT date(pa.created_at) d, COALESCE(SUM(CASE \
+                  WHEN ca.attempt_id IS NOT NULL THEN COALESCE(ca.actual_fee, 0) \
+                  WHEN fr.status = 'paid' THEN fr.fee_zats ELSE 0 END), 0) fee \
+         FROM pps_fee_reservations fr \
+         JOIN payout_attempts pa ON pa.id = fr.attempt_id \
+         LEFT JOIN pps_conventional_attempts ca ON ca.attempt_id = fr.attempt_id \
+         GROUP BY d",
+    )
+    .fetch_all(db)
+    .await?;
+    for row in &fees {
+        let day: Option<String> = row.get("d");
+        let fee: i64 = row.get("fee");
+        epoch_total.tx_fees_zat += fee;
+        if let Some(period) = day.as_ref().and_then(|d| days.get_mut(d)) {
+            period.tx_fees_zat += fee;
+        }
+    }
+
+    let daily: Vec<PnlPeriod> = days.into_values().map(|p| p.finish(fee_bps)).collect();
+    let mut today_period = daily.last().cloned().unwrap_or_default();
+    today_period.label = "Today".into();
+    let mut week = PnlPeriod { label: "Last 7 days".into(), ..Default::default() };
+    for period in daily.iter().rev().take(7) {
+        week.add(period);
+    }
+    Ok(PnlData {
+        fee_bps,
+        periods: vec![today_period, week.finish(fee_bps), epoch_total.finish(fee_bps)],
+        daily: daily.into_iter().rev().collect(),
+    })
 }
 
 /// Live JSON for the /pps dashboard. Read-only; no money path.
@@ -100,6 +273,16 @@ pub async fn get_pps_data(State(state): State<AppState>) -> Result<Json<PpsData>
     .fetch_all(db)
     .await
     .map_err(oops)?;
+
+    let epoch_id: String = meta.get("active_epoch");
+    let fee_bps: i64 = sqlx::query_scalar("SELECT fee_bps FROM pps_epochs WHERE id=?1")
+        .bind(&epoch_id)
+        .fetch_one(db)
+        .await
+        .map_err(oops)?;
+    let pnl = read_pnl(db, &epoch_id, fee_bps, meta.get("gross_whole"), chrono::Utc::now().date_naive())
+        .await
+        .map_err(oops)?;
 
     // Audit B23: decode and re-validate the sampler heartbeat server-side (schema,
     // sample age, lease deadlines) so a dead sampler reads Unknown/stale instead of
@@ -159,6 +342,7 @@ pub async fn get_pps_data(State(state): State<AppState>) -> Result<Json<PpsData>
         health,
         miners,
         recent_payouts,
+        pnl,
     }))
 }
 
@@ -291,6 +475,8 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
   .good-txt{color:var(--good)}.owed-txt{color:var(--owed)}.crit-txt{color:var(--crit)}
   .navlinks{margin-top:.6rem;font-size:.85rem}
   .navlinks a{margin-right:1rem;text-decoration:none}
+  tr.pnl-sep td{border-bottom:2px solid var(--rule)}
+  tr.pnl-day td{color:var(--ink-2);font-size:.82rem}
 </style>
 </head>
 <body>
@@ -348,14 +534,24 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
     </div>
   </section>
 
+  <section>
+    <div class="sec-head"><h2>Pool P&amp;L</h2><span class="note">block rewards in, minus what the pool owes miners for their shares, minus payout fees</span></div>
+    <div class="tiles" id="pnl-tiles"></div>
+    <div class="panel" style="padding:.4rem .6rem;margin-top:1rem"><div class="tablewrap"><table>
+      <thead><tr><th>Period (UTC)</th><th class="num">Blocks</th><th class="num">Income</th><th class="num">Maturing</th><th class="num">Credited</th><th class="num">Payout fees</th><th class="num">Net</th><th class="num">Luck</th></tr></thead>
+      <tbody id="pnl-rows"></tbody>
+    </table></div></div>
+    <div class="throttle"><b>How to read this.</b> PPS pays miners the expected value of every share, minus the fee, whether or not the pool finds blocks, so the net result swings with luck and evens out over time. Income counts confirmed blocks only; blocks still maturing are listed separately until they confirm. Luck compares blocks found (confirmed and maturing) with what the credited work should have found. Blocks column: confirmed, +maturing, · orphaned. All amounts in TAZ.</div>
+  </section>
+
   <div class="cols">
     <section style="margin-top:2rem">
       <div class="sec-head"><h2>How a share becomes money</h2></div>
       <div class="panel">
         <div class="pipe">
-          <div class="step"><div class="rail"><div class="marker">1</div></div><div><h3>Share arrives</h3><p>A miner submits valid proof-of-work against the pool's fixed difficulty‑1000 target.</p><span class="tag">stratum · fixed share target</span></div></div>
+          <div class="step"><div class="rail"><div class="marker">1</div></div><div><h3>Share arrives</h3><p>A miner submits valid proof-of-work at its assigned share difficulty, set per port and adjusted by vardiff.</p><span class="tag">stratum · per-port difficulty + vardiff</span></div></div>
           <div class="step"><div class="rail"><div class="marker">2</div></div><div><h3>Priced instantly</h3><p>Quoted against the current block subsidy and network difficulty, minus the fee. A share of difficulty D at network difficulty N is worth <span class="mono">D/N × subsidy</span> — its exact expected value as a block.</p><span class="tag">rewards::pps · exact big-integer math</span></div></div>
-          <div class="step"><div class="rail"><div class="marker">3</div></div><div><h3>Credited to the ledger</h3><p>Added to the miner's <b>pending</b> balance in one atomic transaction, counting against the lifetime cap. De-duplicated by proof hash — credited exactly once.</p><span class="tag">pps_events → pps_accounts.pending</span></div></div>
+          <div class="step"><div class="rail"><div class="marker">3</div></div><div><h3>Credited to the ledger</h3><p>Added to the miner's <b>pending</b> balance in one atomic transaction, counting against the liability cap (it refills as payouts settle). De-duplicated by proof hash — credited exactly once.</p><span class="tag">pps_events → pps_accounts.pending</span></div></div>
           <div class="step"><div class="rail"><div class="marker">4</div></div><div><h3>Admission gate</h3><p>Every valid share is priced and credited. A live <b>funding lease</b> — fresh proof the wallet holds enough mature shielded notes to cover what is owed — must pass before any payout is sent. While it is stale, shares still credit and payouts wait.</p><span class="tag">credits never wait · sends re-prove funding</span></div></div>
           <div class="step"><div class="rail"><div class="marker">5</div></div><div><h3>Paid out</h3><p>A batch moves <b>pending → paying</b>, is sealed durably, sent via one <span class="mono">z_sendmany</span>, then settles to <b>paid</b> only after 10 confirmations. The durable seal makes a double-pay impossible.</p><span class="tag">reserve · seal · send · settle</span></div></div>
         </div>
@@ -541,6 +737,30 @@ async function render(){
     `<tr><td class="mono">${(p.created_at||'').replace('T',' ').slice(5,19)}</td><td><span class="addr">${shorttx(p.txid)}</span></td><td class="num">${f2(TAZ(p.amount))}</td></tr>`
   ).join('') || '<tr><td colspan="3" style="color:var(--ink-3)">no payouts yet</td></tr>';
 
+  // Pool P&L: block income in, PPS credits and payout fees out. Luck swings the result.
+  const pnl = d.pnl || {periods:[], daily:[], fee_bps:0};
+  const zt = z => { const v = TAZ(z); return v !== 0 && Math.abs(v) < 1 ? v.toFixed(4) : f2(v); };
+  const signed = z => (z >= 0 ? '+' : '') + zt(z);
+  const lk = l => l == null ? '—' : (l*100).toFixed(1) + '%';
+  const netCls = z => z >= 0 ? 'good-txt' : 'crit-txt';
+  const ep = pnl.periods.find(x => x.label === 'Epoch');
+  if (ep) {
+    $('pnl-tiles').innerHTML = [
+      [`<span class="${netCls(ep.net_zat)}">${signed(ep.net_zat)}</span>`, 'net result', 'this epoch · income − credited − payout fees'],
+      [zt(ep.income_zat), 'block income', `${ep.blocks_confirmed} confirmed blocks`],
+      [zt(ep.credited_zat), 'credited to miners', `net of the ${(pnl.fee_bps/100).toFixed(1)}% fee`],
+      [lk(ep.luck), 'luck', 'blocks found ÷ expected'],
+      [ep.blocks_orphaned, 'orphaned blocks', `${zt(ep.orphaned_zat)} TAZ lost`],
+      [zt(ep.tx_fees_zat), 'payout fees', `${zt(ep.maturing_zat)} TAZ maturing`],
+    ].map(([n,l,s]) => `<div class="tile"><div class="n">${n}</div><div class="l">${l}</div><div class="s">${s}</div></div>`).join('');
+  }
+  const pnlRow = (x, cls) => `<tr class="${cls}"><td>${x.label}</td>`
+    + `<td class="num">${x.blocks_confirmed}${x.blocks_maturing ? ' +' + x.blocks_maturing : ''}${x.blocks_orphaned ? ' · ' + x.blocks_orphaned : ''}</td>`
+    + `<td class="num">${zt(x.income_zat)}</td><td class="num">${zt(x.maturing_zat)}</td><td class="num">${zt(x.credited_zat)}</td>`
+    + `<td class="num">${zt(x.tx_fees_zat)}</td><td class="num ${netCls(x.net_zat)}">${signed(x.net_zat)}</td><td class="num">${lk(x.luck)}</td></tr>`;
+  $('pnl-rows').innerHTML = pnl.periods.map((x, i) => pnlRow(x, i === pnl.periods.length - 1 ? 'pnl-sep' : '')).join('')
+    + pnl.daily.map(x => pnlRow(x, 'pnl-day')).join('');
+
   $('updated').textContent = 'updated '+new Date().toLocaleTimeString();
 }
 render();
@@ -549,3 +769,94 @@ setInterval(render, 15000);
 </body>
 </html>
 "####;
+
+
+#[cfg(test)]
+mod pnl_tests {
+    use super::*;
+    use pool_db::PoolDb;
+
+    #[test]
+    fn net_result_expected_value_and_luck_follow_the_fee() {
+        let p = PnlPeriod {
+            income_zat: 1_000, maturing_zat: 100, credited_zat: 990, tx_fees_zat: 5,
+            ..Default::default()
+        }
+        .finish(100);
+        assert_eq!(p.net_zat, 5);
+        assert_eq!(p.expected_zat, 1_000);
+        assert_eq!(p.luck, Some(1.1));
+        assert_eq!(PnlPeriod::default().finish(100).luck, None);
+    }
+
+    #[tokio::test]
+    async fn pnl_totals_epoch_blocks_credits_and_fees_by_utc_day() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let db = PoolDb::new(pool.clone());
+        db.run_migrations().await.unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+        let at = |days_ago: i64| {
+            (today - chrono::Duration::days(days_ago))
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp()
+        };
+        let hex = |c: char| c.to_string().repeat(64);
+        let fixture = format!(
+            "INSERT INTO miners(id,address) VALUES(1,'synthetic-miner');
+             INSERT INTO workers(id,miner_id,name) VALUES(1,1,'w');
+             INSERT INTO pps_epochs(id,network,fee_bps,cap_zats,quote_provenance) VALUES
+               ('e1','testnet',100,1000000,'synthetic'),('e0','testnet',100,1000000,'synthetic');
+             INSERT INTO pps_quotes VALUES('q1','e1',1,zeroblob(32),zeroblob(32),125000000,0,0);
+             INSERT INTO pps_events VALUES
+               ('p1','e1','q1',1,1,'j','s',1.0,0,600,500000000000,{t0},1),
+               ('p2','e1','q1',1,1,'j','s',1.0,0,400,500000000000,{t0},2),
+               ('p3','e1','q1',1,1,'j','s',1.0,0,1000,0,{t6},3),
+               ('p4','e1','q1',1,1,'j','s',1.0,0,5000,0,{t20},4);
+             INSERT INTO blocks(id,height,hash,reward,status,created_at,actual_reward) VALUES
+               (1,10,'h1',1200,'confirmed','2026-09-13 01:00:00',1250),
+               (2,11,'h2',1250,'pending','2026-09-13 02:00:00',NULL),
+               (3,12,'h3',1250,'orphaned','2026-09-08 03:00:00',NULL),
+               (4,13,'h4',1250,'confirmed','2026-08-20 03:00:00',NULL),
+               (5,14,'h5',9999,'confirmed','2026-09-13 04:00:00',NULL);
+             INSERT INTO pps_block_markers VALUES(1,'e1'),(2,'e1'),(3,'e1'),(4,'e1'),(5,'e0');
+             INSERT INTO payout_attempts(id,status,created_at) VALUES
+               (1,'confirmed','2026-09-13 05:00:00'),(2,'confirmed','2026-09-10 05:00:00');
+             INSERT INTO pps_fee_reservations(attempt_id,proposal_id,fee_zats,status,txid) VALUES
+               (1,'{a}',50,'paid','t1'),(2,'{b}',30,'paid','t2');
+             INSERT INTO pps_conventional_attempts(attempt_id,intent_id,fee_bound,actual_fee,operation_id,observed_txid) VALUES
+               (1,'{c}',50,20,'op1','{d}');",
+            t0 = at(0), t6 = at(6), t20 = at(20),
+            a = hex('a'), b = hex('b'), c = hex('c'), d = hex('d'),
+        );
+        sqlx::raw_sql(&fixture).execute(&pool).await.unwrap();
+
+        let pnl = read_pnl(&pool, "e1", 100, 7_001, today).await.unwrap();
+        let [day, week, epoch] = &pnl.periods[..] else { panic!("expected three periods") };
+        // Today: one confirmed block (actual reward) and one maturing; 600 + 400 whole
+        // zatoshis plus two half-zatoshi fractions; the conventional payout's actual fee.
+        assert_eq!(
+            (day.label.as_str(), day.blocks_confirmed, day.blocks_maturing, day.income_zat, day.maturing_zat),
+            ("Today", 1, 1, 1_250, 1_250)
+        );
+        assert_eq!((day.credited_zat, day.tx_fees_zat, day.net_zat, day.expected_zat), (1_001, 20, 229, 1_011));
+        // Last 7 days (09-07..09-13): adds the orphan, the six-day-old credit and the PCZT fee.
+        assert_eq!(
+            (week.blocks_orphaned, week.orphaned_zat, week.credited_zat, week.tx_fees_zat, week.net_zat),
+            (1, 1_250, 2_001, 50, -801)
+        );
+        // Epoch: every block marked for e1 (none from e0); credits from the ledger total.
+        assert_eq!(
+            (epoch.blocks_confirmed, epoch.income_zat, epoch.blocks_maturing, epoch.blocks_orphaned),
+            (2, 2_500, 1, 1)
+        );
+        assert_eq!((epoch.credited_zat, epoch.tx_fees_zat, epoch.net_zat), (7_001, 50, -4_551));
+        assert_eq!(pnl.daily.len(), 14);
+        assert_eq!((pnl.daily[0].label.as_str(), pnl.daily[13].label.as_str()), ("2026-09-13", "2026-08-31"));
+    }
+}
