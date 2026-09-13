@@ -53,6 +53,8 @@ pub struct PpsData {
 
 /// Days of per-day P&L rows returned to the page.
 const PNL_DAYS: i64 = 14;
+/// Hours of per-hour P&L rows. Testing aid: the page shows these instead of days for now.
+const PNL_HOURS: i64 = 24;
 const SUBZAT_PER_ZAT: f64 = 1_000_000_000_000.0;
 
 /// One period of the pool's profit and loss under PPS. Amounts in zatoshis.
@@ -127,86 +129,111 @@ pub struct PnlData {
     periods: Vec<PnlPeriod>,
     /// The last `PNL_DAYS` UTC days, newest first.
     daily: Vec<PnlPeriod>,
+    /// The last `PNL_HOURS` UTC hours, newest first.
+    hourly: Vec<PnlPeriod>,
+}
+
+/// Empty periods keyed and labelled by bucket.
+fn empty_buckets(labels: impl Iterator<Item = String>) -> std::collections::BTreeMap<String, PnlPeriod> {
+    labels.map(|label| (label.clone(), PnlPeriod { label, ..Default::default() })).collect()
+}
+
+/// Apply `f` to the day and hour buckets an hour label ("YYYY-MM-DD HH:00") falls in.
+fn for_buckets(
+    days: &mut std::collections::BTreeMap<String, PnlPeriod>,
+    hours: &mut std::collections::BTreeMap<String, PnlPeriod>,
+    hour: Option<&str>,
+    mut f: impl FnMut(&mut PnlPeriod),
+) {
+    let Some(hour) = hour else { return };
+    if let Some(period) = hour.get(..10).and_then(|day| days.get_mut(day)) {
+        f(period);
+    }
+    if let Some(period) = hours.get_mut(hour) {
+        f(period);
+    }
 }
 
 /// Pool profit and loss for the active epoch. Income is the reward of every
 /// block found under the epoch, credits are the PPS liabilities its shares
-/// created, and fees are settled payout transaction fees. Read-only.
+/// created, and fees are settled payout transaction fees. Every figure is
+/// bucketed by UTC hour, then rolled up into days, the week and the epoch.
+/// Read-only.
 pub(crate) async fn read_pnl(
     db: &sqlx::SqlitePool,
     epoch: &str,
     fee_bps: i64,
     gross_whole_zat: i64,
-    today: chrono::NaiveDate,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<PnlData, sqlx::Error> {
-    let first = today - chrono::Duration::days(PNL_DAYS - 1);
-    let first_unix = first.and_hms_opt(0, 0, 0).map_or(0, |t| t.and_utc().timestamp());
-    let mut days: std::collections::BTreeMap<String, PnlPeriod> = (0..PNL_DAYS)
-        .map(|i| {
-            let label = (first + chrono::Duration::days(i)).to_string();
-            (label.clone(), PnlPeriod { label, ..Default::default() })
-        })
-        .collect();
+    use chrono::{Duration, Timelike};
+    let today = now.date_naive();
+    let first_day = today - Duration::days(PNL_DAYS - 1);
+    let first_unix = first_day.and_hms_opt(0, 0, 0).map_or(0, |t| t.and_utc().timestamp());
+    let this_hour = now
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now);
+    let mut days = empty_buckets((0..PNL_DAYS).map(|i| (first_day + Duration::days(i)).to_string()));
+    let mut hours = empty_buckets(
+        (0..PNL_HOURS).map(|i| (this_hour - Duration::hours(i)).format("%Y-%m-%d %H:00").to_string()),
+    );
     let mut epoch_total = PnlPeriod { label: "Epoch".into(), ..Default::default() };
 
     let blocks = sqlx::query(
-        "SELECT date(b.created_at) d, b.status s, COUNT(*) n, \
+        "SELECT strftime('%Y-%m-%d %H:00', b.created_at) h, b.status s, COUNT(*) n, \
                 COALESCE(SUM(COALESCE(b.actual_reward, b.reward)), 0) v \
          FROM blocks b JOIN pps_block_markers m ON m.block_id = b.id \
-         WHERE m.epoch_id = ?1 GROUP BY d, s",
+         WHERE m.epoch_id = ?1 GROUP BY h, s",
     )
     .bind(epoch)
     .fetch_all(db)
     .await?;
     for row in &blocks {
-        let day: Option<String> = row.get("d");
+        let hour: Option<String> = row.get("h");
         let status: String = row.get("s");
         let (count, reward): (i64, i64) = (row.get("n"), row.get("v"));
         epoch_total.add_blocks(&status, count, reward);
-        if let Some(period) = day.as_ref().and_then(|d| days.get_mut(d)) {
-            period.add_blocks(&status, count, reward);
-        }
+        for_buckets(&mut days, &mut hours, hour.as_deref(), |p| p.add_blocks(&status, count, reward));
     }
 
-    // Sub-zatoshi fractions are summed as a float: the error is under one zatoshi a day.
+    // Sub-zatoshi fractions are summed as a float: the error is under one zatoshi an hour.
     let credits = sqlx::query(
-        "SELECT date(accepted_at, 'unixepoch') d, COALESCE(SUM(amount_whole), 0) w, \
-                TOTAL(amount_fraction) f \
-         FROM pps_events WHERE epoch_id = ?1 AND accepted_at >= ?2 GROUP BY d",
+        "SELECT strftime('%Y-%m-%d %H:00', accepted_at, 'unixepoch') h, \
+                COALESCE(SUM(amount_whole), 0) w, TOTAL(amount_fraction) f \
+         FROM pps_events WHERE epoch_id = ?1 AND accepted_at >= ?2 GROUP BY h",
     )
     .bind(epoch)
     .bind(first_unix)
     .fetch_all(db)
     .await?;
     for row in &credits {
-        let day: Option<String> = row.get("d");
+        let hour: Option<String> = row.get("h");
         let (whole, fraction): (i64, f64) = (row.get("w"), row.get("f"));
-        if let Some(period) = day.as_ref().and_then(|d| days.get_mut(d)) {
-            period.credited_zat += whole + (fraction / SUBZAT_PER_ZAT).floor() as i64;
-        }
+        let credited = whole + (fraction / SUBZAT_PER_ZAT).floor() as i64;
+        for_buckets(&mut days, &mut hours, hour.as_deref(), |p| p.credited_zat += credited);
     }
     epoch_total.credited_zat = gross_whole_zat;
 
     // A settled conventional payout carries its actual fee; a PCZT payout's fee
     // is exact once its reservation is paid. Unsettled fees are not costs yet.
     let fees = sqlx::query(
-        "SELECT date(pa.created_at) d, COALESCE(SUM(CASE \
+        "SELECT strftime('%Y-%m-%d %H:00', pa.created_at) h, COALESCE(SUM(CASE \
                   WHEN ca.attempt_id IS NOT NULL THEN COALESCE(ca.actual_fee, 0) \
                   WHEN fr.status = 'paid' THEN fr.fee_zats ELSE 0 END), 0) fee \
          FROM pps_fee_reservations fr \
          JOIN payout_attempts pa ON pa.id = fr.attempt_id \
          LEFT JOIN pps_conventional_attempts ca ON ca.attempt_id = fr.attempt_id \
-         GROUP BY d",
+         GROUP BY h",
     )
     .fetch_all(db)
     .await?;
     for row in &fees {
-        let day: Option<String> = row.get("d");
+        let hour: Option<String> = row.get("h");
         let fee: i64 = row.get("fee");
         epoch_total.tx_fees_zat += fee;
-        if let Some(period) = day.as_ref().and_then(|d| days.get_mut(d)) {
-            period.tx_fees_zat += fee;
-        }
+        for_buckets(&mut days, &mut hours, hour.as_deref(), |p| p.tx_fees_zat += fee);
     }
 
     let daily: Vec<PnlPeriod> = days.into_values().map(|p| p.finish(fee_bps)).collect();
@@ -220,6 +247,7 @@ pub(crate) async fn read_pnl(
         fee_bps,
         periods: vec![today_period, week.finish(fee_bps), epoch_total.finish(fee_bps)],
         daily: daily.into_iter().rev().collect(),
+        hourly: hours.into_values().rev().map(|p| p.finish(fee_bps)).collect(),
     })
 }
 
@@ -280,7 +308,7 @@ pub async fn get_pps_data(State(state): State<AppState>) -> Result<Json<PpsData>
         .fetch_one(db)
         .await
         .map_err(oops)?;
-    let pnl = read_pnl(db, &epoch_id, fee_bps, meta.get("gross_whole"), chrono::Utc::now().date_naive())
+    let pnl = read_pnl(db, &epoch_id, fee_bps, meta.get("gross_whole"), chrono::Utc::now())
         .await
         .map_err(oops)?;
 
@@ -541,7 +569,7 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
       <thead><tr><th>Period (UTC)</th><th class="num">Blocks</th><th class="num">Income</th><th class="num">Maturing</th><th class="num">Credited</th><th class="num">Payout fees</th><th class="num">Net</th><th class="num">Luck</th></tr></thead>
       <tbody id="pnl-rows"></tbody>
     </table></div></div>
-    <div class="throttle"><b>How to read this.</b> PPS pays miners the expected value of every share, minus the fee, whether or not the pool finds blocks, so the net result swings with luck and evens out over time. Income counts confirmed blocks only; blocks still maturing are listed separately until they confirm. Luck compares blocks found (confirmed and maturing) with what the credited work should have found. Blocks column: confirmed, +maturing, · orphaned. All amounts in TAZ.</div>
+    <div class="throttle"><b>How to read this.</b> PPS pays miners the expected value of every share, minus the fee, whether or not the pool finds blocks, so the net result swings with luck and evens out over time. Income counts confirmed blocks only; blocks still maturing are listed separately until they confirm. Luck compares blocks found (confirmed and maturing) with what the credited work should have found. Blocks column: confirmed, +maturing, · orphaned. Rows under the totals are per UTC hour for the last 24 hours. All amounts in TAZ.</div>
   </section>
 
   <div class="cols">
@@ -759,7 +787,8 @@ async function render(){
     + `<td class="num">${zt(x.income_zat)}</td><td class="num">${zt(x.maturing_zat)}</td><td class="num">${zt(x.credited_zat)}</td>`
     + `<td class="num">${zt(x.tx_fees_zat)}</td><td class="num ${netCls(x.net_zat)}">${signed(x.net_zat)}</td><td class="num">${lk(x.luck)}</td></tr>`;
   $('pnl-rows').innerHTML = pnl.periods.map((x, i) => pnlRow(x, i === pnl.periods.length - 1 ? 'pnl-sep' : '')).join('')
-    + pnl.daily.map(x => pnlRow(x, 'pnl-day')).join('');
+    // Testing aid: per-hour rows (last 24 h) in place of pnl.daily for now.
+    + (pnl.hourly || []).map(x => pnlRow({...x, label: x.label.slice(5)}, 'pnl-day')).join('');
 
   $('updated').textContent = 'updated '+new Date().toLocaleTimeString();
 }
@@ -836,7 +865,8 @@ mod pnl_tests {
         );
         sqlx::raw_sql(&fixture).execute(&pool).await.unwrap();
 
-        let pnl = read_pnl(&pool, "e1", 100, 7_001, today).await.unwrap();
+        let now = today.and_hms_opt(12, 30, 0).unwrap().and_utc();
+        let pnl = read_pnl(&pool, "e1", 100, 7_001, now).await.unwrap();
         let [day, week, epoch] = &pnl.periods[..] else { panic!("expected three periods") };
         // Today: one confirmed block (actual reward) and one maturing; 600 + 400 whole
         // zatoshis plus two half-zatoshi fractions; the conventional payout's actual fee.
@@ -858,5 +888,16 @@ mod pnl_tests {
         assert_eq!((epoch.credited_zat, epoch.tx_fees_zat, epoch.net_zat), (7_001, 50, -4_551));
         assert_eq!(pnl.daily.len(), 14);
         assert_eq!((pnl.daily[0].label.as_str(), pnl.daily[13].label.as_str()), ("2026-09-13", "2026-08-31"));
+        // Hourly: the last 24 UTC hours ending with the current hour, newest first.
+        assert_eq!(pnl.hourly.len(), 24);
+        assert_eq!(
+            (pnl.hourly[0].label.as_str(), pnl.hourly[23].label.as_str()),
+            ("2026-09-13 12:00", "2026-09-12 13:00")
+        );
+        let hour = |label: &str| pnl.hourly.iter().find(|p| p.label == label).unwrap();
+        assert_eq!(hour("2026-09-13 12:00").credited_zat, 1_001);
+        assert_eq!((hour("2026-09-13 01:00").income_zat, hour("2026-09-13 02:00").maturing_zat), (1_250, 1_250));
+        assert_eq!(hour("2026-09-13 05:00").tx_fees_zat, 20);
+        assert_eq!(hour("2026-09-13 11:00"), &PnlPeriod { label: "2026-09-13 11:00".into(), ..Default::default() });
     }
 }
