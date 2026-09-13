@@ -59,7 +59,12 @@ impl PoolDb {
         let _ = sqlx::raw_sql(migration_013).execute(&self.pool).await;
         let migration_014 = include_str!("../migrations/014_shares_rollup.sql");
         let _ = sqlx::raw_sql(migration_014).execute(&self.pool).await;
-        let mut pps_migration = self.pool.begin().await?;
+        // IMMEDIATE: take the write lock up front so busy_timeout applies. A
+        // deferred transaction that reads first and then writes (a new
+        // CREATE INDEX) gets an immediate SQLITE_BUSY when pool-server and the
+        // dashboard migrate at the same moment; busy_timeout never retries it.
+        let mut migration_conn = self.pool.acquire().await?;
+        let mut pps_migration = migration_conn.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::raw_sql(include_str!("../migrations/015_pps_accounts.sql")).execute(&mut *pps_migration).await?;
         sqlx::raw_sql(include_str!("../migrations/016_pps_funding.sql")).execute(&mut *pps_migration).await?;
         sqlx::raw_sql(include_str!("../migrations/017_pps_conventional.sql")).execute(&mut *pps_migration).await?;

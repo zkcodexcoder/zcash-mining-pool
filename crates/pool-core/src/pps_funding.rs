@@ -132,11 +132,16 @@ fn finish_evidence(before: &PpsFundingSnapshot, after: &PpsFundingSnapshot,
     spendable: i64, epoch: &PpsEpoch, checked_at: i64, now: i64)
     -> Result<PpsFundingLease, PpsFundingError>
 {
+    // The requirement counts outstanding liability, so every credit between the
+    // two reads moves it; bracketing on it would fail every refresh while miners
+    // are active. The generation still brackets wallet-side changes (payouts),
+    // and each use of the lease re-checks the proven balance against the
+    // requirement at that moment (pool-db validate_lease). Cover the larger one.
     if before.generation != after.generation || before.network != after.network
         || before.network != epoch.network
-        || before.required_spendable_zatoshis != after.required_spendable_zatoshis
     { return Err(PpsFundingError::ConcurrentChange); }
-    if after.required_spendable_zatoshis <= 0 || spendable < after.required_spendable_zatoshis {
+    let required = before.required_spendable_zatoshis.max(after.required_spendable_zatoshis);
+    if after.required_spendable_zatoshis <= 0 || spendable < required {
         return Err(PpsFundingError::InsufficientFunding);
     }
     let lease = PpsFundingLease {
@@ -427,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn balance_read_must_bracket_unchanged_liabilities_and_generation() {
+    fn balance_read_brackets_generation_and_covers_the_larger_requirement() {
         let e = epoch();
         let s = PpsFundingSnapshot {
             network: "testnet".into(), generation:7, legacy_pending_zatoshis:2,
@@ -444,8 +449,12 @@ mod tests {
         assert_eq!(finish_evidence(&s,&s,1_000_000_006,&e,100,100+FUNDING_LEASE_SECONDS),Err(PpsFundingError::InvalidEvidence));
         let mut changed=s.clone(); changed.generation+=1;
         assert_eq!(finish_evidence(&s,&changed,i64::MAX,&e,100,100),Err(PpsFundingError::ConcurrentChange));
+        // A credit between the reads moves the requirement, not the generation:
+        // the refresh succeeds only if the proof covers the larger requirement.
         let mut changed=s.clone(); changed.required_spendable_zatoshis+=1;
-        assert_eq!(finish_evidence(&s,&changed,i64::MAX,&e,100,100),Err(PpsFundingError::ConcurrentChange));
+        assert!(finish_evidence(&s,&changed,1_000_000_007,&e,100,100).is_ok());
+        assert_eq!(finish_evidence(&s,&changed,1_000_000_006,&e,100,100),Err(PpsFundingError::InsufficientFunding));
+        assert_eq!(finish_evidence(&changed,&s,1_000_000_006,&e,100,100),Err(PpsFundingError::InsufficientFunding));
     }
 
     #[test]
