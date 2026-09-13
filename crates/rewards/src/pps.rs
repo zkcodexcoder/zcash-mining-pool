@@ -13,7 +13,7 @@
 //! per quote. Underpayment is strictly less than one sub-zatoshi per accepted
 //! share, hence less than n/10^12 zatoshis over n shares, with no overpayment.
 //! Persist/aggregate the integer sub-zatoshi entitlement; round only at payout.
-//! The shadow ledger must atomically bind each unique accepted share to its
+//! The live ledger (pool-db `pps_live`) must atomically bind each unique accepted share to its
 //! immutable quote and preserve its remaining sub-zatoshi balance across runs.
 //!
 //! This math layer DOES NOT attest a subsidy or the consensus schedule. Its
