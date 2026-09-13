@@ -413,7 +413,7 @@ impl ShareValidator {
                                 };
                                 let duration_ms=u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                                 if revoke {
-                                    warn!(stage="chain_refresh",category,duration_ms,"PPS chain evidence rejected; new credits paused");
+                                    warn!(stage="chain_refresh",category,duration_ms,"PPS chain agreement lost (warning only; shares still credited, payouts continue)");
                                     *refresh_lease.write().await = None;
                                 } else {
                                     warn!(stage="chain_refresh",category,duration_ms,"PPS chain evidence unavailable; retaining prior proof until expiry");

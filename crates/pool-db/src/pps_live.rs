@@ -90,6 +90,10 @@ pub struct PpsReceipt {
     /// payout seal re-proves funding hard before any money moves. Carries the
     /// bypassed category so the caller can log/alert without counting a denial.
     pub funding_advisory: Option<&'static str>,
+    /// Set when the share was credited although the chain-agreement lease was
+    /// absent, stale or disagreeing. Chain agreement is a warning only (health
+    /// page and Telegram); it never rejects a valid share.
+    pub chain_advisory: Option<&'static str>,
 }
 
 /// Credit-path funding policy: a valid proof-of-work share is NEVER rejected for a
@@ -386,29 +390,37 @@ impl PoolDb {
                 duplicate: true,
                 credited_subzatoshis: s.amount_subzatoshis,
                 funding_advisory: None,
+                chain_advisory: None,
             };
             tx.commit().await?;
             return Ok(receipt);
         }
         epoch_check(&mut tx, e).await?;
-        let l = lease.ok_or(PpsDbError::ChainLeaseRequired)?;
         let now = clock()?;
         // Advisory: a stale funding lease never rejects a valid share (see advisory_funding).
         let funding_advisory = advisory_funding(
             crate::pps_funding::check_credit(&mut tx, e, funding, now).await)?;
-        if l.network != e.network
-            || l.disagreement
-            || l.agreeing_references < 2
-            || l.checked_at_unix < 0
-            || l.valid_until_unix < l.checked_at_unix
-            || l.valid_until_unix - l.checked_at_unix > crate::pps_funding::CHAIN_LEASE_SECONDS
-            || now < l.checked_at_unix
-            || now >= l.valid_until_unix
-            || s.accepted_at_unix < l.checked_at_unix
-            || s.accepted_at_unix > now
-        {
-            return Err(PpsDbError::ChainLeaseRequired);
+        // A share stamped after the ledger clock is a clock fault, not a chain question.
+        if s.accepted_at_unix > now {
+            return Err(PpsDbError::Invalid);
         }
+        // Chain agreement is a warning only: an absent, stale or disagreeing proof is
+        // reported (health page, Telegram) and never rejects a valid share.
+        let chain_current = |at: i64| {
+            lease.is_some_and(|l| {
+                l.network == e.network
+                    && !l.disagreement
+                    && l.agreeing_references >= 2
+                    && l.checked_at_unix >= 0
+                    && l.valid_until_unix >= l.checked_at_unix
+                    && l.valid_until_unix - l.checked_at_unix
+                        <= crate::pps_funding::CHAIN_LEASE_SECONDS
+                    && l.checked_at_unix <= s.accepted_at_unix
+                    && l.checked_at_unix <= at
+                    && at < l.valid_until_unix
+            })
+        };
+        let chain_advisory = (!chain_current(now)).then_some("chain_lease_required");
         let meta = sqlx::query("SELECT * FROM pps_meta WHERE singleton=1")
             .fetch_one(&mut *tx)
             .await?;
@@ -496,12 +508,12 @@ impl PoolDb {
         .execute(&mut *tx)
         .await?;
         let commit_now = clock()?;
-        if commit_now < l.checked_at_unix
-            || commit_now >= l.valid_until_unix
-            || s.accepted_at_unix > commit_now
-        {
-            return Err(PpsDbError::ChainLeaseRequired);
+        if s.accepted_at_unix > commit_now {
+            return Err(PpsDbError::Invalid);
         }
+        // Warning only at commit time too: the proof may have lapsed during the write.
+        let chain_advisory =
+            chain_advisory.or((!chain_current(commit_now)).then_some("chain_lease_required"));
         // Advisory at commit time too: the lease may have gone stale during the write.
         let funding_advisory = funding_advisory.or(advisory_funding(
             crate::pps_funding::check(&mut tx, e, funding, commit_now, false).await)?);
@@ -511,6 +523,7 @@ impl PoolDb {
             duplicate: false,
             credited_subzatoshis: s.amount_subzatoshis,
             funding_advisory,
+            chain_advisory,
         })
     }
     pub async fn pps_invariant(&self) -> Result<PpsLedgerSummary, PpsDbError> {
@@ -2454,27 +2467,28 @@ mod tests {
         assert_eq!(f.db.get_total_shares_count().await.unwrap(), 1);
     }
     #[tokio::test]
-    async fn stale_forked_and_missing_chain_proof_never_accept_a_share() {
+    async fn stale_forked_and_missing_chain_proof_credit_with_a_chain_warning() {
         let f = setup(true, 10).await;
-        let s = event(&f, 1, 1);
-        assert!(matches!(
-            f.db.credit_pps_share(&f.e, &s, None, None, NOW).await,
-            Err(PpsDbError::ChainLeaseRequired)
-        ));
+        let funding = funded(&f).await;
         let mut bad = f.l.clone();
         bad.disagreement = true;
-        assert!(matches!(
-            f.db.credit_pps_share(&f.e, &s, Some(&bad), Some(&funded(&f).await), NOW)
-                .await,
-            Err(PpsDbError::ChainLeaseRequired)
-        ));
-        assert!(matches!(
-            f.db.credit_pps_share(&f.e, &s, Some(&f.l), Some(&funded(&f).await), NOW + 61)
-                .await,
-            Err(PpsDbError::ChainLeaseRequired)
-        ));
-        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 0);
-        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 0);
+        // Chain agreement is a warning only: every case credits and says so.
+        for (index, lease, now) in [(1, None, NOW), (2, Some(&bad), NOW), (3, Some(&f.l), NOW + 61)] {
+            let receipt = f.db
+                .credit_pps_share(&f.e, &event(&f, index, 1), lease, Some(&funding), now)
+                .await
+                .unwrap();
+            assert_eq!(receipt.chain_advisory, Some("chain_lease_required"), "case {index}");
+            assert!(!receipt.duplicate);
+        }
+        // A current proof carries no warning.
+        let receipt = f.db
+            .credit_pps_share(&f.e, &event(&f, 4, 1), Some(&f.l), Some(&funding), NOW)
+            .await
+            .unwrap();
+        assert_eq!(receipt.chain_advisory, None);
+        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 4);
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 4);
     }
     #[tokio::test]
     async fn concurrent_cap_includes_fractional_claims_and_survives_epoch_change() {
@@ -2857,42 +2871,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_expiry_after_lock_or_before_commit_rejects_all_writes() {
+    async fn lease_expiry_after_lock_or_before_commit_credits_with_a_chain_warning() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let f = setup(true, 10).await;
-        let share = event(&f, 1, PPS_SCALE);
-        assert!(matches!(
-            f.db.credit_pps_share_with_clock(
+        let funding = funded(&f).await;
+        let expired = f.db
+            .credit_pps_share_with_clock(
                 &f.e,
-                &share,
+                &event(&f, 1, PPS_SCALE),
                 Some(&f.l),
-                Some(&funded(&f).await),
+                Some(&funding),
                 NOW,
-                || Ok(NOW + 60)
+                || Ok(NOW + 60),
             )
-            .await,
-            Err(PpsDbError::ChainLeaseRequired)
-        ));
+            .await
+            .unwrap();
+        assert_eq!(expired.chain_advisory, Some("chain_lease_required"));
         let calls = AtomicUsize::new(0);
-        assert!(matches!(
-            f.db.credit_pps_share_with_clock(
+        let lapsed_during_write = f.db
+            .credit_pps_share_with_clock(
                 &f.e,
-                &share,
+                &event(&f, 2, PPS_SCALE),
                 Some(&f.l),
-                Some(&funded(&f).await),
+                Some(&funding),
                 NOW,
                 || Ok(if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     NOW
                 } else {
                     NOW + 60
-                })
+                }),
             )
-            .await,
-            Err(PpsDbError::ChainLeaseRequired)
-        ));
+            .await
+            .unwrap();
+        assert_eq!(lapsed_during_write.chain_advisory, Some("chain_lease_required"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 0);
-        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 0);
+        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 2);
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 2);
     }
     #[tokio::test]
     async fn canonical_pps_proofs_and_liabilities_survive_raw_share_pruning() {

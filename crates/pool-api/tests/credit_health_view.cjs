@@ -34,15 +34,20 @@ assert.equal(view({...ready, category: 'invalid'}).state, 'unknown');
 assert.equal(view({...ready, funding_expires_at_unix: 1001}).state, 'degraded');
 assert.equal(view({...ready, funding_expires_at_unix: 1001}).category, 'funding_expired');
 assert.equal(view({...ready, funding_expiry_valid: false}).state, 'degraded');
-// A lapsed chain lease rejects shares.
-assert.equal(view({...ready, chain_expires_at_unix: 1001}).state, 'paused');
+// Chain agreement is a warning only: a lapsed proof degrades, never pauses.
+assert.equal(view({...ready, chain_expires_at_unix: 1001}).state, 'degraded');
 assert.equal(view({...ready, chain_expires_at_unix: 1001}).category, 'chain_invalid');
-assert.equal(view({...ready, chain_expiry_valid: false}).state, 'paused');
+assert.equal(view({...ready, chain_expiry_valid: false}).state, 'degraded');
+assert.equal(view({...ready, chain_expiry_valid: false}).label, 'Crediting (chain warning)');
+// A gate that really rejects shares still wins over the chain warning.
+assert.equal(view({...ready, state: 'paused', category: 'cap_exhausted', chain_expiry_valid: false}).state, 'paused');
+assert.equal(view({...ready, current_quote_fits: false, chain_expiry_valid: false}).category, 'current_quote_insufficient');
 const degradedGen = {...ready, state: 'degraded', category: 'generation_changed', generation_matches: false};
 assert.equal(view(degradedGen).state, 'degraded');
 assert.equal(view(degradedGen).label, 'Crediting (payouts may hold)');
 assert.equal(view(degradedGen, 1016).state, 'unknown');
-assert.equal(view({...degradedGen, chain_expiry_valid: false}).state, 'paused');   // worst state wins
+assert.equal(view({...degradedGen, chain_expiry_valid: false}).state, 'degraded');
+assert.equal(view({...degradedGen, chain_expiry_valid: false}).category, 'chain_invalid');   // chain warning reported first
 assert.equal(view({...ready, state: 'paused', category: 'cap_exhausted'}).category, 'cap_exhausted');
 const successfulIdlePayout = {consecutive_payout_failures: 0,
     pps_payout_cycle: {outcome: 'no_payout_due', funding_check: 'not_checked_no_payout_due'}};

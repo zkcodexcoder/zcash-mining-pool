@@ -719,12 +719,13 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
         }
         let submits_before = node.calls("submitblock").len();
         let outcome = failing.submit("failure-session", &block[143..1487]).await;
-        if failure == "funding" {
-            // Never-reject: a stale funding lease is advisory at credit time.
-            assert!(outcome.is_ok(), "{failure}: advisory funding must still credit");
+        if failure == "funding" || failure == "lease" {
+            // Never-reject: a stale funding lease is advisory at credit time, and
+            // chain agreement is a warning only.
+            assert!(outcome.is_ok(), "{failure}: a warning-only gate must still credit");
         } else {
-            // Credit refused (cap, chain lease, database), but the block-solving
-            // share is still accepted and nothing partial is credited.
+            // Credit refused (cap, database), but the block-solving share is
+            // still accepted and nothing partial is credited.
             assert!(outcome.as_ref().is_ok_and(|r| r.is_block), "{failure}: block must be accepted");
             assert_uncredited(&fdb).await;
         }

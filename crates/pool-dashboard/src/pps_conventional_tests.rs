@@ -207,29 +207,28 @@ impl Fixture {
 
 #[tokio::test]
 async fn conventional_fixture_share_and_chain_proof_use_one_sampled_clock() {
-    use pool_db::pps_live::PpsDbError;
-    let f = Fixture::new().await;
-    let worker = f.db.get_or_create_worker(f.miner,"clock-boundary-worker").await.unwrap();
     let observed = Utc::now().timestamp();
     // Deterministically model accepted_at just before a second boundary and
     // a separately sampled chain proof just after it, without sleeping.
     let accepted = observed - 1;
-    let credit = PpsCredit { proof_id:"d".repeat(64),quote_id:"e".repeat(64),
-        worker_id:worker.id,job_id:"clock-boundary-job".into(),session_id:"clock-boundary-session".into(),
-        difficulty:1.0,is_block:false,amount_subzatoshis:CREDIT as u128 * PPS_SCALE,
-        accepted_at_unix:accepted,quote_height:HEIGHT as u64,network_target_be:[1;32],
-        assigned_share_target_be:[2;32],miner_subsidy_zats:125_000_000 };
-    let proof = funding(&f.db,&f.policy).await;
-    let incoherent = f.db.credit_pps_share(&f.policy.epoch_config(),&credit,
-        Some(&chain_lease_at(observed)),Some(&proof),observed).await;
-    assert!(matches!(incoherent,Err(PpsDbError::ChainLeaseRequired)));
-    assert_eq!(f.db.pps_invariant().await.unwrap().pending_zatoshis,CREDIT);
-    let coherent = chain_lease_at(accepted);
-    assert_eq!(coherent.checked_at_unix,credit.accepted_at_unix);
-    assert_eq!(coherent.valid_until_unix - coherent.checked_at_unix,90);
-    f.db.credit_pps_share(&f.policy.epoch_config(),&credit,Some(&coherent),Some(&proof),observed)
-        .await.unwrap();
-    assert_eq!(f.db.pps_invariant().await.unwrap().pending_zatoshis,2 * CREDIT);
+    assert_eq!(chain_lease_at(accepted).valid_until_unix - accepted,90);
+    // A proof sampled after the share was stamped does not cover it; one sampled
+    // at the share's own clock does. Chain agreement is a warning only, so both
+    // shares are credited and only the receipt's warning differs.
+    for (proof_at, warning) in [(observed, Some("chain_lease_required")), (accepted, None)] {
+        let f = Fixture::new().await;
+        let worker = f.db.get_or_create_worker(f.miner,"clock-boundary-worker").await.unwrap();
+        let credit = PpsCredit { proof_id:"d".repeat(64),quote_id:"e".repeat(64),
+            worker_id:worker.id,job_id:"clock-boundary-job".into(),session_id:"clock-boundary-session".into(),
+            difficulty:1.0,is_block:false,amount_subzatoshis:CREDIT as u128 * PPS_SCALE,
+            accepted_at_unix:accepted,quote_height:HEIGHT as u64,network_target_be:[1;32],
+            assigned_share_target_be:[2;32],miner_subsidy_zats:125_000_000 };
+        let proof = funding(&f.db,&f.policy).await;
+        let receipt = f.db.credit_pps_share(&f.policy.epoch_config(),&credit,
+            Some(&chain_lease_at(proof_at)),Some(&proof),observed).await.unwrap();
+        assert_eq!(receipt.chain_advisory,warning,"proof sampled at {proof_at}");
+        assert_eq!(f.db.pps_invariant().await.unwrap().pending_zatoshis,2 * CREDIT);
+    }
 }
 
 // Reproduced by tests/support/zecd_raw_fixture.rs using the upstream parser.
@@ -1054,7 +1053,9 @@ async fn conventional_final_preparation_failures_release_only_definitely_unseale
     // Malformed encoding is not reachable from normal bounded selection. Test
     // the real encoder and exact production cleanup boundary with that input,
     // rather than adding a runtime injection path or corrupting the ledger.
-    for failure in ["encoding","missing_cache","expired_at_seal","ambiguous_committed_seal"] {
+    // Chain agreement is a warning only, so a missing chain proof is not a
+    // preparation failure; the funding lease alone bounds the seal.
+    for failure in ["encoding","expired_at_seal","ambiguous_committed_seal"] {
         let f=Fixture::new().await;
         let rpc=MockRpc::new(&f.db).await;
         let legacy=f.legacy().await;
@@ -1073,23 +1074,14 @@ async fn conventional_final_preparation_failures_release_only_definitely_unseale
                     malformed.items[0].amount_zatoshis=i64::MAX;
                     pps_conventional::encode_recipients(&malformed)?;
                 },
-                "missing_cache" => {
-                    // New production gate, no supplied-evidence test shortcut.
-                    let empty=PpsGate::new(rpc.client.clone(),"testnet");
-                    let _held=empty.valid_cached_lease().await?;
-                },
                 _ => {
-                    let gate=gate(&rpc.client);
-                    let held=gate.valid_cached_lease().await?;
                     let mut lease=funding(&f.db,&f.policy).await;
-                    lease.valid_until_unix=lease.valid_until_unix.min(held.valid_until_unix());
                     if failure=="expired_at_seal" {
                         // Models expiry while waiting for the database. Its
                         // actual funded entry check must reject the proof.
                         lease.valid_until_unix=Utc::now().timestamp();
                     }
                     f.db.seal_pps_conventional_payout_funded(attempt,&bound.intent_id,&lease).await?;
-                    drop(held);
                     // Real durable commit, followed by a caller-side error:
                     // the same production cleanup must NOT release these funds.
                     anyhow::bail!("synthetic post-commit response failure");

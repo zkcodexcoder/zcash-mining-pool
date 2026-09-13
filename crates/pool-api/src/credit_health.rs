@@ -86,10 +86,10 @@ mod tests {
             CreditAdmissionState::Ready
         );
         // A lapsed funding lease only degrades (shares still credit; sends may
-        // hold); a lapsed chain lease is a hard credit gate and pauses.
+        // hold); chain agreement is a warning only, so a lapsed proof degrades too.
         for (field, expected) in [
             ("funding_expires_at_unix", CreditAdmissionState::Degraded),
-            ("chain_expires_at_unix", CreditAdmissionState::Paused),
+            ("chain_expires_at_unix", CreditAdmissionState::Degraded),
         ] {
             let mut h = heartbeat();
             h[field] = json!(1002);

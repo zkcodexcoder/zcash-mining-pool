@@ -3,15 +3,16 @@
 //
 // States mirror pool-core's CreditAdmissionState:
 //   ready    - shares credited, all proofs current
-//   degraded - shares STILL credited; a send-side proof is stale (payouts may hold)
-//   paused   - a hard gate is rejecting valid shares (chain lease, cap, accounting)
+//   degraded - shares STILL credited; a warning (chain agreement) or a stale
+//              send-side proof (payouts may hold)
+//   paused   - a hard gate is rejecting valid shares (cap, accounting)
 //   unknown  - telemetry missing, malformed or stale
 // An idle gap between priced shares is not unknown.
 function ppsCreditView(health, now = Math.floor(Date.now() / 1000)) {
     let funding = 'Unknown', warning = false;
     const result = (state, label, category) => ({state, label, category, funding, warning});
     const unknown = category => result('unknown', 'Unknown', category);
-    const degraded = category => result('degraded', 'Crediting (payouts may hold)', category);
+    const degraded = (category, label = 'Crediting (payouts may hold)') => result('degraded', label, category);
     if (!health) return unknown('missing');
     if (health.version !== 2 || typeof health.quote_required !== 'boolean'
         || typeof health.budget_low !== 'boolean' || !Number.isSafeInteger(health.sampled_at_unix)
@@ -28,8 +29,6 @@ function ppsCreditView(health, now = Math.floor(Date.now() / 1000)) {
     if (fundingCurrent && health.generation_matches === true) funding = 'Current (sampled)';
     if (health.state === 'unknown') return unknown(health.category);
     if (!['ready', 'degraded', 'paused'].includes(health.state)) return unknown('malformed');
-    // A lapsed chain lease rejects shares whatever the sampled state said.
-    if (!chainCurrent && health.state !== 'paused') return result('paused', 'Paused', 'chain_invalid');
     // Only a FRESH quote says anything about the next share.
     const quoteFresh = health.quote_required === true
         && Number.isSafeInteger(health.quote_checked_at_unix) && health.quote_checked_at_unix <= now
@@ -37,6 +36,9 @@ function ppsCreditView(health, now = Math.floor(Date.now() / 1000)) {
     if (quoteFresh && health.current_quote_fits === false)
         return result('paused', 'Paused', 'current_quote_insufficient');
     if (health.state === 'paused') return result('paused', 'Paused', health.category);
+    // Chain agreement is a warning only: a lapsed proof degrades, never pauses,
+    // and is reported ahead of other warnings, as the server ranks it.
+    if (!chainCurrent) return degraded('chain_invalid', 'Crediting (chain warning)');
     if (health.state === 'degraded') return degraded(health.category);
     if (health.category !== 'ok' || health.generation_matches !== true) return unknown('malformed');
     if (!fundingCurrent) return degraded('funding_expired');

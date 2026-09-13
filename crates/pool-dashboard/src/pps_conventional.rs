@@ -120,12 +120,6 @@ pub(super) fn encode_recipients(intent: &PpsConventionalIntent) -> Result<Vec<Va
         .collect()
 }
 
-/// Only shorten the original proof's lifetime. The funded seal's unchanged
-/// entry/precommit clock checks then enforce BOTH wallet and chain expiry.
-fn intersect_seal_deadline(funding: &mut PpsFundingLease, chain_expiry: i64) {
-    funding.valid_until_unix = funding.valid_until_unix.min(chain_expiry);
-}
-
 /// Every failure before a successful seal attempts the existing atomic refund.
 /// A committed or ambiguously committed seal makes that refund fail closed.
 /// The one-shot wallet send must stay outside this cleanup boundary.
@@ -334,15 +328,13 @@ async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClie
     let recipients = pre_send_or_release(db,attempt,async {
         pre_send_phase("chain_before_send", chain.fresh_lease()).await?;
         pre_send_phase("wallet_idle_before_send", wallet_idle(wallet)).await?;
-        let mut funding=pre_send_phase("funding_before_send",
+        let funding=pre_send_phase("funding_before_send",
             collect_funding_resilient(db,wallet,policy,from,node,route)).await?;
         pre_send_phase("funding_recheck", db.check_pps_funding(&funding)).await?;
         let recipients=pre_send_phase("recipient_encoding", async { encode_recipients(&intent) }).await?;
-        let chain_guard=pre_send_phase("chain_before_seal", chain.valid_cached_lease()).await?;
-        intersect_seal_deadline(&mut funding,chain_guard.valid_until_unix());
+        // Chain agreement is a warning only (chain_before_send logs it); it does
+        // not bound the seal. The funding lease alone sets the seal deadline.
         pre_send_phase("seal", db.seal_pps_conventional_payout_funded(attempt,&bound.intent_id,&funding)).await?;
-        // Keep the same cache mutex held until the funded seal has returned.
-        drop(chain_guard);
         Ok(recipients)
     }).await?;
     // No fallback and no transport retry. Even a reported RPC failure can
@@ -460,20 +452,6 @@ async fn reconcile_inner(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn seal_deadline_intersection_never_extends_or_changes_other_funding_fields() {
-        let original=PpsFundingLease { network:"testnet".into(),checked_at_unix:100,
-            valid_until_unix:160,spendable_zatoshis:1_000_000_000,
-            reserve_floor_zatoshis:1,reserved_fee_allowance_zatoshis:50_000_000,generation:17 };
-        for (chain_expiry,expected) in [(190,160),(160,160),(140,140),(100,100),(99,99)] {
-            let mut bounded=original.clone();
-            intersect_seal_deadline(&mut bounded,chain_expiry);
-            assert_eq!(bounded.valid_until_unix,expected);
-            bounded.valid_until_unix=original.valid_until_unix;
-            assert!(bounded==original);
-        }
-    }
 
     #[test]
     fn pre_send_categories_use_types_not_error_text_or_context() {

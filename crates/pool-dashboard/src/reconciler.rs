@@ -877,12 +877,12 @@ impl Reconciler {
     async fn check_pps_invariant(&self, summary: &mut SweepSummary) {
         let Some(policy) = &self.pps_policy else { return; };
         let lease = match &self.pps_gate {
-            Some(gate) => gate.fresh_lease().await.ok(), None => None,
+            Some(gate) => gate.fresh_lease().await.ok().flatten(), None => None,
         };
         let fresh = lease.is_some();
         let valid_until = lease.map_or(0, |l| l.valid_until_unix);
         if !fresh {
-            summary.alerts.push("PPS chain-agreement lease expired; new PPS actions are blocked".into());
+            summary.alerts.push("WARNING: PPS chain agreement unproven (node vs reference explorers); credits and payouts continue".into());
         }
         match self.db.pps_invariant().await {
             Ok(totals) => {

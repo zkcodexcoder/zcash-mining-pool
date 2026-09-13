@@ -419,7 +419,7 @@ const REASON = {
   invalid_evidence:'funding evidence rejected — shares still credited, payouts held',
   fee_capacity_exhausted:'payout fee budget spent — shares still credited, payouts held',
   financial_halt:'operator halt — shares still credited, no sends',
-  chain_invalid:'chain-agreement lease invalid — valid shares are being REJECTED',
+  chain_invalid:'chain agreement unproven (node vs reference explorers) — warning only; shares still credited, payouts continue',
   cap_exhausted:'credit cap exhausted — valid shares are being REJECTED',
   current_quote_insufficient:'next share would exceed the cap — valid shares are being REJECTED',
   accounting_invalid:'ledger unreadable — valid shares are being REJECTED',
@@ -527,7 +527,7 @@ async function render(){
   $('gates').innerHTML =
     gate('Credit admission','valid shares priced &amp; credited',admCls,admVal)+
     gate('Funding lease','wallet cover — gates payouts, not credits',h.funding_expiry_valid?'ok':'warn',fundVal)+
-    gate('Chain agreement','node + references agree — gates credits',h.chain_expiry_valid?'ok':'bad',h.chain_expiry_valid?'valid · '+secs(h.chain_expires_at_unix):'INVALID — rejecting shares')+
+    gate('Chain agreement','node + references agree — warning only',h.chain_expiry_valid?'ok':'warn',h.chain_expiry_valid?'valid · '+secs(h.chain_expires_at_unix):'UNPROVEN — warning only')+
     gate('Price quote','last priced share vs the cap',priceCls,priceVal)+
     gate('Budget','credit cap headroom',low?'warn':'ok',low?'LOW':'ok');
 

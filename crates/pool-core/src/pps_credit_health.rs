@@ -32,11 +32,12 @@ const QUOTE_MAX_AGE_SECONDS: i64 = 15;
 #[serde(rename_all = "snake_case")]
 pub enum CreditAdmissionState { Ready, Degraded, Paused, Unknown }
 
-/// Send-side reasons: crediting continues, only sending may be held. Everything
-/// else in `assess` is a hard credit gate and maps to `Paused`.
+/// Warnings and send-side reasons: crediting continues. Chain agreement is a
+/// warning only; the rest may hold sending. Everything else in `assess` is a
+/// hard credit gate and maps to `Paused`.
 fn degrades_only(reason: &str) -> bool {
     matches!(reason,
-        "financial_halt" | "funding_missing" | "funding_expired" | "generation_changed"
+        "chain_invalid" | "financial_halt" | "funding_missing" | "funding_expired" | "generation_changed"
         | "invalid_evidence" | "funding_insufficient" | "fee_capacity_exhausted")
 }
 
@@ -153,8 +154,8 @@ pub fn decode_credit_health(raw: Option<&str>, now_unix: i64) -> PpsCreditHealth
         && h.funding_expires_at_unix.is_some_and(|v| now_unix < v);
     h.chain_expiry_valid &= h.chain_expires_at_unix.is_some_and(|v| now_unix < v);
     if matches!(h.state, CreditAdmissionState::Ready | CreditAdmissionState::Degraded) {
-        // A lapsed chain lease is a hard credit gate whatever the funding state.
-        if !h.chain_expiry_valid { h.state=CreditAdmissionState::Paused; h.category="chain_invalid".into(); }
+        // Chain agreement is a warning only: a lapsed proof degrades, never pauses.
+        if !h.chain_expiry_valid { h.state=CreditAdmissionState::Degraded; h.category="chain_invalid".into(); }
         else if h.state == CreditAdmissionState::Ready {
             // A lapsed funding lease only degrades: shares are still credited,
             // sends may be held until it recovers.
@@ -331,13 +332,13 @@ fn assess(h:&mut PpsCreditHealth, epoch:&PpsEpoch, route:&PpsFundingRoute,
             < s.cap_subzatoshis/5 + u128::from(s.cap_subzatoshis%5!=0));
     h.generation_matches=lease.map(|l| l.generation==snapshot.generation);
     // Audit B14: report the WORST state. Gates that actually reject valid shares
-    // (chain lease, unreadable accounting, exhausted cap) are evaluated before the
-    // send-side reasons that only degrade, so a funding warning can never mask a
-    // hard rejection.
+    // (unreadable accounting, exhausted cap) are evaluated before the reasons that
+    // only degrade, so a warning can never mask a hard rejection. Chain agreement
+    // is a warning only and is reported first among those.
     let funding=snapshot.funding.as_ref();
-    let reason=if !h.chain_expiry_valid { Some("chain_invalid") }
-        else if funding.is_none() { Some("accounting_invalid") }
+    let reason=if funding.is_none() { Some("accounting_invalid") }
         else if funding.is_some_and(|s| s.unused_credit_subzatoshis==0) { Some("cap_exhausted") }
+        else if !h.chain_expiry_valid { Some("chain_invalid") }
         else if snapshot.financial_halt { Some("financial_halt") }
         else if lease.is_none() { Some("funding_missing") }
         else if !h.funding_expiry_valid { Some("funding_expired") }
@@ -476,7 +477,9 @@ mod tests {
         assert_eq!(expired.category,"funding_expired");
         assert_eq!(expired.funding_expires_at_unix,Some(140));
         h.chain_expires_at_unix=Some(139);
-        assert_eq!(decode(&h,139).category,"chain_invalid");
+        // Chain agreement is a warning only: a lapsed proof degrades, never pauses.
+        let lapsed=decode(&h,139);
+        assert_eq!((lapsed.state,lapsed.category.as_str()),(CreditAdmissionState::Degraded,"chain_invalid"));
         h=ready(); h.generation_matches=Some(false);
         assert_eq!(decode(&h,100).state,CreditAdmissionState::Unknown);
         // A lease span beyond the funding-lease ceiling is incoherent -> malformed.
@@ -552,7 +555,14 @@ mod tests {
         s.funding.as_mut().unwrap().required_spendable_zatoshis+=1;
         h.chain_expiry_valid=false;
         assess(&mut h,&e,&route,Some(&l),&s,100);
-        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"chain_invalid"));
+        // Chain agreement is a warning only: it degrades and is reported first
+        // among warnings (here ahead of funding_insufficient)...
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"chain_invalid"));
+        // ...while a gate that really rejects shares still outranks it.
+        s.funding.as_mut().unwrap().unused_credit_subzatoshis=0;
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"cap_exhausted"));
+        s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
         h.chain_expiry_valid=true;
         // Unreadable accounting rejects credits, so it outranks a halt too.
         s.funding=None;
