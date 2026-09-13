@@ -792,10 +792,64 @@ mod tests {
     async fn shielded_mock(mut results:Vec<Value>,reverse:bool)
         -> (ZcashRpcClient,tokio::task::JoinHandle<Vec<Value>>)
     {
-        if results.len()>=10 {
-            results[8]=json!({"mock_reverse_money":reverse,"mock_money_result":results[8]});
+        if results.len()>=8 {
+            results[6]=json!({"mock_reverse_money":reverse,"mock_money_result":results[6]});
         }
         mock(results,None).await
+    }
+
+    /// Harness for the RETAINED identity-operation proof. Since 95862e8
+    /// `collect_testnet_funding` no longer calls `verify_identity_operation`
+    /// (an IdentityNotProven wallet proceeds straight to the money reads), but
+    /// the function and `collect_money`'s signer branch are kept for a future
+    /// passphrase-encrypted configuration. This composes exactly those retained
+    /// production pieces — begin_funding, verify_identity_operation, then
+    /// collect_money with the proof — so their own logic stays covered. It adds
+    /// no re-envelope read (that was removed from production with the wiring).
+    async fn collect_with_identity_proof(wallet: &ZcashRpcClient, source: &str, node: &ZcashRpcClient)
+        -> Result<ZecdFundingEvidence, ZecdFundingError>
+    {
+        tokio::time::timeout(collection_timeout(), async {
+            let (checked_at,until,initial)=begin_funding(wallet,source).await?;
+            let signer=match initial.readiness {
+                DiagnosticSignerReadiness::PassphraseUnlocked => None,
+                DiagnosticSignerReadiness::IdentityNotProven =>
+                    Some(verify_identity_operation(wallet,source,node,&initial).await?),
+            };
+            let proof=collect_money(wallet,source,node,checked_at,until,initial,signer.as_ref()).await?;
+            let readiness=if signer.is_some() {SignerReadiness::IdentityOperationVerified}
+                else {SignerReadiness::PassphraseUnlocked};
+            probe_stage("evidence_final_freshness");
+            let finished=now()?;
+            if finished < proof.checked_at_unix || finished >= proof.valid_until_unix {
+                return Err(ZecdFundingError::InvalidEvidence);
+            }
+            Ok(ZecdFundingEvidence { confirmed_eligible_zatoshis: proof.confirmed_eligible_zatoshis,
+                checked_at_unix: proof.checked_at_unix, valid_until_unix: proof.valid_until_unix,
+                signer_readiness: readiness, _private: () })
+        }).await.map_err(|_| ZecdFundingError::Timeout)?
+    }
+
+    async fn identity_proof_observed_with_stage(wallet: &ZcashRpcClient, source: &str,
+        node: &ZcashRpcClient, observer: &FundingStageObserver)
+        -> Result<ZecdFundingEvidence, FundingObservedError>
+    {
+        observer.set("collection_start");
+        SHARED_PROBE_STAGE.scope(observer.clone(),PROBE_STAGE.scope(std::cell::Cell::new("collection_start"), async {
+            collect_with_identity_proof(wallet,source,node).await.map_err(|error| FundingObservedError {
+                error, stage: PROBE_STAGE.with(|current| current.get()), category: probe_category(&error),
+            })
+        })).await
+    }
+
+    async fn identity_proof_observed(wallet: &ZcashRpcClient, source: &str, node: &ZcashRpcClient)
+        -> Result<ZecdFundingEvidence, FundingObservedError>
+    {
+        identity_proof_observed_with_stage(wallet,source,node,&FundingStageObserver::default()).await
+    }
+
+    fn methods(reads: &[Value]) -> Vec<&str> {
+        reads.iter().map(|r| r["method"].as_str().unwrap()).collect()
     }
 
     // Private ephemeral loopback mocks only; never a real node/wallet.
@@ -811,7 +865,10 @@ mod tests {
         // Identity fixtures are explicitly in actual signer-first order; they
         // are not positional legacy diagnostic fixtures.
         let signer_first=results.first().is_some_and(|r|r["mock_signer_first"]==true);
-        if !signer_first && results.len() >= 3 && results[0].get("version")==Some(&json!(700)) {
+        // Funding fixtures are recognised by a supported zecd identity reply.
+        let funding_fixture=results.first().and_then(|r|r.get("version"))
+            .is_some_and(|v| *v==json!(700) || *v==json!(800));
+        if !signer_first && results.len() >= 3 && funding_fixture {
             results.swap(1,2);
             if results.len() >= 8 { results.swap(6,7); }
         }
@@ -819,8 +876,8 @@ mod tests {
         // response positions to method-routed concurrent responses. Inputs and
         // expected values stay unchanged; the server insists BOTH exact RPCs
         // arrive before replying to either, and forbids an early closing read.
-        let money_index=if signer_first {if results[0]["mock_shielded"]==true {8} else {7}} else {4};
-        if results.len() >= money_index+2 && results[0].get("version")==Some(&json!(700)) {
+        let money_index=if signer_first {if results[0]["mock_shielded"]==true {6} else {5}} else {4};
+        if results.len() >= money_index+2 && funding_fixture {
             let reverse=results[money_index].get("mock_reverse_money").and_then(Value::as_bool).unwrap_or(false);
             let total=results[money_index].get("mock_money_result").unwrap_or(&results[money_index]).clone();
             let pair=json!({"mock_parallel":[
@@ -868,7 +925,12 @@ mod tests {
                     }
                     continue;
                 }
-                let (mut stream,_)=listener.accept().await.unwrap();
+                // A scripted reply the collector never requests fails loudly
+                // instead of hanging the test run.
+                let (mut stream,_)=tokio::time::timeout(Duration::from_secs(10),listener.accept()).await
+                    .unwrap_or_else(|_| panic!("scripted RPC never requested; issued so far: {:?}",
+                        requests.iter().map(|r:&Value|r["method"].clone()).collect::<Vec<_>>()))
+                    .unwrap();
                 let request=mock_request(&mut stream).await;
                 if let Some(raw)=&raw_http {
                     let _=stream.write_all(raw).await;
@@ -1201,19 +1263,19 @@ mod tests {
         for actor_failure in [false,true] {
             let (source,mut wallet_responses,mut node_responses)=identity_receipt_responses();
             if actor_failure {
-                wallet_responses[9]=json!({"mock_error":{"code":-1,"message":"synthetic private detail"}});
-                wallet_responses.truncate(10);
+                wallet_responses[7]=json!({"mock_error":{"code":-1,"message":"synthetic private detail"}});
+                wallet_responses.truncate(8);
             } else {
-                let h=wallet_responses[5]["enhanced_through"].as_u64().unwrap();
-                wallet_responses[5]["enhanced_through"]=json!(h+1);
-                wallet_responses.truncate(7);
+                // The closing metadata finished one block past the closing anchor.
+                let h=wallet_responses[10]["enhanced_through"].as_u64().unwrap();
+                wallet_responses[10]["enhanced_through"]=json!(h+1);
             }
             node_responses.truncate(3);
             let (wallet,w)=mock(wallet_responses,None).await;
             let (node,n)=mock(node_responses,None).await;
-            let report=probe_testnet_funding(&wallet,&source,&node).await;
+            let report=run_funding_probe(collect_with_identity_proof(&wallet,&source,&node)).await;
             assert_eq!(report,FundingProbeReport {passed:false,
-                stage:if actor_failure {"signer_actor_read"} else {"signer_final_metadata_check"},
+                stage:if actor_failure {"signer_actor_read"} else {"closing_metadata_check"},
                 category:"wallet_not_ready"});
             assert!(!format!("{report:?}").contains("synthetic private detail"));
             w.await.unwrap(); n.await.unwrap();
@@ -1290,6 +1352,137 @@ mod tests {
         assert!(identity(&json!({"version":700,"subversion":"/zecd:0.7.1/"})).is_err());
     }
 
+    #[test]
+    fn identity_accepts_zecd_0_7_0_and_0_8_x_only() {
+        for (version,subversion) in [(700,"/zecd:0.7.0/"),(800,"/zecd:0.8.0-rc2/"),
+            (800,"/zecd:0.8.0/"),(800,"/zecd:0.8.1/")] {
+            assert_eq!(identity(&json!({"version":version,"subversion":subversion})),Ok(()),
+                "{version} {subversion}");
+        }
+        for reply in [
+            json!({"version":900,"subversion":"/zecd:0.9.0/"}),
+            json!({"version":800,"subversion":"/zecd:0.9.0/"}),
+            json!({"version":700,"subversion":"/zecd:0.7.1/"}),
+            json!({"version":701,"subversion":"/zecd:0.7.0/"}),
+            json!({"version":801,"subversion":"/zecd:0.8.1/"}),
+            json!({"version":810,"subversion":"/zecd:0.8.1/"}),
+            json!({"version":0,"subversion":"/zecd:0.8.1/"}),
+            json!({"version":"800","subversion":"/zecd:0.8.1/"}),
+            json!({"subversion":"/zecd:0.8.1/"}),
+            json!({"version":800}),
+            json!({"version":800,"subversion":"/zecd:0.80/"}),
+            json!({"version":800,"subversion":"/zecd:0.8/"}),
+            json!({"version":800,"subversion":"/zcashd:0.8.1/"}),
+        ] {
+            assert_eq!(identity(&reply),Err(ZecdFundingError::IdentityMismatch),"{reply}");
+        }
+    }
+
+    #[test]
+    fn memoless_wallet_readiness_accepts_null_watermark_only_when_fetch_memos_is_false() {
+        let until=now().unwrap()+60;
+        let with=|fetch:Option<Value>,enhanced:Option<Value>| {
+            let mut v=info(100);
+            if let Some(fetch)=fetch { v["fetch_memos"]=fetch; }
+            match enhanced {
+                Some(e) => v["enhanced_through"]=e,
+                None => { v.as_object_mut().unwrap().remove("enhanced_through"); },
+            }
+            v
+        };
+        let off=||Some(json!(false));
+        for accepted in [with(off(),Some(Value::Null)),with(off(),None),with(off(),Some(json!(100)))] {
+            assert_eq!(wallet_metadata(&accepted,100,until).map(|(_,r)|r),
+                Ok(DiagnosticSignerReadiness::PassphraseUnlocked),"{accepted}");
+        }
+        // zecd 0.8 memoless wallet without unlocked_until: readable, identity not proven.
+        let mut no_unlock=with(off(),Some(Value::Null));
+        no_unlock.as_object_mut().unwrap().remove("unlocked_until");
+        assert_eq!(wallet_metadata(&no_unlock,100,until),
+            Ok(("synthetic-wallet".to_owned(),DiagnosticSignerReadiness::IdentityNotProven)));
+        // A stale numeric watermark, or an unfinished scan, is still not ready with memos off.
+        assert_eq!(wallet_metadata(&with(off(),Some(json!(99))),100,until),Err(ZecdFundingError::NotReady));
+        let mut scanning=with(off(),Some(Value::Null)); scanning["scanning"]=json!(true);
+        assert_eq!(wallet_metadata(&scanning,100,until),Err(ZecdFundingError::NotReady));
+        // Memo-fetching, unspecified or malformed fetch_memos keeps the strict proof.
+        for fetch in [None,Some(json!(true)),Some(json!("false")),Some(Value::Null)] {
+            for enhanced in [Some(Value::Null),None] {
+                let v=with(fetch.clone(),enhanced.clone());
+                assert_eq!(wallet_metadata(&v,100,until),Err(ZecdFundingError::NotReady),
+                    "fetch_memos={fetch:?} enhanced_through={enhanced:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_owned_rejects_watchonly_unsolvable_and_unstated_spend_capability() {
+        for (field,value) in [("iswatchonly",json!(true)),("solvable",json!(false)),
+            ("ismine",json!(false)),("isscript",json!(true)),
+            ("iswatchonly",Value::Null),("solvable",Value::Null)] {
+            let mut s=source(); s[field]=value.clone();
+            assert_eq!(source_owned(&s,"synthetic-source"),Err(ZecdFundingError::UnsupportedSource),
+                "{field}={value}");
+            let mut s=source(); s.as_object_mut().unwrap().remove(field);
+            assert_eq!(source_owned(&s,"synthetic-source"),Err(ZecdFundingError::UnsupportedSource),
+                "{field} absent");
+        }
+    }
+
+    /// Unencrypted wallet as deployed after 95862e8: no `unlocked_until`
+    /// (IdentityNotProven readiness). "0.8" is zecd 0.8.0-rc2 with
+    /// `fetch_memos=false` and a null watermark. Legacy positional layout.
+    fn unencrypted_responses(release: &str) -> Vec<Value> {
+        let mut r=responses();
+        if release=="0.8" {
+            r[0]=json!({"version":800,"subversion":"/zecd:0.8.0-rc2/"});
+            for i in [2,7] { r[i]["fetch_memos"]=json!(false); r[i]["enhanced_through"]=Value::Null; }
+        }
+        for i in [2,7] { r[i].as_object_mut().unwrap().remove("unlocked_until"); }
+        r
+    }
+
+    #[tokio::test]
+    async fn unencrypted_wallet_funding_succeeds_without_any_operation_proof_reads() {
+        for release in ["0.7","0.8"] {
+            let (wallet,w)=mock(unencrypted_responses(release),None).await;
+            let (node,n)=mock(vec![json!(100),json!("a".repeat(64))],None).await;
+            let evidence=collect_testnet_funding_observed(&wallet,"synthetic-source",&node).await
+                .unwrap_or_else(|e| panic!("release {release}: {e:?}"));
+            assert_eq!(evidence.signer_readiness,SignerReadiness::PassphraseUnlocked);
+            assert_eq!(evidence.confirmed_eligible_zatoshis,200_000_000);
+            assert_eq!(evidence.valid_until_unix-evidence.checked_at_unix,EVIDENCE_LIFETIME_SECONDS);
+            let reads=w.await.unwrap();
+            assert_eq!(reads.len(),8,"release {release}");
+            assert_eq!(methods(&reads[..4]),
+                vec!["getnetworkinfo","getwalletinfo","getblockchaininfo","getaddressinfo"]);
+            let mut money=methods(&reads[4..6]); money.sort();
+            assert_eq!(money,vec!["getbalance","listunspent"]);
+            assert_eq!(methods(&reads[6..]),vec!["getwalletinfo","getblockchaininfo"]);
+            assert!(reads.iter().all(|r| !matches!(r["method"].as_str().unwrap(),
+                "z_getoperationstatus"|"getrawtransaction"|"getblock"|"gettransaction")));
+            let node_reads=n.await.unwrap();
+            assert_eq!(methods(&node_reads),vec!["getblockcount","getblockhash"]);
+            assert_eq!(node_reads[1]["params"],json!([100]));
+        }
+    }
+
+    #[tokio::test]
+    async fn watchonly_or_unsolvable_source_cannot_pass_unencrypted_funding() {
+        for (field,value) in [("iswatchonly",json!(true)),("solvable",json!(false))] {
+            for release in ["0.7","0.8"] {
+                let mut r=unencrypted_responses(release); r[3][field]=value.clone(); r.truncate(4);
+                let (wallet,w)=mock(r,None).await; let (node,n)=mock(vec![],None).await;
+                let failure=collect_testnet_funding_observed(&wallet,"synthetic-source",&node).await.unwrap_err();
+                assert_eq!(failure,FundingObservedError {error:ZecdFundingError::UnsupportedSource,
+                    stage:"opening_source_check",category:"unsupported_source"},"{field} {release}");
+                let reads=w.await.unwrap();
+                assert_eq!(methods(&reads),
+                    vec!["getnetworkinfo","getwalletinfo","getblockchaininfo","getaddressinfo"]);
+                assert!(n.await.unwrap().is_empty());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn runtime_success_uses_fixed_reads_and_exact_anchor() {
         let (wallet,w)=mock(responses(),None).await;
@@ -1354,7 +1547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_diagnostics_cannot_authorize_credit_or_hide_signer_mode_changes() {
+    async fn identity_diagnostics_stay_opaque_and_signer_mode_changes_are_rejected() {
         let identity_responses = || {
             let mut r=responses();
             for i in [2,7] { r[i].as_object_mut().unwrap().remove("unlocked_until"); }
@@ -1367,17 +1560,28 @@ mod tests {
         assert_eq!(diagnostics.confirmed_eligible_zatoshis(),200_000_000);
         assert_eq!(format!("{diagnostics:?}"),"ZecdFundingDiagnostics { redacted }");
         w.await.unwrap(); n.await.unwrap();
+        // Since 95862e8 collect_testnet_funding no longer requires the operation
+        // proof (see unencrypted_wallet_funding_* below). The RETAINED proof
+        // itself still refuses an empty operation registry.
         let mut unknown=identity_responses(); unknown.truncate(4); unknown.swap(1,2);
         unknown[0]["mock_signer_first"]=json!(true); unknown.push(json!([]));
         let (wallet,w)=mock(unknown,None).await;
         let (node,n)=mock(vec![],None).await;
-        assert_eq!(collect_testnet_funding(&wallet,"synthetic-source",&node).await,Err(ZecdFundingError::IdentitySignerNotProven));
+        assert_eq!(collect_with_identity_proof(&wallet,"synthetic-source",&node).await,Err(ZecdFundingError::IdentitySignerNotProven));
         w.await.unwrap(); n.await.unwrap();
-        let mut r=identity_responses(); r[7]=info(100);
-        let (wallet,w)=mock(r,None).await; let (node,n)=mock(vec![],None).await;
-        assert!(matches!(collect_testnet_funding_diagnostics(&wallet,"synthetic-source",&node).await,
-            Err(ZecdFundingError::ConcurrentChange)));
-        w.await.unwrap(); n.await.unwrap();
+        // A signer-mode change inside the bracket is rejected by BOTH the
+        // diagnostics and the credit-authorizing collector.
+        for credit in [false,true] {
+            let mut r=identity_responses(); r[7]=info(100);
+            let (wallet,w)=mock(r,None).await; let (node,n)=mock(vec![],None).await;
+            let outcome=if credit {
+                collect_testnet_funding(&wallet,"synthetic-source",&node).await.map(|_|())
+            } else {
+                collect_testnet_funding_diagnostics(&wallet,"synthetic-source",&node).await.map(|_|())
+            };
+            assert_eq!(outcome,Err(ZecdFundingError::ConcurrentChange),"credit={credit}");
+            assert_eq!(w.await.unwrap().len(),8); assert!(n.await.unwrap().is_empty());
+        }
     }
 
     fn identity_receipt_responses() -> (String,Vec<Value>,Vec<Value>) {
@@ -1388,12 +1592,13 @@ mod tests {
             "method":"z_sendmany","creation_time":now().unwrap()-1,
             "params":{"fromaddress":src,"minconf":1,"amounts":[{"address":recipient,"amount":0.001}]},
             "result":{"txid":txid}});
-        // Actual order: initial identity envelope, selected signer proof,
-        // fresh monetary envelope, money pair, immutable operation/source,
-        // closing monetary envelope. No old balance is replayed after signer.
+        // Order through collect_with_identity_proof: opening identity envelope
+        // (0-3), selected signer proof (4), money pair (5-6), actor sentinel
+        // (7), immutable operation/source (8-9), closing envelope (10-11).
+        // No re-envelope exists after the signer proof since 95862e8.
         let wallet=vec![json!({"version":700,"subversion":"/zecd:0.7.0/","mock_signer_first":true}),
             wallet_info.clone(),tip(height as u64,"a"),owned.clone(),json!([op.clone()]),
-            wallet_info.clone(),tip(height as u64,"a"),json!(12),json!([note("orchard",1,"12")]),
+            json!(12),json!([note("orchard",1,"12")]),
             json!({"mock_error":{"code":-5,"message":"fixed absence"}}),
             json!([op]),owned,wallet_info,tip(height as u64,"a")];
         let node=vec![json!({"txid":txid,"hex":raw,"confirmations":1,"blockhash":"a".repeat(64)}),
@@ -1416,7 +1621,7 @@ mod tests {
             "result":{"txid":txid}});
         let wallet=vec![json!({"version":700,"subversion":"/zecd:0.7.0/","mock_signer_first":true,"mock_shielded":true}),
             wallet_info.clone(),tip(height as u64,"a"),owned.clone(),json!([op.clone()]),history,
-            wallet_info.clone(),tip(height as u64,"a"),json!(12),json!([note("orchard",1,"12")]),
+            json!(12),json!([note("orchard",1,"12")]),
             json!({"mock_error":{"code":-5,"message":"fixed absence"}}),
             json!([op]),owned,wallet_info,tip(height as u64,"a")];
         let node=vec![json!({"txid":txid,"hex":raw,"confirmations":1,"blockhash":"a".repeat(64)}),
@@ -1433,7 +1638,7 @@ mod tests {
             if bare_sapling {
                 let address=wr[5]["details"][0]["address"].clone();
                 wr[4][0]["params"]["amounts"][0]["address"]=address.clone();
-                wr[11][0]["params"]["amounts"][0]["address"]=address;
+                wr[9][0]["params"]["amounts"][0]["address"]=address;
             }
             let selected=wr[4][0].clone();
             let (_,other_wr,_)=identity_receipt_responses();
@@ -1442,15 +1647,15 @@ mod tests {
             newer["id"]=json!("opid-00000000-0000-4000-8000-000000000003");
             wr[4]=json!([newer,selected]);
             let (wallet,w)=shielded_mock(wr,pool=="orchard").await; let (node,n)=mock(nr,None).await;
-            let evidence=collect_testnet_funding(&wallet,&src,&node).await.unwrap();
+            let evidence=collect_with_identity_proof(&wallet,&src,&node).await.unwrap();
             assert_eq!(evidence.signer_readiness,SignerReadiness::IdentityOperationVerified);
             let reads=w.await.unwrap(); let node_reads=n.await.unwrap();
-            assert_eq!(reads.len(),15); assert_eq!(node_reads.len(),7);
+            assert_eq!(reads.len(),13); assert_eq!(node_reads.len(),7);
             assert_eq!(reads.iter().filter(|r|r["method"]=="gettransaction").count(),1);
             let history_read=reads.iter().find(|r|r["method"]=="gettransaction").unwrap();
             assert_eq!(history_read["params"][0],node_reads[0]["params"][0]);
             assert_eq!(reads.iter().filter(|r|r["method"]=="getrawtransaction").count(),1);
-            assert_eq!(reads[11]["params"],json!([["opid-00000000-0000-4000-8000-000000000002"]]));
+            assert_eq!(reads[9]["params"],json!([["opid-00000000-0000-4000-8000-000000000002"]]));
             assert_eq!(node_reads[2]["params"],node_reads[3]["params"]);
             assert_eq!(node_reads[2]["params"],node_reads[6]["params"]);
             assert!(reads.iter().all(|r|matches!(r["method"].as_str().unwrap(),
@@ -1484,7 +1689,7 @@ mod tests {
             }
             wr.truncate(6); nr.truncate(3);
             let (wallet,w)=shielded_mock(wr,case%2==0).await; let (node,n)=mock(nr,None).await;
-            let error=collect_testnet_funding(&wallet,&src,&node).await.unwrap_err();
+            let error=collect_with_identity_proof(&wallet,&src,&node).await.unwrap_err();
             assert!(!error.to_string().contains("private history absent"));
             let reads=w.await.unwrap(); let node_reads=n.await.unwrap();
             assert_eq!(reads.len(),6,"case {case}"); assert_eq!(node_reads.len(),3,"case {case}");
@@ -1500,16 +1705,25 @@ mod tests {
     async fn unified_history_keeps_final_chain_actor_operation_source_and_anchor_fences() {
         for case in 0..6 {
             let (src,mut wr,mut nr)=shielded_identity_responses("orchard");
-            match case {
-                0 => { nr[3]=json!("b".repeat(64)); nr.truncate(4); wr.truncate(6); },
-                1 => { wr[10]=json!({"mock_error":{"code":-1,"message":"actor unavailable"}}); wr.truncate(11); nr.truncate(4); },
-                2 => { wr[11][0]["params"]["minconf"]=json!(2); wr.truncate(12); nr.truncate(4); },
-                3 => { wr[6]["walletname"]=json!("other synthetic wallet"); wr.truncate(8); nr.truncate(4); },
-                4 => { wr[14]["bestblockhash"]=json!("b".repeat(64)); nr.truncate(4); },
-                _ => { wr[12]["ismine"]=json!(false); wr.truncate(13); nr.truncate(4); },
-            }
+            let (expected,stage)=match case {
+                0 => { nr[3]=json!("b".repeat(64)); nr.truncate(4); wr.truncate(6);
+                    (ZecdFundingError::ChainMismatch,"signer_history_canonical_check") },
+                1 => { wr[8]=json!({"mock_error":{"code":-1,"message":"actor unavailable"}}); wr.truncate(9); nr.truncate(4);
+                    (ZecdFundingError::NotReady,"signer_actor_read") },
+                2 => { wr[9][0]["params"]["minconf"]=json!(2); wr.truncate(10); nr.truncate(4);
+                    (ZecdFundingError::ConcurrentChange,"signer_final_operation_check") },
+                // Formerly the removed post-signer re-envelope; the wallet
+                // identity fence now lives in the closing envelope only.
+                3 => { wr[11]["walletname"]=json!("other synthetic wallet"); nr.truncate(4);
+                    (ZecdFundingError::ConcurrentChange,"funding_bracket_check") },
+                4 => { wr[12]["bestblockhash"]=json!("b".repeat(64)); nr.truncate(6);
+                    (ZecdFundingError::ChainMismatch,"funding_anchor_canonical_check") },
+                _ => { wr[10]["ismine"]=json!(false); wr.truncate(11); nr.truncate(4);
+                    (ZecdFundingError::UnsupportedSource,"signer_final_source_check") },
+            };
             let (wallet,w)=shielded_mock(wr,case%2==0).await; let (node,n)=mock(nr,None).await;
-            assert!(collect_testnet_funding(&wallet,&src,&node).await.is_err(),"case {case}");
+            let failure=identity_proof_observed(&wallet,&src,&node).await.unwrap_err();
+            assert_eq!((failure.error,failure.stage),(expected,stage),"case {case}");
             w.await.unwrap(); n.await.unwrap();
         }
     }
@@ -1518,13 +1732,13 @@ mod tests {
     async fn identity_receipt_proves_current_signer_without_any_key_use_or_send() {
         let (src,wallet,node)=identity_receipt_responses();
         let (wallet,w)=mock(wallet,None).await; let (node,n)=mock(node,None).await;
-        let evidence=collect_testnet_funding(&wallet,&src,&node).await.unwrap();
+        let evidence=collect_with_identity_proof(&wallet,&src,&node).await.unwrap();
         assert_eq!(evidence.signer_readiness,SignerReadiness::IdentityOperationVerified);
         assert_eq!(evidence.confirmed_eligible_zatoshis,1_200_000_000);
-        let reads=w.await.unwrap(); assert_eq!(reads.len(),14);
-        assert_eq!(reads[9]["method"],"getrawtransaction");
-        assert_eq!(reads[9]["params"],json!(["0".repeat(64),0]));
-        assert_eq!(reads[10]["params"],json!([["opid-00000000-0000-4000-8000-000000000001"]]));
+        let reads=w.await.unwrap(); assert_eq!(reads.len(),12);
+        assert_eq!(reads[7]["method"],"getrawtransaction");
+        assert_eq!(reads[7]["params"],json!(["0".repeat(64),0]));
+        assert_eq!(reads[8]["params"],json!([["opid-00000000-0000-4000-8000-000000000001"]]));
         assert!(reads.iter().all(|r| !matches!(r["method"].as_str().unwrap(),
             "z_sendmany"|"z_getoperationresult"|"walletpassphrase"|"walletlock"|"signmessage")));
         assert_eq!(n.await.unwrap().len(),6);
@@ -1537,27 +1751,24 @@ mod tests {
                 else {identity_receipt_responses()};
             let shift=usize::from(shielded);
             let old_height=wr[2]["blocks"].as_u64().unwrap();
-            for index in [5+shift,12+shift] {wr[index]["enhanced_through"]=json!(old_height+1);}
-            for index in [6+shift,13+shift] {wr[index]=tip(old_height+1,"b");}
-            // This lower value is sampled after historical work; no initial
-            // balance exists which could incorrectly be retained across H+1.
-            wr[7+shift]=json!(1); wr[8+shift]=json!([note("orchard",9,"1")]);
+            // The wallet advances H -> H+1 between the opening and closing envelopes.
+            wr[10+shift]["enhanced_through"]=json!(old_height+1);
+            wr[11+shift]=tip(old_height+1,"b");
+            // The money pair is sampled only after the historical signer work.
+            wr[5+shift]=json!(1); wr[6+shift]=json!([note("orchard",9,"1")]);
             nr[3+shift]=json!(old_height+1); nr[4+shift]=json!("b".repeat(64));
             let (wallet,w)=if shielded {shielded_mock(wr,true).await} else {mock(wr,None).await};
             let (node,n)=mock(nr,None).await;
-            let proof=collect_testnet_funding(&wallet,&src,&node).await.unwrap();
+            let proof=collect_with_identity_proof(&wallet,&src,&node).await.unwrap();
             assert_eq!(proof.confirmed_eligible_zatoshis,100_000_000);
             let reads=w.await.unwrap(); let node_reads=n.await.unwrap();
-            assert_eq!(reads.len(),14+shift); assert_eq!(node_reads.len(),6+shift);
-            assert_eq!(reads[..5].iter().map(|r|r["method"].as_str().unwrap()).collect::<Vec<_>>(),
+            assert_eq!(reads.len(),12+shift); assert_eq!(node_reads.len(),6+shift);
+            assert_eq!(methods(&reads[..5]),
                 vec!["getnetworkinfo","getwalletinfo","getblockchaininfo","getaddressinfo","z_getoperationstatus"]);
-            assert_eq!(reads[5+shift]["method"],"getwalletinfo");
-            assert_eq!(reads[6+shift]["method"],"getblockchaininfo");
-            assert_eq!(reads[9+shift]["method"],"getrawtransaction");
-            assert_eq!(reads[10+shift]["method"],"z_getoperationstatus");
-            assert_eq!(reads[11+shift]["method"],"getaddressinfo");
-            assert_eq!(reads[12+shift]["method"],"getwalletinfo");
-            assert_eq!(reads[13+shift]["method"],"getblockchaininfo");
+            let mut money=methods(&reads[5+shift..7+shift]); money.sort();
+            assert_eq!(money,vec!["getbalance","listunspent"]);
+            assert_eq!(methods(&reads[7+shift..]),vec!["getrawtransaction","z_getoperationstatus",
+                "getaddressinfo","getwalletinfo","getblockchaininfo"]);
             assert_eq!(node_reads[4+shift]["params"],json!([old_height+1]));
             assert_eq!(node_reads[5+shift]["params"],json!([old_height]));
             assert_eq!(reads.iter().filter(|r|r["method"]=="getbalance").count(),1);
@@ -1567,34 +1778,33 @@ mod tests {
 
     #[tokio::test]
     async fn signer_first_rejects_money_reorg_end_readiness_identity_and_final_receipt_changes() {
-        for case in 0..11 {
+        // The former re-envelope cases (walletname / backward height at the
+        // removed signer_final_metadata_check) are dropped with that read; the
+        // same fences are exercised at the closing envelope by cases 1 and 4.
+        for case in 0..9 {
             let (src,mut wr,mut nr)=identity_receipt_responses();
             let (expected,stage)=match case {
-                0 => {let h=wr[13]["blocks"].as_u64().unwrap()+30; wr[13]=tip(h,"b"); wr[12]["enhanced_through"]=json!(h); nr.truncate(3);
+                0 => {let h=wr[11]["blocks"].as_u64().unwrap()+30; wr[11]=tip(h,"b"); wr[10]["enhanced_through"]=json!(h); nr.truncate(3);
                     (ZecdFundingError::ConcurrentChange,"funding_bracket_check")},
-                1 => {let h=wr[13]["blocks"].as_u64().unwrap()-1; wr[13]=tip(h,"b"); wr[12]["enhanced_through"]=json!(h); nr.truncate(3);
+                1 => {let h=wr[11]["blocks"].as_u64().unwrap()-1; wr[11]=tip(h,"b"); wr[10]["enhanced_through"]=json!(h); nr.truncate(3);
                     (ZecdFundingError::ConcurrentChange,"funding_bracket_check")},
-                2 => {wr[12]["scanning"]=json!(true); nr.truncate(3);
+                2 => {wr[10]["scanning"]=json!(true); nr.truncate(3);
                     (ZecdFundingError::NotReady,"closing_metadata_check")},
-                3 => {wr[12]["private_keys_enabled"]=json!(false); nr.truncate(3);
+                3 => {wr[10]["private_keys_enabled"]=json!(false); nr.truncate(3);
                     (ZecdFundingError::NotReady,"closing_metadata_check")},
-                4 => {wr[12]["walletname"]=json!("replacement-wallet"); nr.truncate(3);
+                4 => {wr[10]["walletname"]=json!("replacement-wallet"); nr.truncate(3);
                     (ZecdFundingError::ConcurrentChange,"funding_bracket_check")},
-                5 => {wr[12]["unlocked_until"]=json!(now().unwrap()+3600); nr.truncate(3);
+                5 => {wr[10]["unlocked_until"]=json!(now().unwrap()+3600); nr.truncate(3);
                     (ZecdFundingError::ConcurrentChange,"funding_bracket_check")},
-                6 => {wr[5]["walletname"]=json!("replacement-wallet"); wr.truncate(7); nr.truncate(3);
-                    (ZecdFundingError::ConcurrentChange,"signer_final_metadata_check")},
-                7 => {let h=wr[6]["blocks"].as_u64().unwrap()-1; wr[5]["enhanced_through"]=json!(h); wr[6]=tip(h,"b"); wr.truncate(7); nr.truncate(3);
-                    (ZecdFundingError::ConcurrentChange,"signer_final_metadata_check")},
-                8 => {nr[5]=json!("b".repeat(64));
+                6 => {nr[5]=json!("b".repeat(64));
                     (ZecdFundingError::ChainMismatch,"signer_closing_canonical_check")},
-                9 => {nr[4]=json!("b".repeat(64)); nr.truncate(5);
+                7 => {nr[4]=json!("b".repeat(64)); nr.truncate(5);
                     (ZecdFundingError::ChainMismatch,"funding_anchor_canonical_check")},
-                _ => {wr[10][0]["creation_time"]=json!(1); wr.truncate(11); nr.truncate(3);
+                _ => {wr[8][0]["creation_time"]=json!(1); wr.truncate(9); nr.truncate(3);
                     (ZecdFundingError::ConcurrentChange,"signer_final_operation_check")},
             };
             let (wallet,w)=mock(wr,None).await; let (node,n)=mock(nr,None).await;
-            let failure=collect_testnet_funding_observed(&wallet,&src,&node).await.unwrap_err();
+            let failure=identity_proof_observed(&wallet,&src,&node).await.unwrap_err();
             assert_eq!(failure.error,expected,"case {case}"); assert_eq!(failure.stage,stage,"case {case}");
             w.await.unwrap(); n.await.unwrap();
         }
@@ -1602,7 +1812,7 @@ mod tests {
         // substituted by its earlier post-history canonical check.
         let (src,wr,mut nr)=shielded_identity_responses("orchard"); nr[6]=json!("b".repeat(64));
         let (wallet,w)=shielded_mock(wr,false).await; let (node,n)=mock(nr,None).await;
-        let failure=collect_testnet_funding_observed(&wallet,&src,&node).await.unwrap_err();
+        let failure=identity_proof_observed(&wallet,&src,&node).await.unwrap_err();
         assert_eq!(failure.stage,"signer_closing_canonical_check");
         w.await.unwrap(); n.await.unwrap();
     }
@@ -1611,37 +1821,37 @@ mod tests {
     async fn signer_first_original_timestamp_is_never_restamped_after_historical_work() {
         for finished in [159,100+EVIDENCE_LIFETIME_SECONDS,99] {
             let (src,mut wr,mut nr)=identity_receipt_responses();
-            wr[4][0]["creation_time"]=json!(99); wr[10][0]["creation_time"]=json!(99);
+            wr[4][0]["creation_time"]=json!(99); wr[8][0]["creation_time"]=json!(99);
             nr[0]=json!({"mock_expected_method":"getrawtransaction","mock_delay_ms":30,"mock_result":nr[0]});
             let (wallet,w)=mock(wr,None).await; let (node,n)=mock(nr,None).await;
             let result=TEST_NOW.scope(std::cell::Cell::new(100),async {
-                let (result,())=tokio::join!(collect_testnet_funding_observed(&wallet,&src,&node),async {
+                let (result,())=tokio::join!(identity_proof_observed(&wallet,&src,&node),async {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     TEST_NOW.with(|clock|clock.set(finished));
                 }); result
             }).await;
             if finished==159 {let proof=result.unwrap(); assert_eq!(proof.checked_at_unix,100); assert_eq!(proof.valid_until_unix,100+EVIDENCE_LIFETIME_SECONDS);}
             else {let error=result.unwrap_err(); assert_eq!(error.error,ZecdFundingError::InvalidEvidence); assert_eq!(error.stage,"diagnostic_final_freshness");}
-            assert_eq!(w.await.unwrap().len(),14); assert_eq!(n.await.unwrap().len(),6);
+            assert_eq!(w.await.unwrap().len(),12); assert_eq!(n.await.unwrap().len(),6);
         }
     }
 
     #[tokio::test]
     async fn signer_first_cancellation_drops_pending_money_without_closing_or_restamping() {
         let (src,mut wr,mut nr)=identity_receipt_responses();
-        wr[7]=json!({"mock_hold_money":true,"mock_money_result":wr[7]}); wr.truncate(9); nr.truncate(3);
+        wr[5]=json!({"mock_hold_money":true,"mock_money_result":wr[5]}); wr.truncate(7); nr.truncate(3);
         let (ready,ready_rx)=tokio::sync::oneshot::channel();
         let (wallet,w)=mock_with_money_ready(wr,None,Some(ready)).await; let (node,n)=mock(nr,None).await;
         let observer=FundingStageObserver::default();
         let result={
-            let collector=collect_testnet_funding_observed_with_stage(&wallet,&src,&node,&observer);
+            let collector=identity_proof_observed_with_stage(&wallet,&src,&node,&observer);
             tokio::pin!(collector);
             tokio::select! {ready=ready_rx=>ready.unwrap(), result=&mut collector=>panic!("ended before money barrier: {result:?}")}
             assert_eq!(observer.stage(),"balance_inventory_read");
             tokio::time::timeout(Duration::ZERO,collector).await
         };
         assert!(result.is_err()); assert_eq!(observer.stage(),"balance_inventory_read");
-        let reads=w.await.unwrap(); assert_eq!(reads.len(),9); assert_eq!(n.await.unwrap().len(),3);
+        let reads=w.await.unwrap(); assert_eq!(reads.len(),7); assert_eq!(n.await.unwrap().len(),3);
         assert_eq!(reads.iter().filter(|r|r["method"]=="getrawtransaction").count(),0);
         assert_eq!(reads.iter().filter(|r|r["method"]=="z_getoperationstatus").count(),1);
         assert_eq!(COLLECTION_TIMEOUT_SECONDS,45); assert_eq!(EVIDENCE_LIFETIME_SECONDS,600);
@@ -1655,27 +1865,28 @@ mod tests {
             let shift=usize::from(shielded);
             // The daemon's retained operation, source and status would all
             // still pass even if the actor stopped during the money reads.
-            assert_eq!(wr[4],wr[10+shift]);
-            assert_eq!(wr[1],wr[12+shift]);
-            let h=wr[13+shift]["blocks"].as_u64().unwrap();
-            assert!(wallet_metadata(&wr[12+shift],h,now().unwrap()+60).is_ok());
-            assert!(source_owned(&wr[11+shift],&src).is_ok());
-            wr[8+shift]=json!({"mock_delay_ms":20,"mock_result":wr[8+shift]});
-            wr[9+shift]=json!({"mock_expected_method":"getrawtransaction",
+            assert_eq!(wr[4],wr[8+shift]);
+            assert_eq!(wr[1],wr[10+shift]);
+            let h=wr[11+shift]["blocks"].as_u64().unwrap();
+            assert!(wallet_metadata(&wr[10+shift],h,now().unwrap()+60).is_ok());
+            assert!(source_owned(&wr[9+shift],&src).is_ok());
+            wr[6+shift]=json!({"mock_delay_ms":20,"mock_result":wr[6+shift]});
+            wr[7+shift]=json!({"mock_expected_method":"getrawtransaction",
                 "mock_result":{"mock_error":{"code":-1,"message":"synthetic actor stopped"}}});
-            wr.truncate(10+shift); nr.truncate(3+shift);
+            wr.truncate(8+shift); nr.truncate(3+shift);
             let (wallet,w)=if shielded {shielded_mock(wr,false).await} else {mock(wr,None).await};
             let (node,n)=mock(nr,None).await;
-            let failure=collect_testnet_funding_observed(&wallet,&src,&node).await.unwrap_err();
+            let failure=identity_proof_observed(&wallet,&src,&node).await.unwrap_err();
             assert_eq!(failure,FundingObservedError {error:ZecdFundingError::NotReady,
                 stage:"signer_actor_read",category:"wallet_not_ready"});
             let reads=w.await.unwrap();
-            assert_eq!(reads.len(),10+shift);
+            assert_eq!(reads.len(),8+shift);
             assert_eq!(reads.last().unwrap()["params"],json!(["0".repeat(64),0]));
             assert_eq!(reads.iter().filter(|r|r["method"]=="getrawtransaction").count(),1);
             assert_eq!(reads.iter().filter(|r|r["method"]=="z_getoperationstatus").count(),1);
             assert_eq!(reads.iter().filter(|r|r["method"]=="getaddressinfo").count(),1);
-            assert_eq!(reads.iter().filter(|r|r["method"]=="getwalletinfo").count(),2);
+            // Only the opening envelope; the post-signer re-envelope is gone.
+            assert_eq!(reads.iter().filter(|r|r["method"]=="getwalletinfo").count(),1);
             assert_eq!(n.await.unwrap().len(),3+shift);
         }
     }
@@ -1689,10 +1900,10 @@ mod tests {
             newer["creation_time"]=json!(now().unwrap());
             if same_time {old["creation_time"]=newer["creation_time"].clone();}
             old["result"]["txid"]=json!("b".repeat(64));
-            wr[10]=json!([newer.clone()]);
+            wr[8]=json!([newer.clone()]);
             wr[4]=if reverse {json!([newer,old])} else {json!([old,newer])};
             let (wallet,w)=mock(wr,None).await; let (node,n)=mock(nr,None).await;
-            assert!(collect_testnet_funding(&wallet,&src,&node).await.is_ok());
+            assert!(collect_with_identity_proof(&wallet,&src,&node).await.is_ok());
             let reads=n.await.unwrap(); assert_eq!(reads.len(),6);
             assert_ne!(reads[0]["params"][0],json!("b".repeat(64)));
             assert_eq!(reads.iter().filter(|r|r["method"]=="getrawtransaction").count(),1);
@@ -1710,19 +1921,19 @@ mod tests {
             missing["id"]=json!("opid-00000000-0000-4000-8000-000000000003");
             missing["creation_time"]=json!(now().unwrap());
             missing["result"]["txid"]=json!("b".repeat(64));
-            wr[10+usize::from(shielded)]=json!([selected.clone()]);
+            wr[8+usize::from(shielded)]=json!([selected.clone()]);
             wr[4]=json!([selected,missing]);
             nr.insert(0,json!({"mock_error":{"code":-5,"message":"synthetic absent"}}));
             let (wallet,w)=if shielded {shielded_mock(wr,false).await} else {mock(wr,None).await};
             let (node,n)=mock(nr,None).await;
-            let proof=collect_testnet_funding_observed(&wallet,&src,&node).await
+            let proof=identity_proof_observed(&wallet,&src,&node).await
                 .unwrap_or_else(|error|panic!("shielded={shielded}, stage={}, category={}",error.stage,error.category));
             assert_eq!(proof.signer_readiness,SignerReadiness::IdentityOperationVerified);
             let reads=n.await.unwrap();
             assert_eq!(reads[0]["params"],json!(["b".repeat(64),1]));
             assert_eq!(reads.iter().filter(|r|r["method"]=="getrawtransaction").count(),2);
             let wallet_reads=w.await.unwrap();
-            assert_eq!(wallet_reads.len(),14+usize::from(shielded));
+            assert_eq!(wallet_reads.len(),12+usize::from(shielded));
             assert_eq!(wallet_reads.iter().filter(|r|r["method"]=="getrawtransaction").count(),1);
         }
     }
@@ -1737,7 +1948,7 @@ mod tests {
         wr[4]=json!(ops); wr.truncate(5);
         let absent=json!({"mock_error":{"code":-5,"message":"synthetic absent"}});
         let (wallet,w)=mock(wr,None).await; let (node,n)=mock(vec![absent;3],None).await;
-        let error=collect_testnet_funding(&wallet,&src,&node).await.unwrap_err();
+        let error=collect_with_identity_proof(&wallet,&src,&node).await.unwrap_err();
         assert_eq!(error,ZecdFundingError::IdentitySignerNotProven);
         let reads=n.await.unwrap(); assert_eq!(reads.len(),3);
         for (i,read) in reads.iter().enumerate() {assert_eq!(read["params"],json!([format!("{:064x}",i+1),1]));}
@@ -1755,17 +1966,17 @@ mod tests {
             older["creation_time"]=json!(now().unwrap()-1);
             older["id"]=json!("opid-00000000-0000-4000-8000-000000000003");
             older["result"]["txid"]=json!("b".repeat(64));
-            wr[4]=json!([older,selected.clone()]); wr[10+usize::from(shielded)]=json!([selected]);
+            wr[4]=json!([older,selected.clone()]); wr[8+usize::from(shielded)]=json!([selected]);
             match case {
                 0=>{nr[1]["tx"]=json!(["b".repeat(64)]);nr.truncate(2);wr.truncate(5);},
                 1=>{nr[2]=json!("b".repeat(64));nr.truncate(3);wr.truncate(5);},
                 2=>{nr[0]["hex"]=json!("invalid");nr.truncate(3);wr.truncate(5);},
                 3=>{wr[5]["blockhash"]=json!("b".repeat(64));nr.truncate(3);wr.truncate(6);},
-                _=>{wr[10]=json!([]);wr.truncate(11);nr.truncate(3);},
+                _=>{wr[8]=json!([]);wr.truncate(9);nr.truncate(3);},
             }
             let (wallet,w)=if shielded {shielded_mock(wr,false).await} else {mock(wr,None).await};
             let (node,n)=mock(nr,None).await;
-            assert!(collect_testnet_funding(&wallet,&src,&node).await.is_err(),"case {case}");
+            assert!(collect_with_identity_proof(&wallet,&src,&node).await.is_err(),"case {case}");
             let reads=n.await.unwrap();
             assert_eq!(reads.iter().filter(|r|r["method"]=="getrawtransaction").count(),1,"case {case}");
             w.await.unwrap();
@@ -1780,17 +1991,17 @@ mod tests {
             let mut absent=selected.clone();absent["creation_time"]=json!(99);
             absent["id"]=json!("opid-00000000-0000-4000-8000-000000000002");
             absent["result"]["txid"]=json!("b".repeat(64));
-            wr[4]=json!([selected.clone(),absent]);wr[10]=json!([selected]);
+            wr[4]=json!([selected.clone(),absent]);wr[8]=json!([selected]);
             nr.insert(0,json!({"mock_delay_ms":30,"mock_result":{"mock_error":{"code":-5,"message":"synthetic absent"}}}));
             let (wallet,w)=mock(wr,None).await;let (node,n)=mock(nr,None).await;
             let result=TEST_NOW.scope(std::cell::Cell::new(100),async {
-                let (result,())=tokio::join!(collect_testnet_funding(&wallet,&src,&node),async {
+                let (result,())=tokio::join!(collect_with_identity_proof(&wallet,&src,&node),async {
                     tokio::time::sleep(Duration::from_millis(5)).await;TEST_NOW.with(|clock|clock.set(finished));
                 });result
             }).await;
             if finished==159 {let proof=result.unwrap();assert_eq!(proof.checked_at_unix,100);assert_eq!(proof.valid_until_unix,100+EVIDENCE_LIFETIME_SECONDS);}
             else {assert_eq!(result,Err(ZecdFundingError::InvalidEvidence));}
-            assert_eq!(w.await.unwrap().len(),14);assert_eq!(n.await.unwrap().len(),7);
+            assert_eq!(w.await.unwrap().len(),12);assert_eq!(n.await.unwrap().len(),7);
         }
     }
 
@@ -1812,7 +2023,7 @@ mod tests {
         });
         let observer=FundingStageObserver::default();
         let result={
-            let collector=collect_testnet_funding_observed_with_stage(&wallet,&src,&node,&observer);tokio::pin!(collector);
+            let collector=identity_proof_observed_with_stage(&wallet,&src,&node,&observer);tokio::pin!(collector);
             tokio::select! {ready=ready_rx=>ready.unwrap(),result=&mut collector=>panic!("ended before discovery barrier: {result:?}")}
             assert_eq!(observer.stage(),"signer_raw_read");tokio::time::timeout(Duration::ZERO,collector).await
         };
@@ -1839,11 +2050,11 @@ mod tests {
             assert!(operation_amounts(&newer,&src,now().unwrap()).is_err());
             wr[4]=if reverse {json!([newer,older])} else {json!([older,newer])};
             let (wallet,w)=mock(wr,None).await; let (node,n)=mock(nr,None).await;
-            let proof=collect_testnet_funding(&wallet,&src,&node).await.unwrap();
+            let proof=collect_with_identity_proof(&wallet,&src,&node).await.unwrap();
             assert_eq!(proof.signer_readiness,SignerReadiness::IdentityOperationVerified);
             let reads=w.await.unwrap();
-            assert_eq!(reads.len(),14);
-            assert_eq!(reads[10]["params"],json!([["opid-00000000-0000-4000-8000-000000000001"]]));
+            assert_eq!(reads.len(),12);
+            assert_eq!(reads[8]["params"],json!([["opid-00000000-0000-4000-8000-000000000001"]]));
             assert_eq!(n.await.unwrap().len(),6);
         }
     }
@@ -1855,7 +2066,7 @@ mod tests {
         let mut malformed=wr[4][0].clone(); malformed["result"]=json!({"txid":"invalid"});
         wr[4]=json!([unsupported,malformed]); wr.truncate(5); nr.clear();
         let (wallet,w)=mock(wr,None).await; let (node,n)=mock(nr,None).await;
-        assert_eq!(collect_testnet_funding(&wallet,&src,&node).await,
+        assert_eq!(collect_with_identity_proof(&wallet,&src,&node).await,
             Err(ZecdFundingError::IdentitySignerNotProven));
         assert_eq!(w.await.unwrap().len(),5);
         assert_eq!(n.await.unwrap().len(),0);
@@ -1881,7 +2092,7 @@ mod tests {
                 _=>nr[0]["confirmations"]=json!("1"),
             }
             let (wallet,w)=mock(wr,None).await; let (node,n)=mock(nr,None).await;
-            assert!(collect_testnet_funding(&wallet,&src,&node).await.is_err(),"case {case}");
+            assert!(collect_with_identity_proof(&wallet,&src,&node).await.is_err(),"case {case}");
             assert_eq!(w.await.unwrap().len(),5);
             let reads=n.await.unwrap(); assert_eq!(reads.len(),1,"case {case}");
             assert_ne!(reads[0]["params"],json!(["b".repeat(64),1]));
@@ -1894,18 +2105,20 @@ mod tests {
             let (src,mut wr,mut nr)=identity_receipt_responses();
             match case {
                 0 => { wr[4]=json!([]); wr.truncate(5); nr.clear(); },
-                1 => { wr[10]=json!([]); wr.truncate(11); nr.truncate(3); },
-                2 => { wr[9]=json!({"mock_error":{"code":-1,"message":"actor unavailable"}}); wr.truncate(10); nr.truncate(3); },
-                3 => { wr[10][0]["params"]["minconf"]=json!(2); wr.truncate(11); nr.truncate(3); },
+                1 => { wr[8]=json!([]); wr.truncate(9); nr.truncate(3); },
+                2 => { wr[7]=json!({"mock_error":{"code":-1,"message":"actor unavailable"}}); wr.truncate(8); nr.truncate(3); },
+                3 => { wr[8][0]["params"]["minconf"]=json!(2); wr.truncate(9); nr.truncate(3); },
                 4 => { nr[0]["txid"]=json!("b".repeat(64)); nr.truncate(1); wr.truncate(5); },
                 5 => { wr[4][0]["params"]["amounts"][0]["amount"]=json!(0.002); wr.truncate(5); nr.truncate(3); },
                 6 => { nr[1]["tx"]=json!(["b".repeat(64)]); nr.truncate(2); wr.truncate(5); },
                 7 => { nr[2]=json!("b".repeat(64)); nr.truncate(3); wr.truncate(5); },
-                8 => { wr[5]["unlocked_until"]=json!(0); wr.truncate(7); nr.truncate(3); },
-                _ => { wr[6]=tip(2_000_000,"b"); wr.truncate(7); nr.truncate(3); },
+                // Formerly the removed post-signer re-envelope: an expired
+                // unlock / absurd tip jump is now caught at the closing envelope.
+                8 => { wr[10]["unlocked_until"]=json!(0); nr.truncate(3); },
+                _ => { wr[11]=tip(2_000_000,"b"); wr[10]["enhanced_through"]=json!(2_000_000); nr.truncate(3); },
             }
             let (wallet,w)=mock(wr,None).await; let (node,n)=mock(nr,None).await;
-            assert!(collect_testnet_funding(&wallet,&src,&node).await.is_err(),"case {case}");
+            assert!(collect_with_identity_proof(&wallet,&src,&node).await.is_err(),"case {case}");
             w.await.unwrap(); n.await.unwrap();
         }
     }
