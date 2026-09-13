@@ -102,6 +102,24 @@ impl PoolDb {
         Ok(())
     }
 
+    /// True when this database holds a PPS epoch (`pps_meta` exists and has a row).
+    /// A PPLNS/solo build must never run on it: it would pay PPLNS over shares
+    /// already credited under PPS.
+    pub async fn pps_epoch_present(&self) -> Result<bool, DbError> {
+        let table: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pps_meta'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if table.0 == 0 {
+            return Ok(false);
+        }
+        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pps_meta")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(rows.0 > 0)
+    }
+
     /// Audit #16: aggregate full UTC hours of shares older than
     /// `older_than_days` into `shares_rollup` and delete the raw rows — one
     /// hour per BEGIN IMMEDIATE transaction (atomic: rollup and delete land

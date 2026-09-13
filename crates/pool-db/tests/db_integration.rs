@@ -780,3 +780,25 @@ async fn test_get_reserved_attempts_lifecycle() {
     db.confirm_payout(attempt, "txid1").await.unwrap();
     assert!(db.get_reserved_attempts(None).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn pps_epoch_presence_is_detected_only_when_pps_meta_has_a_row() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let db = PoolDb::new(pool.clone());
+    db.run_migrations().await.unwrap();
+    assert!(!db.pps_epoch_present().await.unwrap());
+    sqlx::query("CREATE TABLE pps_meta (singleton INTEGER PRIMARY KEY, active_epoch TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!db.pps_epoch_present().await.unwrap());
+    sqlx::query("INSERT INTO pps_meta VALUES (1, 'synthetic-epoch')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(db.pps_epoch_present().await.unwrap());
+}

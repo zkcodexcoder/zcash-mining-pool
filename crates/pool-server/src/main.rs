@@ -274,6 +274,11 @@ async fn main() -> Result<()> {
     db.assert_critical_schema()
         .await
         .with_context(|| "Critical schema verification failed — refusing to start")?;
+    // This build pays PPLNS/solo. Refuse a database that holds a PPS epoch,
+    // whatever [pplns] mode says, or it would re-pay shares PPS already credited.
+    if db.pps_epoch_present().await.with_context(|| "PPS epoch check failed — refusing to start")? {
+        anyhow::bail!("this database holds a PPS epoch; this PPLNS/solo build refuses to run on it");
+    }
     db.set_wal_mode()
         .await
         .with_context(|| "Failed to enable WAL mode")?;
