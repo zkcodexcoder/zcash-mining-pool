@@ -364,6 +364,9 @@ impl PoolDb {
                AND NOT EXISTS (SELECT 1 FROM payout_items pi WHERE pi.attempt_id = payout_attempts.id)
                AND NOT EXISTS (SELECT 1 FROM pps_payout_items pi WHERE pi.attempt_id = payout_attempts.id)
                AND NOT EXISTS (SELECT 1 FROM pps_conventional_attempts ca WHERE ca.attempt_id = payout_attempts.id)
+               -- Audit B25: a PPS attempt keeps its fee reservation after its items settle
+               -- into pps_payouts; the legacy sweep must never adopt it.
+               AND NOT EXISTS (SELECT 1 FROM pps_fee_reservations f WHERE f.attempt_id = payout_attempts.id)
              ORDER BY id ASC",
         )
         .bind(stale_minutes)

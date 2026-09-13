@@ -205,7 +205,12 @@ pub(crate) async fn process(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRp
     let _workflow=WORKFLOW.lock().await;
     // Never return raw RPC data, addresses, or SQL errors to payout-health logs.
     process_inner(db,wallet,node,from,minimum,policy,chain,route).await
-        .map_err(|_| anyhow::anyhow!("testnet PPS payout held; funding, wallet or transaction gate failed"))
+        .map_err(|error| {
+            if let Some(held) = error.downcast_ref::<PpsHeld>() {
+                tracing::warn!(stage = held.stage, category = held.category, "PPS conventional payout round held");
+            }
+            anyhow::anyhow!("testnet PPS payout held; funding, wallet or transaction gate failed")
+        })
 }
 
 /// zecd flips not-ready after almost every block, and a block arriving during
@@ -406,9 +411,12 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
     }).await?;
     // No fallback and no transport retry. Even a reported RPC failure can
     // follow submission. All errors after this one-shot fence retain funds.
-    let sent=rpc(wallet,"z_sendmany",json!([from,recipients,10,null,"AllowRevealedRecipients"])).await?;
-    let opid=sent.as_str().filter(|v|valid_opid(v)).context("PPS operation ID invalid")?;
-    db.record_pps_conventional_operation(attempt,&bound.intent_id,opid).await?;
+    let sent=rpc(wallet,"z_sendmany",json!([from,recipients,10,null,"AllowRevealedRecipients"])).await
+        .inspect_err(|_| tracing::warn!(attempt, stage = "send", "PPS conventional send outcome unknown; attempt held"))?;
+    let opid=sent.as_str().filter(|v|valid_opid(v)).context("PPS operation ID invalid")
+        .inspect_err(|_| tracing::warn!(attempt, stage = "operation_id", "PPS conventional send returned no valid operation; attempt held"))?;
+    db.record_pps_conventional_operation(attempt,&bound.intent_id,opid).await
+        .inspect_err(|_| tracing::warn!(attempt, stage = "record_operation", "PPS conventional operation not recorded; attempt held"))?;
     Ok(Some((attempt, opid.to_string())))
 }
 
@@ -420,15 +428,49 @@ pub(crate) async fn reconcile_one(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashR
 {
     let _workflow=WORKFLOW.lock().await;
     reconcile_inner(db,wallet,node,policy,chain,attempt).await
-        .map_err(|_|anyhow::anyhow!("testnet PPS reconciliation held; exact outcome unproven"))
+        .map_err(|error| anyhow::Error::new(error.downcast_ref::<PpsHeld>().copied()
+            .unwrap_or(PpsHeld { stage: "reconcile", category: "unclassified" })))
 }
+
+/// A reconciliation that stopped short of settling: which step and why, without
+/// addresses, amounts, operation ids or raw RPC/SQL text. The attempt's
+/// principal and fee stay held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PpsHeld {
+    pub stage: &'static str,
+    pub category: &'static str,
+}
+impl std::fmt::Display for PpsHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PPS payout held at {} ({})", self.stage, self.category)
+    }
+}
+impl std::error::Error for PpsHeld {}
 
 async fn reconcile_inner(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
     policy:&PpsPolicy,chain:&PpsGate,attempt:i64) -> Result<usize>
 {
+    let mut stage = "start";
+    match reconcile_steps(db,wallet,node,policy,chain,attempt,&mut stage).await {
+        Ok(settled) => Ok(settled),
+        Err(error) => {
+            let held = PpsHeld { stage, category: pre_send_error_category(&error) };
+            tracing::warn!(attempt, stage = held.stage, category = held.category,
+                "PPS conventional payout held at reconciliation");
+            Err(anyhow::Error::new(held))
+        }
+    }
+}
+
+async fn reconcile_steps(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
+    policy:&PpsPolicy,chain:&PpsGate,attempt:i64,stage:&mut &'static str) -> Result<usize>
+{
+    *stage="policy";
     policy.validate("testnet").map_err(anyhow::Error::msg)?;
     chain.fresh_lease().await?;
+    *stage="epoch";
     db.verify_pps_epoch(&policy.epoch_config()).await?;
+    *stage="attempt";
     let row=db.get_pps_conventional_attempt(attempt).await?.context("PPS attempt missing")?;
     let intent=row.intent()?.context("PPS historical intent missing; held")?;
     anyhow::ensure!(intent.epoch==policy.epoch && intent.network==policy.network,"PPS epoch binding mismatch");
@@ -438,10 +480,12 @@ async fn reconcile_inner(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
         db.refund_pps_payout(attempt).await?;
         return Ok(0);
     }
+    *stage="operation";
     let opid=row.operation_id.as_deref().filter(|v|valid_opid(v)).context("PPS lost operation; held")?;
     let txid=match row.expected_txid {
         Some(ref t)=>crate::wallet_operation::normalize_txid(t)?,
         None=>{
+            *stage="operation_status";
             let response=rpc(wallet,"z_getoperationstatus",json!([[opid]])).await?;
             let statuses=response.as_array().context("PPS operation schema")?;
             anyhow::ensure!(statuses.len()==1 && statuses[0].get("id").and_then(Value::as_str)==Some(opid),
@@ -456,6 +500,7 @@ async fn reconcile_inner(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
             txid
         }
     };
+    *stage="transaction";
     let raw=rpc(node,"getrawtransaction",json!([txid,1])).await?;
     // Stay reserved (soft return, retried next cycle) until the tx is buried
     // PPS_SETTLE_MATURITY-deep in our node's active chain; only then settle.
@@ -464,6 +509,7 @@ async fn reconcile_inner(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
     anyhow::ensure!(crate::wallet_operation::normalize_txid(raw_txid)?==txid,"PPS raw txid mismatch");
     let blockhash=raw.get("blockhash").and_then(Value::as_str).context("PPS block missing")?;
     crate::wallet_operation::normalize_txid(blockhash)?;
+    *stage="inclusion";
     let block=rpc(node,"getblock",json!([blockhash,1])).await?;
     let height=block.get("height").and_then(Value::as_u64).context("PPS height missing")?;
     anyhow::ensure!(block.get("hash").and_then(Value::as_str)==Some(blockhash)
@@ -471,17 +517,20 @@ async fn reconcile_inner(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
         && block.get("tx").and_then(Value::as_array).is_some_and(|txs|
             txs.iter().filter(|t|t.as_str()==Some(txid.as_str())).count()==1),
         "PPS transaction inclusion unproven");
+    *stage="canonical";
     let canonical=rpc(node,"getblockhash",json!([height])).await?;
     anyhow::ensure!(canonical.as_str()==Some(blockhash),"PPS block no longer canonical");
     let hex=raw.get("hex").and_then(Value::as_str).context("PPS raw bytes missing")?;
     // Canonical raw policy breaches must reach the durable HALT even when the
     // wallet is unavailable. For shielded intents this raw-only API returns
     // WalletHistory only after all independent raw checks have passed.
+    *stage="verification";
     let outcome=match verify_conventional_payout(hex,&txid,&expected) {
         Err(node_rpc::zecd_conventional::ConventionalError::WalletHistory)
             if expected.requires_wallet_history() => {
             // Completion through this payout's block is sufficient; reconciliation
             // needs no unlocked signer and does not require catching a moving tip.
+            *stage="wallet_history";
             let info=rpc(wallet,"getwalletinfo",json!([])).await?;
             wallet_history_ready(&info,height)?;
             let history=rpc(wallet,"gettransaction",json!([txid])).await?;
@@ -505,13 +554,16 @@ async fn reconcile_inner(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
                 // variants also default to HOLD, never refund or resend.
                 _=>anyhow::bail!("PPS canonical raw transaction unproven; held"),
             };
+            *stage="financial_halt";
             db.halt_pps_conventional_payout(attempt,category).await?;
             anyhow::bail!("PPS canonical transaction violated wallet contract; financial halt");
         }
     };
+    *stage="final_canonical";
     chain.fresh_lease().await?;
     let canonical=rpc(node,"getblockhash",json!([height])).await?;
     anyhow::ensure!(canonical.as_str()==Some(blockhash),"PPS block changed during verification");
+    *stage="settle";
     let settled=db.confirm_pps_conventional_payout(attempt,verified.txid(),verified.actual_fee_zatoshis()).await?;
     Ok(usize::try_from(settled)?)
 }

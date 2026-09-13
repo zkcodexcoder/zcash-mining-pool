@@ -190,7 +190,21 @@ impl Reconciler {
                         &self.node_rpc,policy,gate,row.attempt_id).await {
                         Ok(count) if count>0 => { summary.attempts_resolved+=1; summary.late_confirmed+=1; },
                         Ok(_) => {},
-                        Err(_) => summary.alerts.push("Testnet PPS exact outcome unproven; funds held".into()),
+                        Err(error) => {
+                            // Audit B25: say which attempt, for how long and at which step,
+                            // never addresses, amounts or raw RPC/SQL text.
+                            let held = error.downcast_ref::<crate::pps_conventional::PpsHeld>().copied()
+                                .unwrap_or(crate::pps_conventional::PpsHeld { stage: "reconcile", category: "unclassified" });
+                            let age: Option<i64> = sqlx::query_scalar(
+                                "SELECT CAST((julianday('now') - julianday(created_at)) * 1440 AS INTEGER) \
+                                 FROM payout_attempts WHERE id=?1")
+                                .bind(row.attempt_id).fetch_optional(self.db.inner()).await.ok().flatten();
+                            summary.alerts.push(format!(
+                                "Testnet PPS attempt {} held for {} at {} ({}); funds held, no automatic action",
+                                row.attempt_id,
+                                age.map_or_else(|| "an unknown time".to_string(), |m| format!("{m} min")),
+                                held.stage, held.category));
+                        }
                     }
                 },
                 Err(_) => summary.alerts.push("Testnet PPS journal unavailable; held".into()),

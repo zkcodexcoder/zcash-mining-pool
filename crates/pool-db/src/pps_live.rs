@@ -2481,6 +2481,21 @@ mod tests {
         assert_eq!(f.db.get_total_shares_count().await.unwrap(), 1);
     }
     #[tokio::test]
+    async fn legacy_stale_sweep_never_adopts_a_pps_attempt() {
+        let f = setup(true, 1_000_000).await;
+        let fixture = format!(
+            "INSERT INTO payout_attempts(id,status,created_at) VALUES
+               (801,'sent',datetime('now','-2 hours')),(802,'sent',datetime('now','-2 hours'));
+             INSERT INTO pps_fee_reservations(attempt_id,proposal_id,fee_zats,status) VALUES(802,'{p}',1,'reserved');",
+            p = "e".repeat(64),
+        );
+        sqlx::raw_sql(&fixture).execute(f.db.inner()).await.unwrap();
+        let stale: Vec<i64> = f.db.get_stale_payout_attempts(60).await.unwrap()
+            .into_iter().map(|a| a.0).collect();
+        // The legacy attempt is swept; the PPS attempt (fee reservation) is not.
+        assert_eq!(stale, vec![801]);
+    }
+    #[tokio::test]
     async fn pending_payouts_come_least_recently_paid_first() {
         let f = setup(true, 1_000_000).await;
         let never = f.db.get_or_create_miner("never-paid").await.unwrap().id;

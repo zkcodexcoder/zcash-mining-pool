@@ -1286,3 +1286,23 @@ async fn conventional_stuck_attempt_is_quarantined_while_other_miners_are_paid()
     assert_eq!((sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis), (0, 2 * CREDIT, 0));
     assert_eq!(rpc.forbidden_calls(), 0);
 }
+
+
+#[tokio::test]
+async fn conventional_held_reconciliation_reports_its_step_without_details() {
+    let f = Fixture::new().await;
+    let rpc = MockRpc::new(&f.db).await;
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    let attempt = f.attempt().await;
+    rpc.state.lock().unwrap().operation = json!([{"id":"opid-synthetic-1","status":"failed"}]);
+    let error = reconcile(&f, &rpc, attempt.attempt_id).await.unwrap_err();
+    let held = error
+        .downcast_ref::<crate::pps_conventional::PpsHeld>()
+        .copied()
+        .expect("a typed held outcome");
+    assert_eq!(held.stage, "operation_status");
+    let text = error.to_string();
+    assert!(text.contains("operation_status"), "{text}");
+    assert!(!text.contains(RECIPIENT) && !text.contains("synthetic") && !text.contains(TXID), "{text}");
+    assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, CREDIT);
+}
