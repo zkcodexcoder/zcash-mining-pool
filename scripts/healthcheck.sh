@@ -173,7 +173,8 @@ TN=$(ssh -i /home/zebra/.ssh/zebra_host -o BatchMode=yes -o ConnectTimeout=8 "ze
   'systemctl is-active zcash-pool zcash-dashboard zallet | tr "\n" " "; echo
    df --output=pcent / | tail -1 | tr -dc 0-9; echo
    systemctl show zallet -p NRestarts --value
-   tail -c 300000 ~/zallet.log 2>/dev/null | grep -cE "note commitment tree|Inserted root conflicts"' 2>/dev/null)
+   tail -c 300000 ~/zallet.log 2>/dev/null | grep -cE "note commitment tree|Inserted root conflicts"
+   sqlite3 ~/zcash-mining-pool/pool-pps.db "SELECT value FROM pool_status WHERE key=\"pps_credit_health\"" 2>/dev/null | head -1; echo' 2>/dev/null)
 if [ -n "$TN" ]; then
   report testnet_ssh 1 "" "✅ recovered: testnet_ssh"
   TSVC=$(echo "$TN" | sed -n 1p)
@@ -191,6 +192,18 @@ if [ -n "$TN" ]; then
   TNTREE=$(echo "$TN" | sed -n 4p)
   report tn_zallet_tree_corruption "$([ "${TNTREE:-0}" = "0" ] && echo 1 || echo 0)" \
     "[testnet] zallet NOTE-TREE CORRUPTION in log ($TNTREE hits) — fix: 'zallet repair truncate-wallet <min-allowed-height>'"
+  # PPS chain agreement is a WARNING ONLY: shares keep crediting and payouts keep
+  # flowing. This tells a human the node and the reference explorers disagree or
+  # the references are unreachable. Skipped without a fresh (<5 min) health sample.
+  TNH=$(echo "$TN" | sed -n 5p)
+  TSAMP=$(echo "$TNH" | grep -o '"sampled_at_unix":[0-9]*' | cut -d: -f2)
+  if [ -n "$TSAMP" ] && [ $((NOW - TSAMP)) -le 300 ]; then
+    TCV=$(echo "$TNH" | grep -o '"chain_expiry_valid":[a-z]*' | cut -d: -f2)
+    TCE=$(echo "$TNH" | grep -o '"chain_expires_at_unix":[0-9]*' | cut -d: -f2)
+    report tn_pps_chain "$([ "$TCV" = true ] && [ "${TCE:-0}" -gt "$NOW" ] && echo 1 || echo 0)" \
+      "[testnet] WARNING (no action taken): PPS chain agreement unproven — node vs testnet.zec.rocks/cipherscan disagree or are unreachable; shares still credited, payouts continue" \
+      "✅ [testnet] PPS chain agreement restored"
+  fi
 else
   report testnet_ssh 0 "[testnet] pool box unreachable over SSH"
 fi
