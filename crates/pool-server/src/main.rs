@@ -769,7 +769,7 @@ mod tests {
         assert_eq!(validate_pps_funding_route(None,None).unwrap(), PpsFundingRoute::ZalletPczt);
         let mut policy = PpsPolicy { network:"testnet".into(), epoch:"testnet-canary".into(),
             fee_bps:100, max_liability_zatoshis:95_000_000_000, total_exposure_zatoshis:100_000_000_000,
-            fee_allowance_zatoshis:5_000_000_000, reserve_min_zatoshis:1, max_payout_zatoshis:1_000_000 };
+            fee_allowance_zatoshis:5_000_000_000, reserve_min_zatoshis:1, max_payout_zatoshis:1_000_000, settle_confirmations:10 };
         assert_eq!(validate_pps_funding_route(Some(&policy), Some(route)).unwrap(), route);
         assert_eq!(policy.fee_bps,100); // The route never rewrites the existing pool fee.
         policy.network="mainnet".into();
@@ -826,7 +826,7 @@ mod tests {
         let policy = PpsPolicy { network: "testnet".into(), epoch: "canary-1".into(),
             fee_bps: 100, max_liability_zatoshis: 100_000_000, reserve_min_zatoshis: 10_000_000,
             total_exposure_zatoshis: 110_000_000, fee_allowance_zatoshis: 10_000_000,
-            max_payout_zatoshis: 20_000_000 };
+            max_payout_zatoshis: 20_000_000, settle_confirmations: 10 };
         assert!(validate_pps_config(RewardMode::Pplns, Some(&policy), "testnet").is_err());
         assert!(validate_pps_config(RewardMode::Pps, Some(&policy), "mainnet").is_err());
         assert!(validate_pps_config(RewardMode::Pps, Some(&policy), "testnet").is_ok());

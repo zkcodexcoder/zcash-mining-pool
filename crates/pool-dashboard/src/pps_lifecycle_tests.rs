@@ -39,6 +39,7 @@ async fn fixture(address: &str) -> (PoolDb, sqlx::SqlitePool, PpsPolicy, i64) {
         fee_allowance_zatoshis: 10_000_000,
         reserve_min_zatoshis: 10_000_000,
         max_payout_zatoshis: 20_000_000,
+        settle_confirmations: 10,
     };
     db.initialize_pps_epoch(&policy.epoch_config(), Some(&funding(&db, &policy).await))
         .await

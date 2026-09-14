@@ -133,6 +133,7 @@ impl Fixture {
             fee_allowance_zatoshis: 5_000_000_000,
             reserve_min_zatoshis: 1,
             max_payout_zatoshis: CREDIT,
+            settle_confirmations: pool_db::pps_policy::DEFAULT_SETTLE_CONFIRMATIONS,
         };
         db.initialize_pps_epoch(&policy.epoch_config(), Some(&funding(&db, &policy).await))
             .await
@@ -692,9 +693,11 @@ async fn conventional_reserve_seal_once_send_and_exact_confirmed_settlement() {
 }
 
 #[tokio::test]
-async fn conventional_settlement_waits_for_maturity_depth() {
-    use crate::pps_conventional::PPS_SETTLE_MATURITY;
-    let f = Fixture::new().await;
+async fn conventional_settlement_waits_for_the_configured_depth() {
+    // The depth comes from [payout] pps_settle_confirmations (5 on testnet).
+    const PPS_SETTLE_MATURITY: u64 = 5;
+    let mut f = Fixture::new().await;
+    f.policy.settle_confirmations = PPS_SETTLE_MATURITY;
     let rpc = MockRpc::new(&f.db).await;
     rpc.success();
     // The send lands but is only one block deep: reserved, not settled.

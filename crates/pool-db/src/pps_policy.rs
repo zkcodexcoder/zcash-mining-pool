@@ -1,5 +1,16 @@
 //! Explicit bounded operator policy for live PPS; never inferred from defaults.
+//! The one exception is `settle_confirmations`: it comes from `[payout]
+//! pps_settle_confirmations` (default 10), which the payout loop re-reads every cycle.
 use serde::Deserialize;
+
+/// PPS payout settlement depth when `[payout] pps_settle_confirmations` is absent.
+pub const DEFAULT_SETTLE_CONFIRMATIONS: u64 = 10;
+/// Allowed settlement depths: never settle on one or two confirmations (audit B2).
+pub const SETTLE_CONFIRMATIONS_RANGE: std::ops::RangeInclusive<u64> = 3..=100;
+
+fn default_settle_confirmations() -> u64 {
+    DEFAULT_SETTLE_CONFIRMATIONS
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -12,6 +23,10 @@ pub struct PpsPolicy {
     pub fee_allowance_zatoshis: i64,
     pub reserve_min_zatoshis: i64,
     pub max_payout_zatoshis: i64,
+    /// Confirmations before a sent payout settles (paying -> paid). Never read from
+    /// `[pps]`; the dashboard sets it from `[payout] pps_settle_confirmations`.
+    #[serde(skip, default = "default_settle_confirmations")]
+    pub settle_confirmations: u64,
 }
 
 impl PpsPolicy {
@@ -50,6 +65,9 @@ impl PpsPolicy {
                 "PPS requires explicit positive bounded liability, reserve and payout limits",
             );
         }
+        if !SETTLE_CONFIRMATIONS_RANGE.contains(&self.settle_confirmations) {
+            return Err("PPS settle confirmations must be within 3..=100");
+        }
         Ok(())
     }
 
@@ -81,6 +99,7 @@ mod tests {
             fee_allowance_zatoshis: 10_000_000,
             reserve_min_zatoshis: 10_000_000,
             max_payout_zatoshis: 20_000_000,
+            settle_confirmations: DEFAULT_SETTLE_CONFIRMATIONS,
         }
     }
 
@@ -134,5 +153,24 @@ mod tests {
             "max_liability_zatoshis":100000000, "reserve_min_zatoshis":10000000,
             "max_payout_zatoshis":20000000, "chain_verified_at_unix":1700000000_i64});
         assert!(serde_json::from_value::<PpsPolicy>(manual).is_err());
+    }
+
+    #[test]
+    fn settle_confirmations_default_to_ten_never_come_from_pps_and_are_bounded() {
+        let valid = serde_json::json!({"network":"testnet", "epoch":"test-1", "fee_bps":100,
+            "max_liability_zatoshis":100000000, "reserve_min_zatoshis":10000000,
+            "total_exposure_zatoshis":110000000,"fee_allowance_zatoshis":10000000,
+            "max_payout_zatoshis":20000000});
+        let parsed = serde_json::from_value::<PpsPolicy>(valid.clone()).unwrap();
+        assert_eq!(parsed.settle_confirmations, DEFAULT_SETTLE_CONFIRMATIONS);
+        // The depth is set from [payout], never from [pps].
+        let mut in_pps = valid;
+        in_pps.as_object_mut().unwrap().insert("settle_confirmations".into(), serde_json::json!(5));
+        assert!(serde_json::from_value::<PpsPolicy>(in_pps).is_err());
+        for (depth, ok) in [(2, false), (3, true), (5, true), (100, true), (101, false)] {
+            let mut p = policy();
+            p.settle_confirmations = depth;
+            assert_eq!(p.validate("testnet").is_ok(), ok, "depth {depth}");
+        }
     }
 }

@@ -222,6 +222,7 @@ fn synthetic_policy() -> PpsPolicy {
         fee_allowance_zatoshis: 10_000_000,
         reserve_min_zatoshis: 10_000_000,
         max_payout_zatoshis: 100_000_000,
+        settle_confirmations: 10,
     }
 }
 

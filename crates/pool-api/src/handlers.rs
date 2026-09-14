@@ -69,6 +69,8 @@ pub struct ApiState {
     pub pps_enabled: bool,
     /// `[pps].max_payout_zatoshis`, shown on the PPS page (0 when PPS is off).
     pub pps_max_payout_zatoshis: i64,
+    /// PPS settle depth; the payout loop re-reads `[payout] pps_settle_confirmations`.
+    pub pps_settle_confirmations: Arc<std::sync::atomic::AtomicU64>,
     /// Background-refreshed snapshot of zebra's /metrics endpoint. The
     /// admin health handler reads this directly instead of triggering a
     /// live scrape — zebra 4.4.x's metrics body grew to ~9 MB with

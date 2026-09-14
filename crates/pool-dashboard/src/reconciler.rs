@@ -85,6 +85,9 @@ pub struct Reconciler {
     /// The transparent collection address every block's coinbase must pay.
     /// Empty string disables the coinbase-output check (tests).
     pub mining_address: String,
+    /// PPS settle depth, shared with the payout loop, which re-reads it from
+    /// `[payout] pps_settle_confirmations` every cycle.
+    pub pps_settle_confirmations: Arc<std::sync::atomic::AtomicU64>,
     /// Audit #19: automatically void recorded payouts whose tx the node
     /// authoritatively reports absent (-5) past tx-expiry — the reorged-out
     /// class. Miners were never paid (the wallet kept the funds); voiding
@@ -167,6 +170,11 @@ impl Reconciler {
         summary
     }
 
+    /// Current PPS settle depth, as last re-read by the payout loop.
+    fn settle_confirmations(&self) -> u64 {
+        self.pps_settle_confirmations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Round-3: resolve in-flight payout reservations — attempts still holding
     /// `paying` funds in payout_items. For each, learn the txid (recorded or via
     /// the opid) and check the chain: on chain -> `confirm_payout` (paying ->
@@ -182,6 +190,7 @@ impl Reconciler {
     ) {
         if let (Some(policy),Some(gate)) = (&self.pps_policy,&self.pps_gate) {
           if policy.network=="testnet" {
+            let policy = &PpsPolicy { settle_confirmations: self.settle_confirmations(), ..policy.clone() };
             // Dedicated immutable-intent path; these journals are permanently
             // excluded from PCZT and legacy stale-attempt queries.
             match self.db.get_reserved_pps_conventional_attempts(100).await {
@@ -254,7 +263,7 @@ impl Reconciler {
                     }
                     continue;
                 };
-                // Audit B2: settle only at PPS_SETTLE_MATURITY confirmations on our
+                // Audit B2: settle only at the configured settle depth on our
                 // node's active chain — never on mere mempool visibility.
                 let confirmations = match self.node_rpc.get_raw_transaction(&expected,1).await {
                     Ok(raw) => raw.get("confirmations").and_then(|c| c.as_u64()).unwrap_or(0),
@@ -263,7 +272,7 @@ impl Reconciler {
                         continue;
                     }
                 };
-                if confirmations < crate::pps_conventional::PPS_SETTLE_MATURITY {
+                if confirmations < self.settle_confirmations() {
                     continue;
                 }
                 if !self.pps_decision_gate(ledger,summary).await { continue; }
@@ -1100,6 +1109,8 @@ pub(crate) mod tests {
             auto_void_reorged: false,
             pps_policy: None,
             pps_gate: None,
+            pps_settle_confirmations: Arc::new(std::sync::atomic::AtomicU64::new(
+                pool_db::pps_policy::DEFAULT_SETTLE_CONFIRMATIONS)),
             shielded_coinbase: false,
         }
     }
@@ -1517,6 +1528,7 @@ pub(crate) mod tests {
             network: "testnet".into(), epoch: "audit-test".into(), fee_bps: 100,
             max_liability_zatoshis: 1_000, total_exposure_zatoshis: 2_000,
             fee_allowance_zatoshis: 10, reserve_min_zatoshis: 1, max_payout_zatoshis: 100,
+            settle_confirmations: 10,
         }
     }
 

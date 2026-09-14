@@ -365,7 +365,7 @@ pub async fn get_pps_data(State(state): State<AppState>) -> Result<Json<PpsData>
         payout_total_zat: payouts.get("t"),
         // Config value, not stored in the DB.
         max_payout_zat: state.pps_max_payout_zatoshis,
-        settle_maturity: 10,
+        settle_maturity: state.pps_settle_confirmations.load(std::sync::atomic::Ordering::Relaxed) as i64,
         health,
         miners,
         recent_payouts,

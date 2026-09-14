@@ -24,7 +24,10 @@ static WORKFLOW:tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// policy and gives ~12.5 min finality; raise toward 24 (the chain-lease tip
 /// spread) for more reorg margin. No depth covers an operator-induced
 /// multi-thousand-block rollback -- that stays a manual reconciliation event.
-pub(crate) const PPS_SETTLE_MATURITY: u64 = 10;
+/// Default only: the live depth is `[payout] pps_settle_confirmations`, re-read
+/// every payout cycle and carried in `PpsPolicy::settle_confirmations`.
+#[cfg(test)]
+pub(crate) const PPS_SETTLE_MATURITY: u64 = pool_db::pps_policy::DEFAULT_SETTLE_CONFIRMATIONS;
 
 /// Classify typed failures only. Never format an error, its context, or any
 /// supplied value: even an otherwise harmless database/RPC error can carry
@@ -503,8 +506,8 @@ async fn reconcile_steps(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
     *stage="transaction";
     let raw=rpc(node,"getrawtransaction",json!([txid,1])).await?;
     // Stay reserved (soft return, retried next cycle) until the tx is buried
-    // PPS_SETTLE_MATURITY-deep in our node's active chain; only then settle.
-    if raw.get("confirmations").and_then(Value::as_u64).unwrap_or(0)<PPS_SETTLE_MATURITY { return Ok(0); }
+    // `policy.settle_confirmations` deep in our node's active chain; only then settle.
+    if raw.get("confirmations").and_then(Value::as_u64).unwrap_or(0)<policy.settle_confirmations { return Ok(0); }
     let raw_txid=raw.get("txid").and_then(Value::as_str).context("PPS raw txid missing")?;
     anyhow::ensure!(crate::wallet_operation::normalize_txid(raw_txid)?==txid,"PPS raw txid mismatch");
     let blockhash=raw.get("blockhash").and_then(Value::as_str).context("PPS block missing")?;

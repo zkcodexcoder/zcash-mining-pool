@@ -80,6 +80,9 @@ fn validate_dashboard_pps(config: &Config) -> Result<()> {
                 && config.payout.interval_secs > 0 && !config.payout.pay_immature
                 && config.payout.wallet_rpc_url.is_some() && config.payout.pool_address.is_some(),
                 "PPS requires enabled payouts, reconciliation, wallet configuration and no immature-credit bypass");
+            anyhow::ensure!(pool_db::pps_policy::SETTLE_CONFIRMATIONS_RANGE.contains(&config.payout.pps_settle_confirmations)
+                && PAYOUT_INTERVAL_RANGE.contains(&config.payout.interval_secs),
+                "PPS settle confirmations must be 3..=100 and the payout interval 10..=3600 seconds");
             let minimum = config.payout.minimum_payout * ZATOSHIS_PER_ZEC;
             anyhow::ensure!(minimum.is_finite() && minimum >= 1.0
                 && minimum <= p.max_payout_zatoshis as f64,
@@ -279,6 +282,10 @@ struct PayoutConfig {
     interval_secs: u64,
     #[serde(default = "default_maturity")]
     maturity_confirmations: u64,
+    /// PPS payout settlement depth: a sent payout moves paying -> paid at this many
+    /// confirmations. Re-read every payout cycle; 3..=100, default 10.
+    #[serde(default = "default_pps_settle_confirmations")]
+    pps_settle_confirmations: u64,
     /// Audit #19: auto-void payouts whose tx the node reports absent (-5)
     /// past tx-expiry (reorged-out class). Default ON — the whole point is
     /// no human dependency; set false to fall back to alert-only.
@@ -337,6 +344,11 @@ fn default_minimum_payout() -> f64 {
 fn default_payout_interval() -> u64 {
     300
 }
+/// Payout round interval bounds, checked at startup and on every reload.
+const PAYOUT_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 10..=3600;
+fn default_pps_settle_confirmations() -> u64 {
+    pool_db::pps_policy::DEFAULT_SETTLE_CONFIRMATIONS
+}
 fn default_auto_void() -> bool {
     true
 }
@@ -367,6 +379,7 @@ impl Default for PayoutConfig {
             reserve_min: 0.0,
             available_balance_margin: default_balance_margin(),
             reconcile_interval_secs: default_reconcile_interval(),
+            pps_settle_confirmations: default_pps_settle_confirmations(),
             pay_immature: false,
             min_payout_interval_secs: 0,
             coalesce_override_zec: None,
@@ -413,6 +426,9 @@ async fn main() -> Result<()> {
         toml::from_str(&config_str).with_context(|| "Failed to parse config file")?;
     validate_dashboard_pps(&config)?;
 
+    // PPS settle depth, shared by the payout loop (which re-reads it every cycle),
+    // the reconciler and the PPS page.
+    let pps_settle = Arc::new(std::sync::atomic::AtomicU64::new(config.payout.pps_settle_confirmations));
     if let Some(port) = port_override {
         config.api.listen_addr = format!("0.0.0.0:{port}");
     }
@@ -599,6 +615,7 @@ async fn main() -> Result<()> {
         },
         pps_enabled: config.pps.is_some(),
         pps_max_payout_zatoshis: config.pps.as_ref().map_or(0, |p| p.max_payout_zatoshis),
+        pps_settle_confirmations: Arc::clone(&pps_settle),
         zebra_metrics_cache: Arc::clone(&zebra_metrics_cache),
         authoritative_tip_cache: Arc::clone(&authoritative_tip_cache),
     });
@@ -809,6 +826,7 @@ async fn main() -> Result<()> {
                 pps_policy: config.pps.clone(),
                 pps_gate: pps_gate.clone(),
                 shielded_coinbase: config.payout.shielded_coinbase,
+                pps_settle_confirmations: Arc::clone(&pps_settle),
             };
             // Round-3: resolve any payout reservations orphaned by a crash BEFORE
             // the payout loop starts — confirm those whose tx reached the chain,
@@ -837,6 +855,7 @@ async fn main() -> Result<()> {
         let payout_config_path = config_path.clone();
         let pps_policy = config.pps.clone();
         let funding_route = config.pps_funding.unwrap_or_default();
+        let loop_settle = Arc::clone(&pps_settle);
         let payout_task = tokio::spawn(async move {
             run_payout_loop(
                 payout_db, node_rpc, payout_wallet_rpc,
@@ -845,7 +864,7 @@ async fn main() -> Result<()> {
                 maturity, interval,
                 &payout_network, pay_immature,
                 loop_wake,
-                payout_config_path, coalesce_fallback, pps_policy, pps_gate, funding_route,
+                payout_config_path, coalesce_fallback, pps_policy, pps_gate, funding_route, loop_settle,
             ).await;
         });
         Some((payout_task, reconciler_handle))
@@ -938,6 +957,31 @@ fn reload_coalesce_knobs(config_path: &str, fallback: (i64, i64)) -> (i64, i64) 
     }
 }
 
+/// Payout interval and PPS settle depth from the config file text, re-read every
+/// payout cycle. Absent keys take their defaults; a file that does not parse or a
+/// value out of range returns None, and the caller keeps its current values.
+fn cycle_settings(text: &str) -> Option<(Duration, u64)> {
+    #[derive(Deserialize)]
+    struct File {
+        payout: Option<Section>,
+    }
+    #[derive(Deserialize)]
+    struct Section {
+        #[serde(default = "default_payout_interval")]
+        interval_secs: u64,
+        #[serde(default = "default_pps_settle_confirmations")]
+        pps_settle_confirmations: u64,
+    }
+    let file: File = toml::from_str(text).ok()?;
+    let (interval, settle) = file.payout.map_or(
+        (default_payout_interval(), default_pps_settle_confirmations()),
+        |s| (s.interval_secs, s.pps_settle_confirmations),
+    );
+    (PAYOUT_INTERVAL_RANGE.contains(&interval)
+        && pool_db::pps_policy::SETTLE_CONFIRMATIONS_RANGE.contains(&settle))
+    .then(|| (Duration::from_secs(interval), settle))
+}
+
 async fn run_payout_loop(
     db: PoolDb,
     node_rpc: Arc<ZcashRpcClient>,
@@ -948,7 +992,7 @@ async fn run_payout_loop(
     reserve_min_zatoshis: i64,
     balance_margin: f64,
     maturity_confirmations: u64,
-    interval: Duration,
+    mut interval: Duration,
     network: &str,
     pay_immature: bool,
     wake: Arc<tokio::sync::Notify>,
@@ -957,6 +1001,7 @@ async fn run_payout_loop(
     pps_policy: Option<PpsPolicy>,
     pps_gate: Option<Arc<PpsGate>>,
     funding_route: PpsFundingRoute,
+    pps_settle: Arc<std::sync::atomic::AtomicU64>,
 ) {
     info!("Payout loop started");
     // Short initial delay to let dashboard fully start before doing RPC work.
@@ -1005,6 +1050,24 @@ async fn run_payout_loop(
         }
 
         // Phase 3: Pay miners from shielded pool (respects reserve_min)
+        // Round interval and PPS settle depth are re-read every cycle, so config edits
+        // apply without a restart. An unreadable or out-of-range config keeps both.
+        match std::fs::read_to_string(&config_path).ok().and_then(|text| cycle_settings(&text)) {
+            Some((next_interval, next_settle)) => {
+                if next_interval != interval {
+                    info!(interval_secs = next_interval.as_secs(), "Payout interval changed");
+                    interval = next_interval;
+                }
+                if pps_settle.swap(next_settle, std::sync::atomic::Ordering::Relaxed) != next_settle {
+                    info!(confirmations = next_settle, "PPS settle confirmations changed");
+                }
+            }
+            None => warn!(config_path, "payout interval or PPS settle depth unreadable or out of range; keeping current values"),
+        }
+        let cycle_policy = pps_policy.as_ref().map(|p| PpsPolicy {
+            settle_confirmations: pps_settle.load(std::sync::atomic::Ordering::Relaxed),
+            ..p.clone()
+        });
         let (coalesce_cooldown, coalesce_override) =
             reload_coalesce_knobs(&config_path, coalesce_fallback);
         let (payout_result, payout_cycle) = payout_health::observe(async {
@@ -1022,7 +1085,7 @@ async fn run_payout_loop(
             min_payout_zatoshis, reserve_min_zatoshis, balance_margin, network,
             pay_immature, coalesce_cooldown, coalesce_override,
             ).await? };
-            if let Some(p) = &pps_policy {
+            if let Some(p) = &cycle_policy {
                 paid += if funding_route.holds_new_legacy_sends() {
                     pps_conventional::process(&db,&wallet_rpc,&node_rpc,pool_address,
                         min_payout_zatoshis,p,pps_gate.as_deref().context("missing PPS verification gate")?,
@@ -2187,5 +2250,23 @@ mod lifecycle_tests {
         let node_url = mock_rpc(node_with_tx()).await;
         run_payouts(&db, &wallet_url, &node_url).await.unwrap();
         assert_eq!(sums(&pool).await, (0, 0, REWARD, REWARD), "reorg + repay conserves exactly");
+    }
+}
+
+#[cfg(test)]
+mod cycle_settings_tests {
+    use super::*;
+
+    #[test]
+    fn payout_interval_and_settle_depth_follow_the_config_file() {
+        let text = "[pool]\nnetwork = \"testnet\"\n[payout]\nenabled = true\ninterval_secs = 60\npps_settle_confirmations = 5\n[pps]\nepoch = \"x\"\n";
+        assert_eq!(cycle_settings(text), Some((Duration::from_secs(60), 5)));
+        // Absent keys take the defaults.
+        assert_eq!(cycle_settings("[payout]\nenabled = true\n"), Some((Duration::from_secs(300), 10)));
+        assert_eq!(cycle_settings(""), Some((Duration::from_secs(300), 10)));
+        // Out of range or unparseable: the caller keeps its current values.
+        assert_eq!(cycle_settings("[payout]\npps_settle_confirmations = 2\n"), None);
+        assert_eq!(cycle_settings("[payout]\ninterval_secs = 5\n"), None);
+        assert_eq!(cycle_settings("[payout\n"), None);
     }
 }
