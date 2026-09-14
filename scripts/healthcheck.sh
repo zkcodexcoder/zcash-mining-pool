@@ -202,6 +202,16 @@ if [ -n "$TN" ]; then
     report tn_pps_chain "$([ "$TCV" = true ] && [ "${TCE:-0}" -gt "$NOW" ] && echo 1 || echo 0)" \
       "[testnet] WARNING (no action taken): PPS chain agreement unproven — node vs testnet.zec.rocks/cipherscan disagree or are unreachable; shares still credited, payouts continue" \
       "✅ [testnet] PPS chain agreement restored"
+    # Liability over the cap is also a warning only: shares keep crediting while
+    # payouts catch up. A pause (unreadable accounting) rejects valid shares.
+    TST=$(echo "$TNH" | grep -o '"state":"[a-z]*"' | head -1 | cut -d'"' -f4)
+    TCAT=$(echo "$TNH" | grep -o '"category":"[a-z_]*"' | head -1 | cut -d'"' -f4)
+    report tn_pps_liability "$([ "$TCAT" != liability_over_cap ] && echo 1 || echo 0)" \
+      "[testnet] WARNING (no action taken): PPS miners are owed more than the liability cap — shares still credited, payouts are behind" \
+      "✅ [testnet] PPS liability back under the cap"
+    report tn_pps_admission "$([ "$TST" != paused ] && echo 1 || echo 0)" \
+      "[testnet] PPS ADMISSION PAUSED ($TCAT) — valid shares are being rejected" \
+      "✅ [testnet] PPS admission resumed"
   fi
 else
   report testnet_ssh 0 "[testnet] pool box unreachable over SSH"
