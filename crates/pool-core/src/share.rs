@@ -1449,6 +1449,9 @@ impl ShareValidator {
                 tracing::warn!(category, worker = %worker_name,
                     "PPS share credited under a stale funding lease (advisory; send-side seal still gates payouts)");
             }
+            if receipt.liability_advisory.is_some() {
+                warn_liability_over_cap();
+            }
             Ok::<(u64, bool), StratumError>((subsidy, receipt.duplicate))
           }.await;
           match admission {
@@ -1949,6 +1952,18 @@ pub fn parse_target(target_hex: &str) -> Result<[u8; 32], String> {
     let offset = 32 - bytes.len();
     padded[offset..].copy_from_slice(&bytes);
     Ok(padded)
+}
+
+/// Logs at most once every five minutes while shares are credited over the
+/// liability cap. Health and Telegram carry the ongoing warning.
+fn warn_liability_over_cap() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST.load(Ordering::Relaxed);
+    if now - last >= 300 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::warn!("PPS share credited over the liability cap (warning only; payouts continue)");
+    }
 }
 
 /// Audit B15: remember a validated miner subsidy. A height's subsidy is fixed by

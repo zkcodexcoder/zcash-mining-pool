@@ -29,8 +29,6 @@ pub enum PpsDbError {
     DuplicateMismatch,
     #[error("current canonical chain agreement required")]
     ChainLeaseRequired,
-    #[error("cumulative PPS liability cap exceeded")]
-    CapExceeded,
     #[error("current PPS wallet funding evidence required")]
     FundingLeaseRequired,
     #[error("PPS wallet funding does not cover protected obligations")]
@@ -94,15 +92,19 @@ pub struct PpsReceipt {
     /// absent, stale or disagreeing. Chain agreement is a warning only (health
     /// page and Telegram); it never rejects a valid share.
     pub chain_advisory: Option<&'static str>,
+    /// Set when the share was credited although outstanding liability (pending +
+    /// paying) is now over `max_liability`. The cap is a warning threshold only
+    /// (health page and Telegram); it never rejects a valid share.
+    pub liability_advisory: Option<&'static str>,
 }
 
 /// Credit-path funding policy: a valid proof-of-work share is NEVER rejected for a
 /// stale, absent, or momentarily insufficient funding lease, nor for an exhausted
 /// fee budget. Those are send-side solvency concerns and are enforced hard where
 /// money actually moves — the payout seal re-proves the funding lease and reserves
-/// the fee before every `z_sendmany`. The cumulative cap (checked separately in the
-/// credit transaction) remains the hard bound on everything the pool can ever owe.
-/// Only accounting corruption or unavailability stays fatal here.
+/// the fee before every `z_sendmany`. The liability cap is likewise a warning only
+/// (`PpsReceipt::liability_advisory`). Only accounting corruption or unavailability
+/// stays fatal here.
 fn advisory_funding(result: Result<(), PpsDbError>) -> Result<Option<&'static str>, PpsDbError> {
     match result {
         Ok(()) => Ok(None),
@@ -391,6 +393,7 @@ impl PoolDb {
                 credited_subzatoshis: s.amount_subzatoshis,
                 funding_advisory: None,
                 chain_advisory: None,
+                liability_advisory: None,
             };
             tx.commit().await?;
             return Ok(receipt);
@@ -431,10 +434,11 @@ impl PoolDb {
         let gross = gross_before
             .checked_add(s.amount_subzatoshis)
             .ok_or(PpsDbError::Invariant)?;
-        // The cap bounds OUTSTANDING liability (pending + paying = gross − paid),
-        // not lifetime credits: capacity refills as payouts settle, backed by the
-        // block rewards the pool earns. `max_liability` is the pool's variance
-        // capital. `gross` itself stays monotonic as the audit total.
+        // The cap is measured against OUTSTANDING liability (pending + paying =
+        // gross − paid), not lifetime credits. It is a warning threshold, never an
+        // admission gate: when payouts lag what miners earn, valid shares are still
+        // credited and health reports `liability_over_cap`. `gross` itself stays
+        // monotonic as the audit total.
         let paid_total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(paid),0) FROM pps_accounts")
             .fetch_one(&mut *tx)
             .await?;
@@ -444,9 +448,8 @@ impl PoolDb {
         let outstanding = outstanding_before
             .checked_add(s.amount_subzatoshis)
             .ok_or(PpsDbError::Invariant)?;
-        if outstanding > e.max_liability_zatoshis as u128 * PPS_SCALE {
-            return Err(PpsDbError::CapExceeded);
-        }
+        let liability_advisory = (outstanding > e.max_liability_zatoshis as u128 * PPS_SCALE)
+            .then_some("liability_over_cap");
         if quote.is_none() {
             sqlx::query("INSERT INTO pps_quotes VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")
                 .bind(&s.quote_id)
@@ -524,6 +527,7 @@ impl PoolDb {
             credited_subzatoshis: s.amount_subzatoshis,
             funding_advisory,
             chain_advisory,
+            liability_advisory,
         })
     }
     pub async fn pps_invariant(&self) -> Result<PpsLedgerSummary, PpsDbError> {
@@ -912,8 +916,7 @@ pub(crate) async fn reconcile(c: &mut SqliteConnection) -> Result<PpsLedgerSumma
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_events")
         .fetch_one(&mut *c)
         .await?;
-    // Lifetime gross is audited against the event log; the cap is checked against
-    // OUTSTANDING liability once the accounts are summed below (refill model).
+    // Lifetime gross is audited against the event log.
     if total != gross || count != expected || count != stored {
         return Err(PpsDbError::Invariant);
     }
@@ -972,14 +975,8 @@ pub(crate) async fn reconcile(c: &mut SqliteConnection) -> Result<PpsLedgerSumma
     if !per_miner.is_empty() {
         return Err(PpsDbError::Invariant);
     }
-    // Refill model: outstanding liability (pending + paying, incl. fractions) must
-    // never exceed the cap. Lifetime gross may — and is expected to.
-    let outstanding = amount(add(s.pending_zatoshis, s.paying_zatoshis)?, 0)?
-        .checked_add(s.fractional_subzatoshis)
-        .ok_or(PpsDbError::Invariant)?;
-    if outstanding > cap {
-        return Err(PpsDbError::Invariant);
-    }
+    // Outstanding liability over the cap is a warning (credit health), not an
+    // accounting fault: shares keep crediting while payouts catch up.
     let e = crate::pps_funding::active_epoch(c).await?;
     crate::pps_funding::snapshot(c, &e, false).await?;
     Ok(s)
@@ -2567,7 +2564,7 @@ mod tests {
         assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 4);
     }
     #[tokio::test]
-    async fn concurrent_cap_includes_fractional_claims_and_survives_epoch_change() {
+    async fn liability_cap_warns_but_never_rejects_concurrent_credits_across_epochs() {
         let f = setup(true, 1).await;
         let a = event(&f, 1, 600_000_000_000);
         let b = event(&f, 2, 600_000_000_000);
@@ -2576,9 +2573,12 @@ mod tests {
             f.db.credit_pps_share(&f.e, &a, Some(&f.l), Some(&funding), NOW),
             f.db.credit_pps_share(&f.e, &b, Some(&f.l), Some(&funding), NOW)
         );
-        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
-        assert!(
-            matches!(a, Err(PpsDbError::CapExceeded)) || matches!(b, Err(PpsDbError::CapExceeded))
+        // Together the two credits (1.2 zatoshis) pass the 1-zatoshi cap. Both are
+        // credited; the one that crossed it carries the warning.
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            usize::from(a.liability_advisory.is_some()) + usize::from(b.liability_advisory.is_some()),
+            1
         );
         let mut next = f.e.clone();
         next.id = "epoch-two".into();
@@ -2586,17 +2586,16 @@ mod tests {
         f.db.initialize_pps_epoch(&next, Some(&funded(&f).await))
             .await
             .unwrap();
-        assert!(matches!(
-            f.db.credit_pps_share(
+        let over = f.db.credit_pps_share(
                 &next,
                 &event(&f, 3, 500_000_000_000),
                 Some(&f.l),
                 Some(&funded(&f).await),
                 NOW
             )
-            .await,
-            Err(PpsDbError::CapExceeded)
-        ));
+            .await
+            .unwrap();
+        assert_eq!(over.liability_advisory, Some("liability_over_cap"));
         next.max_liability_zatoshis = 2;
         next.total_exposure_zatoshis = 102;
         assert!(matches!(
@@ -2604,7 +2603,9 @@ mod tests {
                 .await,
             Err(PpsDbError::EpochMismatch)
         ));
-        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 1);
+        // Outstanding liability above the cap is not an accounting fault.
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 3);
+        assert!(f.db.pps_funding_snapshot().await.is_ok());
     }
     #[tokio::test]
     async fn saga_preserves_legacy_and_gross_cap_after_confirmation_and_refund() {
@@ -2668,7 +2669,7 @@ mod tests {
         f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW)
             .await
             .unwrap();
-        // The cap binds OUTSTANDING liability: fill it exactly (1.5 more -> 4.0).
+        // The cap is measured against OUTSTANDING liability: fill it exactly (1.5 more -> 4.0).
         f.db.credit_pps_share(&f.e, &event(&f, 3, PPS_SCALE + PPS_SCALE / 2), Some(&f.l), Some(&funded(&f).await), NOW)
             .await
             .unwrap();
@@ -2680,12 +2681,14 @@ mod tests {
         // Lifetime gross now EXCEEDS the cap (6 > 4) while outstanding equals it —
         // conservation (outstanding + paid == gross) holds throughout.
         assert_eq!(s.gross_subzatoshis, 6 * PPS_SCALE);
-        // One more sub-zatoshi of outstanding liability is rejected.
-        assert!(matches!(
-            f.db.credit_pps_share(&f.e, &event(&f, 4, 1), Some(&f.l), Some(&funded(&f).await), NOW)
-                .await,
-            Err(PpsDbError::CapExceeded)
-        ));
+        // One more sub-zatoshi takes outstanding liability past the cap. It is still
+        // credited, with the warning, and the books still reconcile.
+        let over = f.db
+            .credit_pps_share(&f.e, &event(&f, 4, 1), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        assert_eq!(over.liability_advisory, Some("liability_over_cap"));
+        assert_eq!(f.db.pps_invariant().await.unwrap().gross_subzatoshis, 6 * PPS_SCALE + 1);
     }
     #[tokio::test]
     async fn legacy_orphans_cannot_debit_pps_and_pps_blocks_never_get_pplns() {

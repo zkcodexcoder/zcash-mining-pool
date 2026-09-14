@@ -37,8 +37,8 @@ pub enum CreditAdmissionState { Ready, Degraded, Paused, Unknown }
 /// hard credit gate and maps to `Paused`.
 fn degrades_only(reason: &str) -> bool {
     matches!(reason,
-        "chain_invalid" | "financial_halt" | "funding_missing" | "funding_expired" | "generation_changed"
-        | "invalid_evidence" | "funding_insufficient" | "fee_capacity_exhausted")
+        "chain_invalid" | "liability_over_cap" | "financial_halt" | "funding_missing" | "funding_expired"
+        | "generation_changed" | "invalid_evidence" | "funding_insufficient" | "fee_capacity_exhausted")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +74,7 @@ pub struct PpsCreditHealth {
 const CATEGORIES: &[&str] = &[
     "unknown", "not_attempted", "ok", "missing", "malformed", "stale",
     "funding_missing", "funding_expired", "chain_invalid", "generation_changed",
-    "financial_halt", "payout_halted", "cap_exhausted", "fee_capacity_exhausted", "funding_insufficient",
+    "financial_halt", "payout_halted", "liability_over_cap", "fee_capacity_exhausted", "funding_insufficient",
     "accounting_unavailable", "accounting_invalid", "epoch_mismatch", "legacy_recovery",
     "invalid_input", "duplicate_mismatch", "chain_lease_required", "funding_lease_required",
     "route_policy", "unsupported_recipient", "network_mismatch", "fee_contract_unavailable",
@@ -84,7 +84,7 @@ const CATEGORIES: &[&str] = &[
     "chain_mismatch", "deadline_exceeded", "actor_probe_missing",
     "stale_job", "subsidy_timeout", "subsidy_unavailable", "fixed_target_unavailable",
     "target_invalid", "quote_invalid", "quote_missing", "quote_stale",
-    "quote_context_changed", "current_quote_insufficient",
+    "quote_context_changed",
 ];
 const STAGES: &[&str] = &[
     "not_attempted", "collection_start", "complete", "route_policy", "funding_before",
@@ -166,15 +166,13 @@ pub fn decode_credit_health(raw: Option<&str>, now_unix: i64) -> PpsCreditHealth
         }
     }
     // Price telemetry is informational (when the last share was priced) and never
-    // downgrades a healthy state to Unknown. The one price gate — a fresh quote
-    // that would not fit under the cap — is a hard pause; once that quote is no
-    // longer current its verdict is unknown, not still-failing.
+    // downgrades a healthy state to Unknown. A fresh quote that would not fit under
+    // the cap is a warning only: the share is still credited. Once that quote is no
+    // longer current its verdict is withheld, not still-failing.
     if h.quote_required {
         if h.quote_expires_at_unix.is_none_or(|end| now_unix>=end) { h.current_quote_fits=None; }
-        if h.current_quote_fits==Some(false) {
-            h.state=CreditAdmissionState::Paused; h.category="current_quote_insufficient".into();
-        } else if h.category=="current_quote_insufficient" && h.current_quote_fits==Some(true) {
-            return PpsCreditHealth::unknown(now_unix,"malformed");
+        if h.current_quote_fits==Some(false) && h.state==CreditAdmissionState::Ready {
+            h.state=CreditAdmissionState::Degraded; h.category="liability_over_cap".into();
         }
     }
     h
@@ -239,21 +237,21 @@ fn assess_quote(h:&mut PpsCreditHealth,quote:Option<&QuoteObservation>,job:Optio
         && instant.checked_duration_since(q.checked)
             .is_some_and(|v| v<Duration::from_secs(QUOTE_MAX_AGE_SECONDS as u64));
     if !fresh {
-        // Audit B14: headroom below the price of one share rejects EVERY share
-        // (CapExceeded) even though unused is not exactly zero. At a fixed target the
-        // last observed price is a sound proxy for the next share, fresh or not.
-        if q.amount>unused {
-            h.state=CreditAdmissionState::Paused;
-            h.category="cap_exhausted".into();
+        // Audit B14: headroom below the price of one share means the next credit
+        // takes liability over the cap. That is a warning only; the share is still
+        // credited. The last observed price is a sound proxy, fresh or not.
+        if q.amount>unused && h.state==CreditAdmissionState::Ready {
+            h.state=CreditAdmissionState::Degraded;
+            h.category="liability_over_cap".into();
         }
         return;
     }
     h.current_quote_fits=Some(q.amount<=unused);
-    if q.amount>unused {
-        // The next share would not fit under the cumulative cap. That IS a hard
-        // credit gate (CapExceeded rejects it), so it pauses.
-        h.state=CreditAdmissionState::Paused;
-        h.category="current_quote_insufficient".into();
+    if q.amount>unused && h.state==CreditAdmissionState::Ready {
+        // The next share takes outstanding liability over the cap. It is still
+        // credited; health warns.
+        h.state=CreditAdmissionState::Degraded;
+        h.category="liability_over_cap".into();
     }
 }
 
@@ -286,7 +284,7 @@ pub(crate) fn db_category(error:&PpsDbError) -> &'static str {
     match error {
         PpsDbError::Invalid=>"invalid_input", PpsDbError::EpochMismatch=>"epoch_mismatch",
         PpsDbError::LegacyRecoveryRequired=>"legacy_recovery", PpsDbError::DuplicateMismatch=>"duplicate_mismatch",
-        PpsDbError::ChainLeaseRequired=>"chain_lease_required", PpsDbError::CapExceeded=>"cap_exhausted",
+        PpsDbError::ChainLeaseRequired=>"chain_lease_required",
         PpsDbError::FundingLeaseRequired=>"funding_lease_required", PpsDbError::FundingInsufficient=>"funding_insufficient",
         PpsDbError::FeeBudgetExceeded=>"fee_capacity_exhausted", PpsDbError::Invariant=>"accounting_invalid",
         PpsDbError::PayoutHalted=>"payout_halted",
@@ -331,13 +329,13 @@ fn assess(h:&mut PpsCreditHealth, epoch:&PpsEpoch, route:&PpsFundingRoute,
         s.cap_subzatoshis>0 && s.unused_credit_subzatoshis
             < s.cap_subzatoshis/5 + u128::from(s.cap_subzatoshis%5!=0));
     h.generation_matches=lease.map(|l| l.generation==snapshot.generation);
-    // Audit B14: report the WORST state. Gates that actually reject valid shares
-    // (unreadable accounting, exhausted cap) are evaluated before the reasons that
-    // only degrade, so a warning can never mask a hard rejection. Chain agreement
-    // is a warning only and is reported first among those.
+    // Audit B14: report the WORST state. Unreadable accounting, the one gate that
+    // rejects valid shares, is evaluated first, so a warning can never mask it.
+    // Liability over the cap and chain agreement are warnings only and are
+    // reported first among those.
     let funding=snapshot.funding.as_ref();
     let reason=if funding.is_none() { Some("accounting_invalid") }
-        else if funding.is_some_and(|s| s.unused_credit_subzatoshis==0) { Some("cap_exhausted") }
+        else if funding.is_some_and(|s| s.unused_credit_subzatoshis==0) { Some("liability_over_cap") }
         else if !h.chain_expiry_valid { Some("chain_invalid") }
         else if snapshot.financial_halt { Some("financial_halt") }
         else if lease.is_none() { Some("funding_missing") }
@@ -537,7 +535,8 @@ mod tests {
         assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"funding_insufficient");
         s.funding.as_mut().unwrap().required_spendable_zatoshis-=1;
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=0;
-        assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"cap_exhausted");
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"liability_over_cap"));
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
         s.funding.as_mut().unwrap().reserved_fees_zatoshis=4_980_000_000;
         assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"fee_capacity_exhausted");
@@ -546,22 +545,22 @@ mod tests {
         s.financial_halt=true;
         assess(&mut h,&e,&route,Some(&l),&s,100);
         assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"financial_halt"));
-        // Audit B14: the WORST state is reported. Gates that actually reject shares
-        // win over send-side reasons that only degrade.
+        // Audit B14: the most serious warning is reported. Liability over the cap
+        // outranks a send-side halt, and neither pauses crediting.
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=0;
         assess(&mut h,&e,&route,Some(&l),&s,100);
-        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"cap_exhausted"));
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"liability_over_cap"));
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
         s.funding.as_mut().unwrap().required_spendable_zatoshis+=1;
         h.chain_expiry_valid=false;
         assess(&mut h,&e,&route,Some(&l),&s,100);
-        // Chain agreement is a warning only: it degrades and is reported first
-        // among warnings (here ahead of funding_insufficient)...
+        // Chain agreement is a warning only: it degrades and is reported ahead of
+        // funding_insufficient...
         assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"chain_invalid"));
-        // ...while a gate that really rejects shares still outranks it.
+        // ...and liability over the cap is reported ahead of it, still only a warning.
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=0;
         assess(&mut h,&e,&route,Some(&l),&s,100);
-        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"cap_exhausted"));
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"liability_over_cap"));
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
         h.chain_expiry_valid=true;
         // Unreadable accounting rejects credits, so it outranks a halt too.
@@ -604,9 +603,9 @@ mod tests {
         (quote,job)
     }
     #[test]
-    fn validated_current_quote_requires_full_capacity_not_merely_nonzero_budget() {
+    fn current_quote_above_the_remaining_headroom_warns_without_pausing() {
         let (quote,job)=quote_fixture();
-        for (unused,state,category) in [(9,CreditAdmissionState::Paused,"current_quote_insufficient"),
+        for (unused,state,category) in [(9,CreditAdmissionState::Degraded,"liability_over_cap"),
             (10,CreditAdmissionState::Ready,"ok"),(11,CreditAdmissionState::Ready,"ok")] {
             let mut h=ready(); h.quote_required=true;
             assess_quote(&mut h,Some(&quote),Some(&job),true,unused,100,quote.checked);
@@ -645,13 +644,15 @@ mod tests {
         assert!(lapsed.current_quote_fits.is_none());
         h.sampled_at_unix=114; // publishing again cannot restamp the quote
         assert_eq!(decode(&h,115).state,CreditAdmissionState::Ready);
-        // A recorded hard pause (next share would not fit the cap) stands after
+        // A recorded over-cap warning (next share would not fit the cap) stands after
         // the quote lapses: the sampler's verdict is kept until it resamples.
-        h.current_quote_fits=Some(false); h.state=CreditAdmissionState::Paused; h.category="current_quote_insufficient".into();
-        assert_eq!(decode(&h,115).state,CreditAdmissionState::Paused);
-        // But a recorded pause that contradicts a fresh fitting quote is malformed.
-        h.current_quote_fits=Some(true);
-        assert_eq!(decode(&h,110).state,CreditAdmissionState::Unknown);
+        h.current_quote_fits=Some(false); h.state=CreditAdmissionState::Degraded; h.category="liability_over_cap".into();
+        assert_eq!(decode(&h,115).state,CreditAdmissionState::Degraded);
+        // A fresh quote that does not fit turns a Ready sample into the warning, never a pause.
+        let mut fresh=ready(); fresh.quote_required=true;
+        fresh.quote_checked_at_unix=Some(100); fresh.quote_expires_at_unix=Some(115); fresh.current_quote_fits=Some(false);
+        let warned=decode(&fresh,114);
+        assert_eq!((warned.state,warned.category.as_str()),(CreditAdmissionState::Degraded,"liability_over_cap"));
     }
     #[test]
     fn equivalent_newer_quote_does_not_invalidate_or_renew_original_observation() {

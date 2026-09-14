@@ -3,9 +3,9 @@
 //
 // States mirror pool-core's CreditAdmissionState:
 //   ready    - shares credited, all proofs current
-//   degraded - shares STILL credited; a warning (chain agreement) or a stale
-//              send-side proof (payouts may hold)
-//   paused   - a hard gate is rejecting valid shares (cap, accounting)
+//   degraded - shares STILL credited; a warning (chain agreement, liability over
+//              the cap) or a stale send-side proof (payouts may hold)
+//   paused   - a hard gate is rejecting valid shares (unreadable accounting)
 //   unknown  - telemetry missing, malformed or stale
 // An idle gap between priced shares is not unknown.
 function ppsCreditView(health, now = Math.floor(Date.now() / 1000)) {
@@ -33,14 +33,16 @@ function ppsCreditView(health, now = Math.floor(Date.now() / 1000)) {
     const quoteFresh = health.quote_required === true
         && Number.isSafeInteger(health.quote_checked_at_unix) && health.quote_checked_at_unix <= now
         && Number.isSafeInteger(health.quote_expires_at_unix) && health.quote_expires_at_unix > now;
-    if (quoteFresh && health.current_quote_fits === false)
-        return result('paused', 'Paused', 'current_quote_insufficient');
     if (health.state === 'paused') return result('paused', 'Paused', health.category);
     // Chain agreement is a warning only: a lapsed proof degrades, never pauses,
     // and is reported ahead of other warnings, as the server ranks it.
     if (!chainCurrent) return degraded('chain_invalid', 'Crediting (chain warning)');
-    if (health.state === 'degraded') return degraded(health.category);
+    const overCapLabel = 'Crediting (over liability cap)';
+    if (health.state === 'degraded')
+        return degraded(health.category, health.category === 'liability_over_cap' ? overCapLabel : undefined);
     if (health.category !== 'ok' || health.generation_matches !== true) return unknown('malformed');
     if (!fundingCurrent) return degraded('funding_expired');
+    // A fresh quote above the remaining headroom is a warning only: shares are still credited.
+    if (quoteFresh && health.current_quote_fits === false) return degraded('liability_over_cap', overCapLabel);
     return result('ready', 'Ready (sampled)', 'ok');
 }

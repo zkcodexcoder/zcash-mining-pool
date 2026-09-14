@@ -598,6 +598,7 @@ async fn main() -> Result<()> {
             _ => "PPLNS".to_string(),
         },
         pps_enabled: config.pps.is_some(),
+        pps_max_payout_zatoshis: config.pps.as_ref().map_or(0, |p| p.max_payout_zatoshis),
         zebra_metrics_cache: Arc::clone(&zebra_metrics_cache),
         authoritative_tip_cache: Arc::clone(&authoritative_tip_cache),
     });

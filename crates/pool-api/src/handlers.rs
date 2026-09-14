@@ -67,6 +67,8 @@ pub struct ApiState {
     pub payout_scheme: String,
     /// Explicit configuration, not inferred from a presentation label or DB row.
     pub pps_enabled: bool,
+    /// `[pps].max_payout_zatoshis`, shown on the PPS page (0 when PPS is off).
+    pub pps_max_payout_zatoshis: i64,
     /// Background-refreshed snapshot of zebra's /metrics endpoint. The
     /// admin health handler reads this directly instead of triggering a
     /// live scrape — zebra 4.4.x's metrics body grew to ~9 MB with

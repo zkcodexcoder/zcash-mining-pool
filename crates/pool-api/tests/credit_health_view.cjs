@@ -40,19 +40,23 @@ assert.equal(view({...ready, chain_expires_at_unix: 1001}).category, 'chain_inva
 assert.equal(view({...ready, chain_expiry_valid: false}).state, 'degraded');
 assert.equal(view({...ready, chain_expiry_valid: false}).label, 'Crediting (chain warning)');
 // A gate that really rejects shares still wins over the chain warning.
-assert.equal(view({...ready, state: 'paused', category: 'cap_exhausted', chain_expiry_valid: false}).state, 'paused');
-assert.equal(view({...ready, current_quote_fits: false, chain_expiry_valid: false}).category, 'current_quote_insufficient');
+assert.equal(view({...ready, state: 'paused', category: 'accounting_invalid', chain_expiry_valid: false}).state, 'paused');
+// Liability over the cap is a warning only; a lapsed chain proof is reported ahead of it.
+assert.equal(view({...ready, current_quote_fits: false, chain_expiry_valid: false}).category, 'chain_invalid');
 const degradedGen = {...ready, state: 'degraded', category: 'generation_changed', generation_matches: false};
 assert.equal(view(degradedGen).state, 'degraded');
 assert.equal(view(degradedGen).label, 'Crediting (payouts may hold)');
 assert.equal(view(degradedGen, 1016).state, 'unknown');
 assert.equal(view({...degradedGen, chain_expiry_valid: false}).state, 'degraded');
 assert.equal(view({...degradedGen, chain_expiry_valid: false}).category, 'chain_invalid');   // chain warning reported first
-assert.equal(view({...ready, state: 'paused', category: 'cap_exhausted'}).category, 'cap_exhausted');
+assert.equal(view({...ready, state: 'paused', category: 'accounting_invalid'}).category, 'accounting_invalid');
 const successfulIdlePayout = {consecutive_payout_failures: 0,
     pps_payout_cycle: {outcome: 'no_payout_due', funding_check: 'not_checked_no_payout_due'}};
 assert.equal(successfulIdlePayout.consecutive_payout_failures, 0);
-assert.equal(view({...ready, current_quote_fits: false}).category, 'current_quote_insufficient');
+assert.equal(view({...ready, current_quote_fits: false}).state, 'degraded');   // over the cap: still crediting
+assert.equal(view({...ready, current_quote_fits: false}).category, 'liability_over_cap');
+assert.equal(view({...ready, current_quote_fits: false}).label, 'Crediting (over liability cap)');
+assert.equal(view({...ready, state: 'degraded', category: 'liability_over_cap'}).label, 'Crediting (over liability cap)');
 assert.equal(view({...ready, current_quote_fits: false}, 1015).state, 'ready');   // a stale quote says nothing
 assert.equal(view({...ready, version: 1}).state, 'unknown');
 for (const field of ['quote_required', 'budget_low']) {

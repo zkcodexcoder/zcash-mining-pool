@@ -1116,7 +1116,7 @@ async fn conventional_final_preparation_failures_release_only_definitely_unseale
                 "encoding" => {
                     let mut malformed=intent.clone();
                     malformed.items[0].amount_zatoshis=i64::MAX;
-                    pps_conventional::encode_recipients(&malformed)?;
+                    pps_conventional::encode_recipients(&malformed, f.policy.max_payout_zatoshis)?;
                 },
                 _ => {
                     let mut lease=funding(&f.db,&f.policy).await;

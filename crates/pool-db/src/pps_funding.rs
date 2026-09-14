@@ -660,19 +660,19 @@ pub(crate) async fn snapshot(
     // outstanding (pending + paying) or paid. `gross` is the lifetime total and only
     // ever grows.
     //
-    // The cap bounds OUTSTANDING liability, not lifetime credits (refill model): a
-    // PPS pool's promises are backed by the block rewards it earns, so capacity must
-    // return as payouts settle and income lands. `max_liability` is therefore the
-    // pool's variance capital — how far in the hole it tolerates being before it
-    // pauses — and lifetime `gross` is expected to exceed it many times over.
+    // The cap is measured against OUTSTANDING liability, not lifetime credits: a
+    // PPS pool's promises are backed by the block rewards it earns, so headroom
+    // returns as payouts settle. `max_liability` is a warning threshold for the
+    // pool's variance capital, never an admission gate. Outstanding liability may
+    // exceed it while payouts catch up (health reports `liability_over_cap`), and
+    // lifetime `gross` is expected to exceed it many times over.
     if s.pps_outstanding_subzatoshis
         .checked_add(subunits(s.paid_zatoshis, 0)?)
         != Some(s.gross_subzatoshis)
-        || s.pps_outstanding_subzatoshis > s.cap_subzatoshis
     {
         return Err(PpsDbError::Invariant);
     }
-    s.unused_credit_subzatoshis = s.cap_subzatoshis - s.pps_outstanding_subzatoshis;
+    s.unused_credit_subzatoshis = s.cap_subzatoshis.saturating_sub(s.pps_outstanding_subzatoshis);
     cursor = None;
     loop {
         let rows=sqlx::query("SELECT f.*,p.attempt_id AS conventional_id,p.intent_id,p.fee_bound,p.actual_fee,p.operation_id,p.observed_txid,p.excess_fee,i.canonical_json,h.category AS halt_category FROM pps_fee_reservations f LEFT JOIN pps_conventional_attempts p ON p.attempt_id=f.attempt_id LEFT JOIN pps_conventional_intents i ON i.attempt_id=f.attempt_id LEFT JOIN pps_conventional_halts h ON h.attempt_id=f.attempt_id WHERE (?1 IS NULL OR f.attempt_id>?1) ORDER BY f.attempt_id LIMIT 256")

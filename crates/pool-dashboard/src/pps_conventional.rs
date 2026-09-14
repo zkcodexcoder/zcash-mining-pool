@@ -66,7 +66,6 @@ fn pre_send_error_category(error: &anyhow::Error) -> &'static str {
             PpsDbError::LegacyRecoveryRequired => "legacy_recovery_required",
             PpsDbError::DuplicateMismatch => "duplicate_mismatch",
             PpsDbError::ChainLeaseRequired => "chain_lease_required",
-            PpsDbError::CapExceeded => "liability_cap_exceeded",
             PpsDbError::FundingLeaseRequired => "funding_lease_required",
             PpsDbError::FundingInsufficient => "insufficient_funding",
             PpsDbError::FeeBudgetExceeded => "fee_budget_exceeded",
@@ -98,9 +97,10 @@ where E: Into<anyhow::Error>
 }
 
 /// Amounts never pass through binary floating point. node-rpc enables serde's
-/// arbitrary_precision feature for this workspace's RPC JSON numbers.
-fn exact_amount(zats: i64) -> Result<Value> {
-    anyhow::ensure!((1..=950_000_000).contains(&zats), "invalid testnet PPS amount");
+/// arbitrary_precision feature for this workspace's RPC JSON numbers. One
+/// recipient never receives more than the configured per-payout cap.
+fn exact_amount(zats: i64, max_payout: i64) -> Result<Value> {
+    anyhow::ensure!(zats >= 1 && zats <= max_payout, "invalid testnet PPS amount");
     Ok(Value::Number(serde_json::Number::from_str(
         &format!("{}.{:08}", zats / 100_000_000, zats % 100_000_000))?))
 }
@@ -114,9 +114,9 @@ fn amounts(intent: &PpsConventionalIntent) -> Result<Vec<(String, i64)>> {
     Ok(values.into_iter().collect())
 }
 
-pub(super) fn encode_recipients(intent: &PpsConventionalIntent) -> Result<Vec<Value>> {
+pub(super) fn encode_recipients(intent: &PpsConventionalIntent, max_payout: i64) -> Result<Vec<Value>> {
     amounts(intent)?.into_iter().map(|(address,amount)|
-        Ok(json!({"address":address,"amount":exact_amount(amount)?})))
+        Ok(json!({"address":address,"amount":exact_amount(amount, max_payout)?})))
         .collect()
 }
 
@@ -403,7 +403,7 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
         let funding=pre_send_phase("funding_before_send",
             collect_funding_resilient(db,wallet,policy,from,node,route)).await?;
         pre_send_phase("funding_recheck", db.check_pps_funding(&funding)).await?;
-        let recipients=pre_send_phase("recipient_encoding", async { encode_recipients(&intent) }).await?;
+        let recipients=pre_send_phase("recipient_encoding", async { encode_recipients(&intent, policy.max_payout_zatoshis) }).await?;
         // Chain agreement is a warning only (chain_before_send logs it); it does
         // not bound the seal. The funding lease alone sets the seal deadline.
         pre_send_phase("seal", db.seal_pps_conventional_payout_funded(attempt,&bound.intent_id,&funding)).await?;
@@ -594,7 +594,7 @@ mod tests {
         { assert_eq!(pre_send_error_category(&error.into()),expected); }
         for (error, expected) in [(D::Invalid,"invalid_database_input"), (D::EpochMismatch,"epoch_mismatch"),
             (D::LegacyRecoveryRequired,"legacy_recovery_required"), (D::DuplicateMismatch,"duplicate_mismatch"),
-            (D::ChainLeaseRequired,"chain_lease_required"), (D::CapExceeded,"liability_cap_exceeded"),
+            (D::ChainLeaseRequired,"chain_lease_required"),
             (D::FundingLeaseRequired,"funding_lease_required"), (D::FundingInsufficient,"insufficient_funding"),
             (D::FeeBudgetExceeded,"fee_budget_exceeded"), (D::Invariant,"accounting_invariant"),
             (D::Database(sqlx::Error::Protocol("SYNTHETIC_PRIVATE_SQL".into())),"database_unavailable")]
@@ -686,10 +686,14 @@ mod tests {
 
     #[test]
     fn exact_amounts_and_operation_identifiers() {
-        for (v,s) in [(1,"0.00000001"),(99_999_999,"0.99999999"),(950_000_000,"9.50000000")] {
-            assert_eq!(exact_amount(v).unwrap().to_string(),s);
+        // Each recipient is bounded by the configured payout cap (here 100 TAZ), not
+        // by the 9.5 TAZ literal of the original trial budget.
+        let cap = 10_000_000_000;
+        for (v,s) in [(1,"0.00000001"),(99_999_999,"0.99999999"),(950_000_000,"9.50000000"),
+            (10_000_000_000,"100.00000000")] {
+            assert_eq!(exact_amount(v,cap).unwrap().to_string(),s);
         }
-        for v in [0,-1,950_000_001,i64::MAX] { assert!(exact_amount(v).is_err()); }
+        for v in [0,-1,10_000_000_001,i64::MAX] { assert!(exact_amount(v,cap).is_err()); }
         assert!(valid_opid("opid-1234-abcd"));
         for s in ["","with space","../path","line\n"] { assert!(!valid_opid(s)); }
     }

@@ -141,16 +141,17 @@ mod tests {
     fn quote_capacity_expiry_and_schema_migration_cannot_report_green() {
         let mut h=heartbeat(); h["current_quote_fits"]=json!(false);
         let projected=present(true,Some(&h.to_string()),1001).unwrap();
-        assert_eq!(projected.state,CreditAdmissionState::Paused);
-        assert_eq!(projected.category,"current_quote_insufficient");
-        h["state"]=json!("paused"); h["category"]=json!("current_quote_insufficient");
+        // A fresh quote above the remaining headroom is a warning, never a pause.
+        assert_eq!(projected.state,CreditAdmissionState::Degraded);
+        assert_eq!(projected.category,"liability_over_cap");
+        h["state"]=json!("degraded"); h["category"]=json!("liability_over_cap");
         h["sampled_at_unix"]=json!(1014);
         // Once that quote lapses its verdict is withheld (fits=None), but the
-        // sampler's recorded hard pause stands until it resamples — the reader
+        // sampler's recorded warning stands until it resamples — the reader
         // never invents "unknown" from a mere quote-clock expiry.
         let expired=present(true,Some(&h.to_string()),1015).unwrap();
-        assert_eq!(expired.state,CreditAdmissionState::Paused);
-        assert_eq!(expired.category,"current_quote_insufficient");
+        assert_eq!(expired.state,CreditAdmissionState::Degraded);
+        assert_eq!(expired.category,"liability_over_cap");
         assert!(expired.current_quote_fits.is_none());
         assert_eq!(expired.quote_expires_at_unix,Some(1015));
         assert!(expired.funding_expiry_valid); // separate evidence is still current

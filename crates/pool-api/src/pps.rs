@@ -363,9 +363,8 @@ pub async fn get_pps_data(State(state): State<AppState>) -> Result<Json<PpsData>
         paid_zat: totals.get("d"),
         payout_count: payouts.get("n"),
         payout_total_zat: payouts.get("t"),
-        // Config values (not stored per-row in the DB); kept in sync with
-        // [pps].max_payout_zatoshis and PPS_SETTLE_MATURITY.
-        max_payout_zat: 950_000_000,
+        // Config value, not stored in the DB.
+        max_payout_zat: state.pps_max_payout_zatoshis,
         settle_maturity: 10,
         health,
         miners,
@@ -535,7 +534,7 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
       <div class="meter" role="img" aria-label="liability cap usage"><div class="fill" id="m-used" style="width:0"></div><div class="fee" id="m-fee" style="width:0"></div></div>
       <div class="legend"><span class="lg-used">outstanding to miners · <span id="lg-used">—</span> TAZ</span><span class="lg-fee">tx-fee allowance · <span id="lg-fee">—</span> TAZ</span><span class="lg-free">headroom · <span id="lg-free">—</span> TAZ</span></div>
       <div class="legend" style="margin-top:.35rem"><span>lifetime credited · <span id="gross" class="mono">—</span> TAZ</span></div>
-      <div class="warn-line" id="budget-warn" hidden>▲ Budget low — <span id="headroom">—</span> TAZ of liability headroom remains. Crediting pauses only if outstanding reaches the cap; capacity comes back as payouts settle.</div>
+      <div class="warn-line" id="budget-warn" hidden>▲ Budget low — <span id="headroom">—</span> TAZ of liability headroom remains. Shares keep crediting even past the cap; capacity comes back as payouts settle.</div>
     </div>
   </section>
 
@@ -644,8 +643,7 @@ const REASON = {
   fee_capacity_exhausted:'payout fee budget spent — shares still credited, payouts held',
   financial_halt:'operator halt — shares still credited, no sends',
   chain_invalid:'chain agreement unproven (node vs reference explorers) — warning only; shares still credited, payouts continue',
-  cap_exhausted:'credit cap exhausted — valid shares are being REJECTED',
-  current_quote_insufficient:'next share would exceed the cap — valid shares are being REJECTED',
+  liability_over_cap:'miners are owed more than the liability cap — warning only; shares still credited, payouts catching up',
   accounting_invalid:'ledger unreadable — valid shares are being REJECTED',
   concurrent_change:'state changed mid-sample — re-sampling',
   missing:'no health sample published yet', malformed:'health sample unreadable',

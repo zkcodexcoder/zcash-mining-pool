@@ -730,12 +730,15 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
         }
         let submits_before = node.calls("submitblock").len();
         let outcome = failing.submit("failure-session", &block[143..1487]).await;
-        if failure == "funding" || failure == "lease" {
-            // Never-reject: a stale funding lease is advisory at credit time, and
-            // chain agreement is a warning only.
+        if failure == "funding" || failure == "lease" || failure == "cap" {
+            // Never-reject: a stale funding lease is advisory at credit time, chain
+            // agreement is a warning only, and so is liability over the cap.
             assert!(outcome.is_ok(), "{failure}: a warning-only gate must still credit");
+            if failure == "cap" {
+                assert_eq!(fdb.pps_invariant().await.unwrap().accepted_events, 1);
+            }
         } else {
-            // Credit refused (cap, database), but the block-solving share is
+            // Credit refused (database), but the block-solving share is
             // still accepted and nothing partial is credited.
             assert!(outcome.as_ref().is_ok_and(|r| r.is_block), "{failure}: block must be accepted");
             assert_uncredited(&fdb).await;
@@ -753,7 +756,7 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
 async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:&[u8]) {
     use pool_db::pps_live::{PpsCredit,PPS_SCALE};
     use pps_credit_health::CreditAdmissionState;
-    for cap_rejected in [false,true] {
+    for over_cap in [false,true] {
         let (db,pool)=reconciler::tests::setup_db().await;
         let mut policy=synthetic_policy();
         policy.max_liability_zatoshis=95_000_000_000;
@@ -761,7 +764,7 @@ async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:
         policy.fee_allowance_zatoshis=5_000_000_000;
         let epoch=policy.epoch_config();
         db.initialize_pps_epoch(&epoch,Some(&synthetic_funding(&db,&epoch).await)).await.unwrap();
-        if cap_rejected {
+        if over_cap {
             let miner=db.get_or_create_miner(CANARY_ADDRESS).await.unwrap();
             let worker=db.get_or_create_worker(miner.id,"synthetic-seed").await.unwrap();
             let now=Utc::now().timestamp();
@@ -781,15 +784,15 @@ async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:
         // No share priced yet is not "unknown": the gates themselves are healthy.
         assert_eq!(before.state,CreditAdmissionState::Ready); assert_eq!(before.category,"ok");
         let result=harness.submit("quote-observation",&block[143..1487]).await;
-        // Audit B1: this share solves a block, so it is accepted and its block
-        // submitted even when the cap refuses its credit.
-        assert!(result.as_ref().is_ok_and(|r| r.is_block), "cap_rejected={cap_rejected}");
+        // This share solves a block and takes liability over the cap. It is still
+        // credited (the cap only warns) and its block is submitted.
+        assert!(result.as_ref().is_ok_and(|r| r.is_block), "over_cap={over_cap}");
         let health=harness.credit_health().await;
-        assert_eq!(health.state,if cap_rejected {CreditAdmissionState::Paused}else{CreditAdmissionState::Ready});
-        assert_eq!(health.current_quote_fits,Some(!cap_rejected));
-        assert_eq!(health.category,if cap_rejected {"current_quote_insufficient"}else{"ok"});
-        assert_eq!(health.budget_low,cap_rejected);
-        if cap_rejected {assert_eq!(db.pps_invariant().await.unwrap().accepted_events,1);}
+        assert_eq!(health.state,if over_cap {CreditAdmissionState::Degraded}else{CreditAdmissionState::Ready});
+        assert_eq!(health.current_quote_fits,Some(!over_cap));
+        assert_eq!(health.category,if over_cap {"liability_over_cap"}else{"ok"});
+        assert_eq!(health.budget_low,over_cap);
+        assert_eq!(db.pps_invariant().await.unwrap().accepted_events,if over_cap {2}else{1});
         // Block the actual SQLite observation after its opening quote/job read.
         // Poll once to Pending deterministically; no timing sleeps or injected
         // production hooks. A same-price observation must not renew the old one.
@@ -815,13 +818,13 @@ async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:
                 assert_eq!(sampled.quote_expires_at_unix,health.quote_expires_at_unix);
             } else {
                 // A changed price or tip is informational: the state stays what the
-                // gates say, and headroom below the last observed price stays a pause.
-                assert_eq!(sampled.state,if cap_rejected {CreditAdmissionState::Paused}else{CreditAdmissionState::Ready});
-                assert_eq!(sampled.category,if cap_rejected {"cap_exhausted"}else{"ok"});
+                // gates say, and liability over the cap stays a warning.
+                assert_eq!(sampled.state,if over_cap {CreditAdmissionState::Degraded}else{CreditAdmissionState::Ready});
+                assert_eq!(sampled.category,if over_cap {"liability_over_cap"}else{"ok"});
                 assert_eq!(sampled.current_quote_fits,None);
             }
         }
-        assert_eq!(harness.credit_health().await.category,if cap_rejected {"cap_exhausted"}else{"ok"});
+        assert_eq!(harness.credit_health().await.category,if over_cap {"liability_over_cap"}else{"ok"});
         assert!(wallet.calls("z_sendmany").is_empty());
         drop(harness); pool.close().await;
     }
