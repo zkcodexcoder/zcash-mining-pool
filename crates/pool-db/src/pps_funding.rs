@@ -1037,6 +1037,117 @@ impl PoolDb {
         tx.commit().await?;
         Ok(())
     }
+    /// Operator release of a sealed conventional send that the wallet reported
+    /// FAILED before building any transaction (for example zecd refusing it over its
+    /// size limit). The caller verifies the wallet operation; this re-checks every
+    /// ledger condition under one exclusive transaction, returns the claims to
+    /// pending, releases the fee reservation, and records the release immutably.
+    /// Anything suggesting money may have left the wallet (an observed transaction,
+    /// a settlement, a fee observation, a halt) refuses.
+    pub async fn release_failed_conventional_send(
+        &self,
+        attempt: i64,
+        operation: &str,
+        evidence: &str,
+    ) -> Result<i64, PpsDbError> {
+        if attempt <= 0 || !operation_id(operation) || evidence.is_empty() || evidence.len() > 4096 {
+            return Err(PpsDbError::Invalid);
+        }
+        let mut c = self.inner().acquire().await?;
+        sqlx::query("PRAGMA synchronous=FULL")
+            .execute(&mut *c)
+            .await?;
+        let mut tx = c.begin_with("BEGIN IMMEDIATE").await?;
+        crate::pps_live::reconcile(&mut tx).await?;
+        let a = conventional_attempt(&mut tx, attempt)
+            .await?
+            .ok_or(PpsDbError::Invalid)?;
+        let txid: Option<String> =
+            sqlx::query_scalar("SELECT txid FROM pps_fee_reservations WHERE attempt_id=?1")
+                .bind(attempt)
+                .fetch_one(&mut *tx)
+                .await?;
+        let settled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_payouts WHERE attempt_id=?1")
+            .bind(attempt)
+            .fetch_one(&mut *tx)
+            .await?;
+        if active_epoch(&mut tx).await?.network != "testnet"
+            || !a.sealed
+            || a.status != "reserved"
+            || a.operation_id.as_deref() != Some(operation)
+            || a.expected_txid.is_some()
+            || a.actual_fee_zatoshis.is_some()
+            || a.excess_fee_zatoshis.is_some()
+            || a.halt_category.is_some()
+            || txid.is_some()
+            || settled != 0
+        {
+            return Err(PpsDbError::Invalid);
+        }
+        let items = sqlx::query("SELECT miner_id,amount FROM pps_payout_items WHERE attempt_id=?1")
+            .bind(attempt)
+            .fetch_all(&mut *tx)
+            .await?;
+        if items.is_empty() {
+            return Err(PpsDbError::Invalid);
+        }
+        let mut released = 0i64;
+        for item in &items {
+            let miner: i64 = item.try_get("miner_id")?;
+            let amount: i64 = item.try_get("amount")?;
+            let row = sqlx::query("SELECT pending,paying FROM pps_accounts WHERE miner_id=?1")
+                .bind(miner)
+                .fetch_one(&mut *tx)
+                .await?;
+            let pending: i64 = row.try_get("pending")?;
+            let paying: i64 = row.try_get("paying")?;
+            if amount <= 0 || paying < amount {
+                return Err(PpsDbError::Invariant);
+            }
+            sqlx::query("UPDATE pps_accounts SET pending=?1,paying=?2 WHERE miner_id=?3")
+                .bind(pending.checked_add(amount).ok_or(PpsDbError::Invariant)?)
+                .bind(paying - amount)
+                .bind(miner)
+                .execute(&mut *tx)
+                .await?;
+            released = released.checked_add(amount).ok_or(PpsDbError::Invariant)?;
+        }
+        sqlx::query("DELETE FROM pps_payout_items WHERE attempt_id=?1")
+            .bind(attempt)
+            .execute(&mut *tx)
+            .await?;
+        // A released reservation is unsealed and carries no operation; the
+        // immutable release record keeps the operation id and the evidence.
+        sqlx::query("INSERT INTO pps_released_sends(attempt_id,operation_id,released_zatoshis,evidence) VALUES(?1,?2,?3,?4)")
+            .bind(attempt)
+            .bind(operation)
+            .bind(released)
+            .bind(evidence)
+            .execute(&mut *tx)
+            .await?;
+        let cleared = sqlx::query("UPDATE pps_conventional_attempts SET operation_id=NULL WHERE attempt_id=?1 AND operation_id=?2 AND observed_txid IS NULL")
+            .bind(attempt)
+            .bind(operation)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let unsealed = sqlx::query("UPDATE pps_fee_reservations SET status='released',sealed=0 WHERE attempt_id=?1 AND status='reserved' AND sealed=1 AND txid IS NULL AND expected_txid IS NULL")
+            .bind(attempt)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if cleared != 1 || unsealed != 1 {
+            return Err(PpsDbError::Invariant);
+        }
+        sqlx::query("UPDATE payout_attempts SET status='failed',error_message='released: wallet send failed before building a transaction',updated_at=datetime('now') WHERE id=?1")
+            .bind(attempt)
+            .execute(&mut *tx)
+            .await?;
+        bump_generation(&mut tx).await?;
+        crate::pps_live::reconcile(&mut tx).await?;
+        tx.commit().await?;
+        Ok(released)
+    }
     /// The result transaction is learned AFTER the one asynchronous wallet
     /// invocation. No signer/broadcast action is performed by this method.
     pub async fn record_pps_conventional_transaction(

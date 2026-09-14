@@ -1320,6 +1320,54 @@ async fn conventional_miner_with_a_payout_in_flight_is_not_paid_again_until_it_s
 }
 
 #[tokio::test]
+async fn failed_send_is_released_to_pending_once_and_paid_again() {
+    let f = Fixture::new().await;
+    let rpc = MockRpc::new(&f.db).await;
+    // The wallet accepts the send, but its operation fails before building anything.
+    rpc.state.lock().unwrap().operation = json!([{"id":"opid-synthetic-1","status":"failed",
+        "error":{"message":"synthetic transaction size limit"}}]);
+    assert!(process(&f, &rpc).await.is_err());
+    let held = f.attempt().await;
+    assert!(held.sealed);
+    assert_eq!(held.operation_id.as_deref(), Some("opid-synthetic-1"));
+    // A different operation id is refused and changes nothing.
+    assert!(f.db.release_failed_conventional_send(held.attempt_id, "opid-other", "{}").await.is_err());
+    assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, CREDIT);
+    let released = f.db
+        .release_failed_conventional_send(held.attempt_id, "opid-synthetic-1", r#"{"wallet_status":"failed"}"#)
+        .await
+        .unwrap();
+    assert_eq!(released, CREDIT);
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!((sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis), (CREDIT, 0, 0));
+    assert_eq!(f.db.pps_funding_snapshot().await.unwrap().reserved_fees_zatoshis, 0);
+    // Released exactly once.
+    assert!(f.db.release_failed_conventional_send(held.attempt_id, "opid-synthetic-1", "{}").await.is_err());
+    // The miner is paid again by the next round.
+    rpc.success();
+    rpc.state.lock().unwrap().confirmations = 0;
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    assert_eq!(rpc.sends(), 2);
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!((sum.pending_zatoshis, sum.paying_zatoshis), (0, CREDIT));
+    assert_eq!(rpc.forbidden_calls(), 0);
+}
+
+#[tokio::test]
+async fn send_with_an_observed_transaction_is_never_released() {
+    let f = Fixture::new().await;
+    let rpc = MockRpc::new(&f.db).await;
+    rpc.success();
+    // The transaction lands one block deep: its txid is recorded, not yet settled.
+    rpc.state.lock().unwrap().confirmations = 1;
+    assert_eq!(process(&f, &rpc).await.unwrap(), 0);
+    let sent = f.attempt().await;
+    assert!(sent.expected_txid.is_some());
+    assert!(f.db.release_failed_conventional_send(sent.attempt_id, "opid-synthetic-1", "{}").await.is_err());
+    assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, CREDIT);
+}
+
+#[tokio::test]
 async fn conventional_held_reconciliation_reports_its_step_without_details() {
     let f = Fixture::new().await;
     let rpc = MockRpc::new(&f.db).await;
