@@ -226,7 +226,21 @@ impl PoolDb {
             true,
         )
         .await;
-        if existing { let _ = advisory_funding(pre)?; } else { pre?; }
+        if existing {
+            // Restarting an existing epoch never fails on funding: a missing, stale
+            // or short proof is the share path's business (decision #1 refuses new
+            // credits against a short one, so the pool keeps serving work and
+            // submitting blocks). Only accounting faults stop a restart.
+            match pre {
+                Ok(())
+                | Err(PpsDbError::FundingLeaseRequired
+                | PpsDbError::FundingInsufficient
+                | PpsDbError::FeeBudgetExceeded) => {}
+                Err(other) => return Err(other),
+            }
+        } else {
+            pre?;
+        }
         crate::pps_funding::persist_policy(&mut tx, e).await?;
         let meta = sqlx::query("SELECT * FROM pps_meta WHERE singleton=1")
             .fetch_optional(&mut *tx)
@@ -1236,6 +1250,10 @@ mod tests {
             .unwrap();
         assert!(!r.duplicate);
         assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 2);
+        // A restart of the existing epoch with that short proof still comes up: the
+        // pool keeps serving work, and the share path refuses credits (2026-09-15:
+        // pool-server crash-looped on exactly this).
+        f.db.initialize_pps_epoch(&f.e, Some(&lease)).await.unwrap();
     }
     #[tokio::test]
     async fn funding_rechecks_clock_before_commit_and_current_legacy_obligations() {
