@@ -120,7 +120,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #0b0b0b;
-            color: #c8c8c8;
+            color: #ececec;
             min-height: 100vh;
         }
 
@@ -145,7 +145,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             border: 1px solid #333;
             padding: 0.15rem 0.5rem;
             font-size: 0.6rem;
-            color: #666;
+            color: #b0b0b0;
             text-transform: uppercase;
             letter-spacing: 0.08em;
         }
@@ -169,13 +169,13 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
         .status-dot.pulsing { animation: pulse 2s ease-in-out infinite; }
         .header-link {
-            color: #555;
+            color: #a8a8a8;
             font-size: 0.7rem;
             text-decoration: none;
             text-transform: uppercase;
             letter-spacing: 0.06em;
         }
-        .header-link:hover { color: #999; }
+        .header-link:hover { color: #dcdcdc; }
 
         /* ── Container ── */
         .container { max-width: 1400px; margin: 0 auto; padding: 1rem 1.5rem; }
@@ -200,7 +200,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.6rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             margin-bottom: 0.25rem;
         }
         .hero-card .value-row {
@@ -218,7 +218,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         .hero-card .sub {
             font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
             font-size: 0.65rem;
-            color: #555;
+            color: #a8a8a8;
         }
         .hero-card .sparkline-wrap {
             flex: 1;
@@ -248,14 +248,14 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             margin-bottom: 0.15rem;
         }
         .metric-cell .value {
             font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
             font-size: 1rem;
             font-weight: 600;
-            color: #e0e0e0;
+            color: #f2f2f2;
         }
 
         /* ── Chart Panels ── */
@@ -281,7 +281,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.6rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
         }
         .chart-panel .panel-legend {
             display: flex;
@@ -289,7 +289,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
         .chart-panel .legend-item {
             font-size: 0.55rem;
-            color: #555;
+            color: #a8a8a8;
             display: flex;
             align-items: center;
             gap: 0.25rem;
@@ -309,7 +309,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.6rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             padding: 0.5rem 0;
             margin-bottom: 0;
         }
@@ -330,7 +330,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #444;
+            color: #9c9c9c;
             padding: 0.5rem 0.75rem;
             text-align: left;
             background: #0e0e0e;
@@ -341,11 +341,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.75rem;
             padding: 0.4rem 0.75rem;
             border-bottom: 1px solid #1a1a1a;
-            color: #999;
+            color: #dcdcdc;
         }
         tr:hover td { background: #151515; }
         .addr-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .addr-link { color: #e0e0e0; cursor: pointer; text-decoration: none; }
+        .addr-link { color: #f2f2f2; cursor: pointer; text-decoration: none; }
         .addr-link:hover { color: #f4b728; text-decoration: underline; }
         .status-confirmed { color: #48bb78; }
         .status-pending { color: #ecc94b; }
@@ -364,17 +364,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             padding: 0.5rem 0.75rem;
             background: #111;
             border: none;
-            color: #c8c8c8;
+            color: #ececec;
             font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
             font-size: 0.75rem;
             outline: none;
         }
-        .lookup-row input::placeholder { color: #333; }
+        .lookup-row input::placeholder { color: #8a8a8a; }
         .lookup-row button {
             padding: 0.5rem 1rem;
             background: #1a1a1a;
             border: none;
-            color: #666;
+            color: #b0b0b0;
             font-size: 0.65rem;
             text-transform: uppercase;
             letter-spacing: 0.06em;
@@ -400,7 +400,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             align-items: center;
             gap: 1.5rem;
             font-size: 0.6rem;
-            color: #444;
+            color: #9c9c9c;
             position: fixed;
             bottom: 0;
             left: 0;
@@ -460,19 +460,19 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             white-space: nowrap;
         }
         .config-value {
             font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
             font-size: 0.75rem;
-            color: #e0e0e0;
+            color: #f2f2f2;
             word-break: break-all;
         }
         .config-coin {
             font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
             font-size: 0.75rem;
-            color: #555;
+            color: #a8a8a8;
         }
         @media (max-width: 900px) {
             .config-grid { grid-template-columns: repeat(2, 1fr); }
@@ -481,10 +481,10 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             .config-grid { grid-template-columns: 1fr; }
         }
 
-        .loading { color: #333; font-style: italic; font-family: inherit; }
+        .loading { color: #8a8a8a; font-style: italic; font-family: inherit; }
         .toggle-row td {
             text-align: center;
-            color: #555;
+            color: #a8a8a8;
             cursor: pointer;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             font-size: 0.65rem;
@@ -498,7 +498,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         .tip::after {
             content: attr(data-tip);
             position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
-            background: #1a1f2e; color: #a0aec0; border: 1px solid #2d3748; border-radius: 6px;
+            background: #1a1f2e; color: #d6dde8; border: 1px solid #2d3748; border-radius: 6px;
             padding: 0.5rem 0.7rem; font-size: 0.7rem; line-height: 1.45; letter-spacing: normal;
             text-transform: none; white-space: normal; width: 220px; text-align: left;
             pointer-events: none; opacity: 0; transition: opacity 0.15s; z-index: 10;
@@ -526,19 +526,19 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             padding: 1rem 1.25rem; border-bottom: 1px solid #222;
             display: flex; align-items: center; justify-content: space-between;
         }
-        .modal-title { font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase; color: #e0e0e0; }
+        .modal-title { font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase; color: #f2f2f2; }
         .modal-close {
-            background: none; border: none; color: #777; font-size: 1.4rem; cursor: pointer; line-height: 1;
+            background: none; border: none; color: #b0b0b0; font-size: 1.4rem; cursor: pointer; line-height: 1;
             padding: 0.25rem 0.6rem;
         }
         .modal-close:hover { color: #f4b728; }
         .modal-body { padding: 0.5rem 0; overflow-y: auto; }
         .modal-body table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
         .modal-body th, .modal-body td { padding: 0.5rem 1.25rem; text-align: left; border-bottom: 1px solid #1a1a1a; }
-        .modal-body th { color: #555; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; }
-        .modal-body .addr { font-family: 'JetBrains Mono', monospace; color: #e0e0e0; word-break: break-all; }
+        .modal-body th { color: #a8a8a8; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; }
+        .modal-body .addr { font-family: 'JetBrains Mono', monospace; color: #f2f2f2; word-break: break-all; }
         .modal-body .amount { color: #48bb78; font-variant-numeric: tabular-nums; }
-        .modal-body .empty-msg { text-align: center; color: #555; font-style: italic; padding: 2rem; }
+        .modal-body .empty-msg { text-align: center; color: #a8a8a8; font-style: italic; padding: 2rem; }
     </style>
 </head>
 <body style="opacity:0;transition:opacity 0.15s">
@@ -549,7 +549,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <span class="badge" id="network-badge"></span>
     <div class="header-right">
         <span class="status-dot pulsing" id="header-status-dot"></span>
-        <span style="font-size:0.6rem;color:#555" id="header-status-text">Connected</span>
+        <span style="font-size:0.6rem;color:#a8a8a8" id="header-status-text">Connected</span>
         <a id="mine-link" href="#" target="_blank" rel="noopener" class="header-link" style="color:#f4b728;font-weight:600">Mine in Browser</a>
         <a href="/network" class="header-link">Network</a>
         <a href="/zallet" class="header-link">Wallet</a>
@@ -769,7 +769,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <div class="modal-backdrop" id="immature-blocks-modal" onclick="if(event.target===this)closeImmatureBlocks()">
     <div class="modal-panel">
         <div class="modal-header">
-            <div class="modal-title">Immature Blocks <span id="immature-blocks-count" style="color:#555;font-weight:normal"></span></div>
+            <div class="modal-title">Immature Blocks <span id="immature-blocks-count" style="color:#a8a8a8;font-weight:normal"></span></div>
             <button class="modal-close" onclick="closeImmatureBlocks()" aria-label="Close">&times;</button>
         </div>
         <div class="modal-body">
@@ -795,7 +795,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <div class="modal-backdrop" id="pending-payouts-modal" onclick="if(event.target===this)closePendingPayouts()">
     <div class="modal-panel">
         <div class="modal-header">
-            <div class="modal-title">Miners Awaiting Payout <span id="pending-payouts-count" style="color:#555;font-weight:normal"></span></div>
+            <div class="modal-title">Miners Awaiting Payout <span id="pending-payouts-count" style="color:#a8a8a8;font-weight:normal"></span></div>
             <button class="modal-close" onclick="closePendingPayouts()" aria-label="Close">&times;</button>
         </div>
         <div class="modal-body">
@@ -820,16 +820,16 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <div class="sf-item">
         <span class="sf-dot ok" id="sf-node-dot"></span>
         <span>Node</span>
-        <span id="sf-node-text" style="color:#666">--</span>
+        <span id="sf-node-text" style="color:#b0b0b0">--</span>
     </div>
     <div class="sf-item">
         <span class="sf-dot ok" id="sf-wallet-dot"></span>
         <span>Wallet</span>
-        <span id="sf-wallet-text" style="color:#666">--</span>
+        <span id="sf-wallet-text" style="color:#b0b0b0">--</span>
     </div>
     <div class="sf-item" id="sf-template-item">
         <span>Last Template</span>
-        <span id="sf-template-text" style="color:#666">--</span>
+        <span id="sf-template-text" style="color:#b0b0b0">--</span>
     </div>
     <div style="margin-left:auto" class="sf-item">
         <span id="sf-uptime">--</span>
@@ -927,8 +927,8 @@ function initCharts() {
             padding: 6
         }},
         scales: {
-            x: { display: true, grid: { color: '#1a1a1a' }, ticks: { color: '#333', font: { size: 9 }, maxTicksLimit: 8 } },
-            y: { display: true, grid: { color: '#1a1a1a' }, ticks: { color: '#333', font: { size: 9 }, maxTicksLimit: 5 }, beginAtZero: true }
+            x: { display: true, grid: { color: '#1a1a1a' }, ticks: { color: '#8a8a8a', font: { size: 9 }, maxTicksLimit: 8 } },
+            y: { display: true, grid: { color: '#1a1a1a' }, ticks: { color: '#8a8a8a', font: { size: 9 }, maxTicksLimit: 5 }, beginAtZero: true }
         },
         animation: { duration: 300 }
     };
@@ -1066,7 +1066,7 @@ async function fetchStats() {
             el.innerHTML = d.stratum_ports.map(p =>
                 '<div style="background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:4px 10px;text-align:center">' +
                 '<div style="font-size:1.1rem;color:#f4b728;font-weight:600">' + p.port + '</div>' +
-                '<div style="font-size:0.65rem;color:#888">' + p.description + '</div></div>'
+                '<div style="font-size:0.65rem;color:#b8b8b8">' + p.description + '</div></div>'
             ).join('');
         }
         setVal('stat-immature', d.immature_blocks);
@@ -1161,7 +1161,7 @@ async function fetchBlocks() {
                 luckColor = b.luck_percent <= 100 ? '#48bb78' : b.luck_percent <= 150 ? '#ecc94b' : '#fc8181';
             }
             return '<tr>' +
-                '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#e0e0e0;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
+                '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#f2f2f2;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
                 '<td title="' + b.hash + '">' + b.hash.substring(0, 16) + '...</td>' +
                 '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                 '<td style="color:' + luckColor + '">' + luckStr + '</td>' +
@@ -1218,7 +1218,7 @@ async function fetchPayouts() {
                 ? '<a href="' + EXPLORER + '/tx/' + p.txid + '" target="_blank" rel="noopener" title="' + txTitle + '" style="color:#63b3ed;text-decoration:none">' + txShort + '</a>'
                 : txShort;
             return '<tr>' +
-                '<td class="addr-cell" title="' + p.miner_address + '" style="color:#e0e0e0">' + p.miner_address + '</td>' +
+                '<td class="addr-cell" title="' + p.miner_address + '" style="color:#f2f2f2">' + p.miner_address + '</td>' +
                 '<td style="color:#48bb78">' + p.amount_zec.toFixed(8) + ' ' + COIN + '</td>' +
                 '<td>' + txCell + '</td>' +
                 '<td>' + p.created_at + '</td>' +
@@ -1326,7 +1326,7 @@ async function showPendingPayouts() {
             return '<tr>' +
                 '<td class="addr"><a href="' + minerHref + '" style="color:#63b3ed;text-decoration:none">' + addr + '</a></td>' +
                 '<td class="amount" style="text-align:right">' + p.amount_zec.toFixed(8) + ' ' + COIN + '</td>' +
-                '<td style="color:#777">' + (p.joined_at || '--') + '</td>' +
+                '<td style="color:#b0b0b0">' + (p.joined_at || '--') + '</td>' +
                 '</tr>';
         }).join('');
     } catch (e) {
@@ -1362,14 +1362,14 @@ async function showImmatureBlocks() {
                   '<div style="flex:1;background:#1a1a1a;border-radius:2px;height:6px;overflow:hidden">' +
                     '<div style="width:' + pct.toFixed(1) + '%;height:100%;background:' + pctColor + '"></div>' +
                   '</div>' +
-                  '<span style="color:#777;font-variant-numeric:tabular-nums;min-width:3em;text-align:right">' + pct.toFixed(0) + '%</span>' +
+                  '<span style="color:#b0b0b0;font-variant-numeric:tabular-nums;min-width:3em;text-align:right">' + pct.toFixed(0) + '%</span>' +
                 '</div>';
             return '<tr>' +
                 '<td style="font-variant-numeric:tabular-nums">' + b.height + '</td>' +
                 '<td class="amount" style="text-align:right">' + b.reward_zec.toFixed(8) + ' ' + COIN + '</td>' +
-                '<td style="color:#a0aec0;font-variant-numeric:tabular-nums">' + b.confirmations + ' / ' + b.required + '</td>' +
+                '<td style="color:#d6dde8;font-variant-numeric:tabular-nums">' + b.confirmations + ' / ' + b.required + '</td>' +
                 '<td style="min-width:180px">' + bar + '</td>' +
-                '<td style="color:#777">' + (b.found_at || '--') + '</td>' +
+                '<td style="color:#b0b0b0">' + (b.found_at || '--') + '</td>' +
                 '</tr>';
         }).join('');
     } catch (e) {

@@ -1149,11 +1149,11 @@ const OPS_LOGIN_HTML: &str = r##"<!DOCTYPE html>
 <title>Ops Login</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #f2f2f2; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
 .login-box { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 2rem; width: 360px; }
 .login-box h1 { color: #f687b3; font-size: 1.3rem; margin-bottom: 1.5rem; text-align: center; }
-label { display: block; font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.4rem; }
-input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }
+label { display: block; font-size: 0.8rem; color: #d6dde8; margin-bottom: 0.4rem; }
+input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #f2f2f2; font-size: 0.95rem; margin-bottom: 1rem; }
 input[type="password"]:focus { outline: none; border-color: #f687b3; }
 button { width: 100%; padding: 0.6rem; background: #f687b3; color: #0a0e17; border: none; border-radius: 4px; font-weight: 600; font-size: 0.95rem; cursor: pointer; }
 button:hover { background: #d53f8c; }
@@ -1211,11 +1211,11 @@ const OPS_LOGIN_FAIL_HTML: &str = r##"<!DOCTYPE html>
 <title>Ops Login</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #f2f2f2; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
 .login-box { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 2rem; width: 360px; }
 .login-box h1 { color: #f687b3; font-size: 1.3rem; margin-bottom: 1.5rem; text-align: center; }
-label { display: block; font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.4rem; }
-input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }
+label { display: block; font-size: 0.8rem; color: #d6dde8; margin-bottom: 0.4rem; }
+input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #f2f2f2; font-size: 0.95rem; margin-bottom: 1rem; }
 button { width: 100%; padding: 0.6rem; background: #f687b3; color: #0a0e17; border: none; border-radius: 4px; font-weight: 600; font-size: 0.95rem; cursor: pointer; }
 .err { background: #3a1a1a; border: 1px solid #5a2d2d; color: #fc8181; padding: 0.5rem; border-radius: 4px; margin-bottom: 1rem; font-size: 0.85rem; text-align: center; }
 </style>
@@ -1241,11 +1241,11 @@ const LOGIN_HTML: &str = r##"<!DOCTYPE html>
 <title>Admin Login - Zcash Mining Pool</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #f2f2f2; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
 .login-box { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 2rem; width: 360px; }
 .login-box h1 { color: #f4b728; font-size: 1.3rem; margin-bottom: 1.5rem; text-align: center; }
-label { display: block; font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.4rem; }
-input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }
+label { display: block; font-size: 0.8rem; color: #d6dde8; margin-bottom: 0.4rem; }
+input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #f2f2f2; font-size: 0.95rem; margin-bottom: 1rem; }
 input[type="password"]:focus { outline: none; border-color: #f4b728; }
 button { width: 100%; padding: 0.6rem; background: #f4b728; color: #0a0e17; border: none; border-radius: 4px; font-weight: 600; font-size: 0.95rem; cursor: pointer; }
 button:hover { background: #d69e2e; }
@@ -1272,11 +1272,11 @@ const LOGIN_FAIL_HTML: &str = r##"<!DOCTYPE html>
 <title>Admin Login - Zcash Mining Pool</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #f2f2f2; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
 .login-box { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 2rem; width: 360px; }
 .login-box h1 { color: #f4b728; font-size: 1.3rem; margin-bottom: 1.5rem; text-align: center; }
-label { display: block; font-size: 0.8rem; color: #a0aec0; margin-bottom: 0.4rem; }
-input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }
+label { display: block; font-size: 0.8rem; color: #d6dde8; margin-bottom: 0.4rem; }
+input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #f2f2f2; font-size: 0.95rem; margin-bottom: 1rem; }
 input[type="password"]:focus { outline: none; border-color: #f4b728; }
 button { width: 100%; padding: 0.6rem; background: #f4b728; color: #0a0e17; border: none; border-radius: 4px; font-weight: 600; font-size: 0.95rem; cursor: pointer; }
 button:hover { background: #d69e2e; }
@@ -1305,30 +1305,30 @@ const ADMIN_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <title>Admin - Zcash Mining Pool</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #f2f2f2; min-height: 100vh; }
 .header { background: linear-gradient(135deg, #1a1f2e 0%, #0d1117 100%); border-bottom: 1px solid #f4b728; padding: 1rem 2rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
 .header h1 { color: #f4b728; font-size: 1.3rem; }
 .header-right { display: flex; align-items: center; gap: 1rem; }
-.header-right a { color: #718096; text-decoration: none; font-size: 0.85rem; }
+.header-right a { color: #b0bccd; text-decoration: none; font-size: 0.85rem; }
 .header-right a:hover { color: #f4b728; }
-.logout-btn { background: none; border: 1px solid #718096; color: #718096; padding: 0.3rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+.logout-btn { background: none; border: 1px solid #718096; color: #b0bccd; padding: 0.3rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
 .logout-btn:hover { border-color: #fc8181; color: #fc8181; }
 .tabs { display: flex; gap: 0; background: #1a1f2e; border-bottom: 1px solid #2d3748; padding: 0 2rem; }
-.tab { padding: 0.75rem 1.5rem; cursor: pointer; color: #718096; font-size: 0.9rem; border-bottom: 2px solid transparent; transition: all 0.15s; }
-.tab:hover { color: #e0e0e0; }
+.tab { padding: 0.75rem 1.5rem; cursor: pointer; color: #b0bccd; font-size: 0.9rem; border-bottom: 2px solid transparent; transition: all 0.15s; }
+.tab:hover { color: #f2f2f2; }
 .tab.active { color: #f4b728; border-bottom-color: #f4b728; }
 .container { max-width: 1100px; margin: 0 auto; padding: 1.5rem 2rem; }
 .panel { display: none; }
 .panel.active { display: block; }
 .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
-.card h2 { font-size: 0.9rem; color: #a0aec0; margin-bottom: 0.75rem; padding-bottom: 0.5rem; border-bottom: 1px solid #2d3748; }
+.card h2 { font-size: 0.9rem; color: #d6dde8; margin-bottom: 0.75rem; padding-bottom: 0.5rem; border-bottom: 1px solid #2d3748; }
 .kv-table { width: 100%; }
 .kv-table td { padding: 0.35rem 0; font-size: 0.85rem; }
-.kv-table td:first-child { color: #718096; width: 220px; }
+.kv-table td:first-child { color: #b0bccd; width: 220px; }
 .kv-table td:last-child { color: #e2e8f0; font-family: 'JetBrains Mono', 'Fira Code', monospace; word-break: break-all; }
 table.data { width: 100%; border-collapse: collapse; }
-table.data th { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: #718096; padding: 0.5rem; text-align: left; border-bottom: 1px solid #2d3748; }
-table.data td { font-size: 0.8rem; padding: 0.5rem; border-bottom: 1px solid #1a2332; color: #a0aec0; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+table.data th { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: #b0bccd; padding: 0.5rem; text-align: left; border-bottom: 1px solid #2d3748; }
+table.data td { font-size: 0.8rem; padding: 0.5rem; border-bottom: 1px solid #1a2332; color: #d6dde8; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
 table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
 .badge { padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
 .badge-ok { background: #22543d; color: #68d391; }
@@ -1343,13 +1343,13 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
 .status-msg { margin-top: 0.75rem; padding: 0.5rem 0.75rem; border-radius: 4px; font-size: 0.8rem; display: none; }
 .status-msg.ok { display: block; background: #22543d; color: #68d391; }
 .status-msg.err { display: block; background: #742a2a; color: #fc8181; }
-.search-box { width: 100%; padding: 0.5rem 0.75rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #e0e0e0; font-size: 0.85rem; margin-bottom: 0.75rem; }
+.search-box { width: 100%; padding: 0.5rem 0.75rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #f2f2f2; font-size: 0.85rem; margin-bottom: 0.75rem; }
 .search-box:focus { outline: none; border-color: #f4b728; }
-.adjust-input { width: 100px; padding: 0.2rem 0.4rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #e0e0e0; font-size: 0.75rem; font-family: monospace; }
+.adjust-input { width: 100px; padding: 0.2rem 0.4rem; background: #0d1117; border: 1px solid #2d3748; border-radius: 4px; color: #f2f2f2; font-size: 0.75rem; font-family: monospace; }
 .mono { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
 .addr { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gold { color: #f4b728; }
-.loading { color: #4a5568; font-size: 0.8rem; padding: 1rem; text-align: center; }
+.loading { color: #8a97ab; font-size: 0.8rem; padding: 1rem; text-align: center; }
 </style>
 </head>
 <body>
@@ -1382,18 +1382,18 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
             <button class="btn btn-primary" onclick="saveConfig()">Save</button>
             <span id="config-save-status" style="font-size:0.8rem"></span>
         </div>
-        <p style="font-size:0.7rem;color:#718096;margin-top:0.5rem">Changes are saved to disk. Restart the pool service to apply.</p>
+        <p style="font-size:0.7rem;color:#b0bccd;margin-top:0.5rem">Changes are saved to disk. Restart the pool service to apply.</p>
     </div>
     <div class="card">
         <h2>Restart Services</h2>
         <div style="display:flex;gap:1rem;align-items:flex-start;flex-wrap:wrap">
             <div>
-                <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Restart the pool (miners reconnect briefly).</p>
+                <p style="font-size:0.8rem;color:#b0bccd;margin-bottom:0.75rem">Restart the pool (miners reconnect briefly).</p>
                 <button class="btn btn-danger" onclick="restartPool()">Restart Pool</button>
                 <span id="restart-status" style="font-size:0.8rem;margin-left:0.5rem"></span>
             </div>
             <div>
-                <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Restart the dashboard (zero miner impact).</p>
+                <p style="font-size:0.8rem;color:#b0bccd;margin-bottom:0.75rem">Restart the dashboard (zero miner impact).</p>
                 <button class="btn btn-primary" onclick="restartDashboard()">Restart Dashboard</button>
                 <span id="restart-dash-status" style="font-size:0.8rem;margin-left:0.5rem"></span>
             </div>
@@ -1405,7 +1405,7 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
 <div class="panel" id="panel-payouts">
     <div class="card">
         <h2>Trigger Manual Payout</h2>
-        <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Runs the full payout pipeline: check maturity, shield coinbase, send payouts.</p>
+        <p style="font-size:0.8rem;color:#b0bccd;margin-bottom:0.75rem">Runs the full payout pipeline: check maturity, shield coinbase, send payouts.</p>
         <button class="btn btn-primary" id="btn-payout" onclick="triggerPayout()">Trigger Payout</button>
         <div id="payout-status" class="status-msg"></div>
     </div>
@@ -1441,7 +1441,7 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
     </div>
     <div class="card">
         <h2>Payout Pipeline</h2>
-        <div id="payout-health-content" style="color:#718096;font-size:0.85rem">Loading...</div>
+        <div id="payout-health-content" style="color:#b0bccd;font-size:0.85rem">Loading...</div>
     </div>
     <div class="card">
         <h2>Zallet (Wallet)</h2>
@@ -1454,30 +1454,30 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
     <div class="card">
         <h2>Service Logs</h2>
         <div style="display:flex;gap:0.5rem;margin-bottom:0.75rem">
-            <button class="btn btn-sm" style="background:#2d3748;color:#e0e0e0" onclick="showLog('pool')">Pool</button>
-            <button class="btn btn-sm" style="background:#2d3748;color:#e0e0e0" onclick="showLog('dashboard')">Dashboard</button>
-            <button class="btn btn-sm" style="background:#2d3748;color:#e0e0e0" onclick="showLog('zallet')">Zallet</button>
+            <button class="btn btn-sm" style="background:#2d3748;color:#f2f2f2" onclick="showLog('pool')">Pool</button>
+            <button class="btn btn-sm" style="background:#2d3748;color:#f2f2f2" onclick="showLog('dashboard')">Dashboard</button>
+            <button class="btn btn-sm" style="background:#2d3748;color:#f2f2f2" onclick="showLog('zallet')">Zallet</button>
         </div>
-        <pre id="log-content" style="background:#0d1117;border:1px solid #2d3748;border-radius:4px;padding:0.75rem;font-size:0.7rem;max-height:400px;overflow-y:auto;color:#a0aec0;white-space:pre-wrap;word-break:break-all"></pre>
+        <pre id="log-content" style="background:#0d1117;border:1px solid #2d3748;border-radius:4px;padding:0.75rem;font-size:0.7rem;max-height:400px;overflow-y:auto;color:#d6dde8;white-space:pre-wrap;word-break:break-all"></pre>
     </div>
 </div>
 
 <div class="panel" id="panel-labels">
     <div class="card">
         <h2>Pool Labels</h2>
-        <p style="font-size:0.85rem;color:#718096;margin-bottom:1rem">Map a miner payout address to a pool name shown on the Network tab. Changes apply live within the Network tab's cache window (about 1-5 min) &mdash; no restart. Built-in labels remain the fallback for any address not listed here.</p>
+        <p style="font-size:0.85rem;color:#b0bccd;margin-bottom:1rem">Map a miner payout address to a pool name shown on the Network tab. Changes apply live within the Network tab's cache window (about 1-5 min) &mdash; no restart. Built-in labels remain the fallback for any address not listed here.</p>
         <div style="display:flex;gap:0.6rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:1rem">
             <div style="flex:2;min-width:280px">
-                <label style="display:block;font-size:0.75rem;color:#718096;margin-bottom:0.25rem">Payout address</label>
-                <input id="label-address" type="text" placeholder="t1..." style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#e0e0e0;font-family:monospace;font-size:0.8rem">
+                <label style="display:block;font-size:0.75rem;color:#b0bccd;margin-bottom:0.25rem">Payout address</label>
+                <input id="label-address" type="text" placeholder="t1..." style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#f2f2f2;font-family:monospace;font-size:0.8rem">
             </div>
             <div style="flex:1;min-width:140px">
-                <label style="display:block;font-size:0.75rem;color:#718096;margin-bottom:0.25rem">Pool name</label>
-                <input id="label-name" type="text" placeholder="Mining-Dutch" style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#e0e0e0;font-size:0.85rem">
+                <label style="display:block;font-size:0.75rem;color:#b0bccd;margin-bottom:0.25rem">Pool name</label>
+                <input id="label-name" type="text" placeholder="Mining-Dutch" style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#f2f2f2;font-size:0.85rem">
             </div>
             <div style="flex:1;min-width:140px">
-                <label style="display:block;font-size:0.75rem;color:#718096;margin-bottom:0.25rem">Note (optional)</label>
-                <input id="label-note" type="text" placeholder="evidence / source" style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#e0e0e0;font-size:0.85rem">
+                <label style="display:block;font-size:0.75rem;color:#b0bccd;margin-bottom:0.25rem">Note (optional)</label>
+                <input id="label-note" type="text" placeholder="evidence / source" style="width:100%;padding:0.5rem;background:#0d1117;border:1px solid #2d3748;border-radius:4px;color:#f2f2f2;font-size:0.85rem">
             </div>
             <button class="btn btn-primary" onclick="saveLabel()">Save</button>
         </div>
@@ -1534,7 +1534,7 @@ async function fetchLabels() {
         if (!d) return;
         const labels = d.labels || [];
         if (!labels.length) {
-            box.innerHTML = '<span style="color:#718096">No custom labels yet. Built-in labels still apply.</span>';
+            box.innerHTML = '<span style="color:#b0bccd">No custom labels yet. Built-in labels still apply.</span>';
             return;
         }
         let html = '<table class="kv-table" style="width:100%"><tr><th style="text-align:left">Pool name</th><th style="text-align:left">Address</th><th style="text-align:left">Note</th><th style="text-align:left">Updated</th><th></th></tr>';
@@ -1542,8 +1542,8 @@ async function fetchLabels() {
             html += '<tr>' +
                 '<td>' + esc(l.name) + '</td>' +
                 '<td style="font-family:monospace;font-size:0.75rem">' + esc(l.address) + '</td>' +
-                '<td style="color:#718096;font-size:0.8rem">' + esc(l.note || '') + '</td>' +
-                '<td style="color:#718096;font-size:0.75rem">' + esc(l.updated_at || '') + '</td>' +
+                '<td style="color:#b0bccd;font-size:0.8rem">' + esc(l.note || '') + '</td>' +
+                '<td style="color:#b0bccd;font-size:0.75rem">' + esc(l.updated_at || '') + '</td>' +
                 '<td><button class="btn btn-danger btn-sm" onclick="deleteLabel(\'' + esc(l.address) + '\')">Remove</button></td>' +
                 '</tr>';
         }
@@ -1719,7 +1719,7 @@ async function fetchImmature() {
         const h = await fetchJson('/admin/api/health');
         if (!h) return;
         document.getElementById('immature-content').innerHTML =
-            '<p style="font-size:0.85rem;color:#a0aec0">See the public dashboard for detailed immature block info. Node height: <span class="gold">' + (h.node_height || '?') + '</span></p>';
+            '<p style="font-size:0.85rem;color:#d6dde8">See the public dashboard for detailed immature block info. Node height: <span class="gold">' + (h.node_height || '?') + '</span></p>';
     } catch (e) {
         document.getElementById('immature-content').innerHTML = '<span style="color:#fc8181">Error</span>';
     }
@@ -1794,7 +1794,7 @@ function renderMiners(miners) {
             '</tr>';
     }
     html += '</tbody></table>';
-    html += '<p style="font-size:0.7rem;color:#718096;margin-top:0.5rem">Adjust: enter amount in ' + coinUnit + ' (positive to add, negative to subtract from pending balance).</p>';
+    html += '<p style="font-size:0.7rem;color:#b0bccd;margin-top:0.5rem">Adjust: enter amount in ' + coinUnit + ' (positive to add, negative to subtract from pending balance).</p>';
     document.getElementById('miners-content').innerHTML = html;
 }
 
@@ -1893,7 +1893,7 @@ function renderZebraCard(d) {
     html += '<tr><td>Verified Height</td><td class="gold">' + (ourHeight != null ? ourHeight.toLocaleString() : '?') + '</td></tr>';
     if (z.finalized_height != null && z.verified_height != null) {
         const finDelta = z.verified_height - z.finalized_height;
-        html += '<tr><td>Finalized Height</td><td>' + z.finalized_height.toLocaleString() + ' <span style="color:#718096">(' + finDelta + ' back)</span></td></tr>';
+        html += '<tr><td>Finalized Height</td><td>' + z.finalized_height.toLocaleString() + ' <span style="color:#b0bccd">(' + finDelta + ' back)</span></td></tr>';
     }
 
     // Network Tip — fan-out across public lwd servers. Replaces zebra's
@@ -1920,9 +1920,9 @@ function renderZebraCard(d) {
             }
             let deltaTxt = '';
             if (delta != null && delta !== 0) {
-                deltaTxt = ' <span style="color:#718096">(Δ ' + (delta > 0 ? '+' : '') + delta + ')</span>';
+                deltaTxt = ' <span style="color:#b0bccd">(Δ ' + (delta > 0 ? '+' : '') + delta + ')</span>';
             }
-            const respTxt = ' <span style="color:#718096">(' + at.responses_ok + '/' + at.responses_total + ' responding)</span>';
+            const respTxt = ' <span style="color:#b0bccd">(' + at.responses_ok + '/' + at.responses_total + ' responding)</span>';
             html += '<tr><td>Network Tip</td><td style="color:' + color + '">' + at.max_height.toLocaleString() + deltaTxt + respTxt + '</td></tr>';
         } else {
             // Cache populated but every server failed — fall back to
@@ -1949,14 +1949,14 @@ function renderZebraCard(d) {
         const ok = total - errs;
         const pct = (errs / total) * 100;
         const c = pct > 5 ? '#fc8181' : pct > 1 ? '#f4b728' : '#68d391';
-        html += '<tr><td>getblocktemplate Error Rate</td><td style="color:' + c + '">' + pct.toFixed(2) + '% <span style="color:#718096">(' + errs.toLocaleString() + ' / ' + total.toLocaleString() + ')</span></td></tr>';
+        html += '<tr><td>getblocktemplate Error Rate</td><td style="color:' + c + '">' + pct.toFixed(2) + '% <span style="color:#b0bccd">(' + errs.toLocaleString() + ' / ' + total.toLocaleString() + ')</span></td></tr>';
         html += '<tr><td>getblocktemplate Successful</td><td style="color:#68d391">' + ok.toLocaleString() + '</td></tr>';
     }
 
     // Mempool
     if (z.mempool_txs != null) {
         let kb = '';
-        if (z.mempool_bytes != null) kb = ' <span style="color:#718096">(' + (z.mempool_bytes / 1024).toFixed(1) + ' KB)</span>';
+        if (z.mempool_bytes != null) kb = ' <span style="color:#b0bccd">(' + (z.mempool_bytes / 1024).toFixed(1) + ' KB)</span>';
         html += '<tr><td>Mempool</td><td>' + z.mempool_txs + ' txs' + kb + '</td></tr>';
     }
 
@@ -1982,10 +1982,10 @@ function renderZebraCard(d) {
         let color, recencyTxt;
         if (lp.wakes_total === 0 && lp.fails_total === 0) {
             color = '#718096';                   // no data yet
-            recencyTxt = ' <span style="color:#718096">(no activity yet)</span>';
+            recencyTxt = ' <span style="color:#b0bccd">(no activity yet)</span>';
         } else if (age == null) {
             color = '#68d391';
-            recencyTxt = ' <span style="color:#718096">(no failures since start)</span>';
+            recencyTxt = ' <span style="color:#b0bccd">(no failures since start)</span>';
         } else if (age < 60) {
             color = '#fc8181';
             recencyTxt = ' <span style="color:#fc8181">(last fail ' + age + 's ago)</span>';
@@ -1995,14 +1995,14 @@ function renderZebraCard(d) {
         } else {
             color = '#68d391';
             const minutes = Math.floor(age/60);
-            recencyTxt = ' <span style="color:#718096">(last fail ' + (minutes >= 60 ? Math.floor(minutes/60)+'h' : minutes+'m') + ' ago)</span>';
+            recencyTxt = ' <span style="color:#b0bccd">(last fail ' + (minutes >= 60 ? Math.floor(minutes/60)+'h' : minutes+'m') + ' ago)</span>';
         }
         html += '<tr><td>Longpoll</td><td style="color:' + color + '">wakes ' + lp.wakes_total.toLocaleString() +
             ' / fails ' + lp.fails_total.toLocaleString() + recencyTxt + '</td></tr>';
     }
 
     // Pool-side notify lag (the orphan-window we control)
-    html += '<tr><td style="padding-top:0.75rem;color:#718096;font-size:0.75rem">Pool to Miner Notify Lag</td><td></td></tr>';
+    html += '<tr><td style="padding-top:0.75rem;color:#b0bccd;font-size:0.75rem">Pool to Miner Notify Lag</td><td></td></tr>';
     if (lag && lag.samples_total > 0) {
         html += '<tr><td style="padding-left:1rem">&bull; Last (empty-block)</td><td style="color:' + lagColor(lag.last_empty_ms) + '">' + fmtMs(lag.last_empty_ms) + '</td></tr>';
         html += '<tr><td style="padding-left:1rem">&bull; p50 / p95 (empty-block)</td><td>' +
@@ -2012,15 +2012,15 @@ function renderZebraCard(d) {
             '<span style="color:' + lagColor(lag.p50_full_ms) + '">' + fmtMs(lag.p50_full_ms) + '</span> / ' +
             '<span style="color:' + lagColor(lag.p95_full_ms) + '">' + fmtMs(lag.p95_full_ms) + '</span></td></tr>';
         const ageTxt = lag.last_sample_age_secs != null ? lag.last_sample_age_secs + 's ago' : '';
-        html += '<tr><td style="padding-left:1rem">&bull; Samples (window / total)</td><td>' + lag.samples_window + ' / ' + lag.samples_total + ' <span style="color:#718096">' + ageTxt + '</span></td></tr>';
+        html += '<tr><td style="padding-left:1rem">&bull; Samples (window / total)</td><td>' + lag.samples_window + ' / ' + lag.samples_total + ' <span style="color:#b0bccd">' + ageTxt + '</span></td></tr>';
     } else {
-        html += '<tr><td style="padding-left:1rem;color:#718096">Awaiting first new-block event after pool start...</td><td></td></tr>';
+        html += '<tr><td style="padding-left:1rem;color:#b0bccd">Awaiting first new-block event after pool start...</td><td></td></tr>';
     }
 
     // Scrape meta
     if (z.scrape_duration_ms != null) {
         const c = z.scrape_duration_ms > 1500 ? '#fc8181' : z.scrape_duration_ms > 500 ? '#f4b728' : '#718096';
-        html += '<tr><td style="padding-top:0.75rem;color:#718096;font-size:0.75rem">Metrics scrape time</td><td style="color:' + c + ';font-size:0.75rem">' + z.scrape_duration_ms + ' ms</td></tr>';
+        html += '<tr><td style="padding-top:0.75rem;color:#b0bccd;font-size:0.75rem">Metrics scrape time</td><td style="color:' + c + ';font-size:0.75rem">' + z.scrape_duration_ms + ' ms</td></tr>';
     }
 
     html += '</table>';
@@ -2034,15 +2034,15 @@ async function fetchHealth() {
         const d = await fetchJson('/admin/api/health');
         if (!d) return;
         let html = '<table class="kv-table">';
-        html += '<tr><td>Zebrad (Node)</td><td>' + (d.node_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline/Stalled</span>') + (d.node_version ? ' <span style="color:#718096;font-size:0.75rem">' + d.node_version + '</span>' : '') + '</td></tr>';
+        html += '<tr><td>Zebrad (Node)</td><td>' + (d.node_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline/Stalled</span>') + (d.node_version ? ' <span style="color:#b0bccd;font-size:0.75rem">' + d.node_version + '</span>' : '') + '</td></tr>';
         html += '<tr><td>Node Height</td><td>' + (d.node_height || '?') + '</td></tr>';
         html += '<tr><td>Last Template</td><td>' + (d.last_template_at || 'N/A') + (d.last_template_age_secs != null ? ' (' + d.last_template_age_secs + 's ago)' : '') + '</td></tr>';
-        html += '<tr><td>Zallet (Wallet)</td><td>' + (d.wallet_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline</span>') + (d.wallet_version ? ' <span style="color:#718096;font-size:0.75rem">' + d.wallet_version + '</span>' : '') + '</td></tr>';
+        html += '<tr><td>Zallet (Wallet)</td><td>' + (d.wallet_ok ? '<span class="badge badge-ok">Online</span>' : '<span class="badge badge-fail">Offline</span>') + (d.wallet_version ? ' <span style="color:#b0bccd;font-size:0.75rem">' + d.wallet_version + '</span>' : '') + '</td></tr>';
         if (d.wallet_balance) {
             html += '<tr><td>Wallet Total</td><td class="gold">' + d.wallet_balance.total + ' ZEC</td></tr>';
         }
         html += '<tr><td>Pool Version</td><td>' + (d.pool_version || '?') + '</td></tr>';
-        html += '<tr><td>Pool Uptime</td><td>' + (d.pool_uptime_secs != null ? fmtDuration(d.pool_uptime_secs) : '<span style="color:#718096">N/A</span>') + '</td></tr>';
+        html += '<tr><td>Pool Uptime</td><td>' + (d.pool_uptime_secs != null ? fmtDuration(d.pool_uptime_secs) : '<span style="color:#b0bccd">N/A</span>') + '</td></tr>';
         html += '<tr><td>Dashboard Uptime</td><td>' + fmtDuration(d.dashboard_uptime_secs) + '</td></tr>';
         html += '<tr><td>Connected Miners</td><td>' + d.connected_miners + '</td></tr>';
         html += '<tr><td>Connected Workers</td><td>' + d.connected_workers + '</td></tr>';
@@ -2061,7 +2061,7 @@ async function fetchHealth() {
             const pct = (count / acc) * 100;
             return pct > bad ? '#fc8181' : pct > warn ? '#f4b728' : '#68d391';
         };
-        html += '<tr><td style="padding-top:0.75rem;color:#718096;font-size:0.75rem">Rejection Breakdown</td><td></td></tr>';
+        html += '<tr><td style="padding-top:0.75rem;color:#b0bccd;font-size:0.75rem">Rejection Breakdown</td><td></td></tr>';
         html += '<tr><td style="padding-left:1rem">&bull; Low Difficulty (code 23)</td><td style="color:' + pctColor(d.rejects_low_diff, 0.5, 2) + '">' + d.rejects_low_diff.toLocaleString() + '</td></tr>';
         html += '<tr><td style="padding-left:1rem">&bull; Job Not Found (code 21)</td><td style="color:' + pctColor(d.rejects_job_not_found, 0.2, 1) + '">' + d.rejects_job_not_found.toLocaleString() + '</td></tr>';
         html += '<tr><td style="padding-left:1rem">&bull; Duplicate (code 22)</td><td style="color:' + pctColor(d.rejects_duplicate, 0.1, 0.5) + '">' + d.rejects_duplicate.toLocaleString() + '</td></tr>';
@@ -2071,7 +2071,7 @@ async function fetchHealth() {
         // System stats (Linux only)
         if (d.system) {
             const s = d.system;
-            html += '<h2 style="font-size:0.9rem;color:#a0aec0;margin:1.25rem 0 0.75rem;padding-bottom:0.5rem;border-bottom:1px solid #2d3748">System Resources</h2>';
+            html += '<h2 style="font-size:0.9rem;color:#d6dde8;margin:1.25rem 0 0.75rem;padding-bottom:0.5rem;border-bottom:1px solid #2d3748">System Resources</h2>';
             html += '<table class="kv-table">';
 
             // Load average
@@ -2080,7 +2080,7 @@ async function fetchHealth() {
                 '<span style="color:' + loadColor(s.load_1m) + '">' + s.load_1m.toFixed(2) + '</span> / ' +
                 '<span style="color:' + loadColor(s.load_5m) + '">' + s.load_5m.toFixed(2) + '</span> / ' +
                 '<span style="color:' + loadColor(s.load_15m) + '">' + s.load_15m.toFixed(2) + '</span>' +
-                ' <span style="color:#718096">(' + s.cpu_count + ' CPUs)</span></td></tr>';
+                ' <span style="color:#b0bccd">(' + s.cpu_count + ' CPUs)</span></td></tr>';
 
             // Memory
             const memColor = s.mem_percent >= 95 ? '#fc8181' : s.mem_percent >= 80 ? '#f4b728' : '#68d391';
@@ -2139,7 +2139,7 @@ async function fetchHealth() {
             }
             const wColor = ph.wallet_responsive ? '#68d391' : '#fc8181';
             phHtml += '<tr><td>Wallet RPC</td><td style="color:' + wColor + '">' + (ph.wallet_responsive ? 'Responsive' : 'Not responding') + '</td></tr>';
-            phHtml += '<tr><td>Last Check</td><td style="color:#718096">' + (ph.checked_at || '?') + '</td></tr>';
+            phHtml += '<tr><td>Last Check</td><td style="color:#b0bccd">' + (ph.checked_at || '?') + '</td></tr>';
             phHtml += '</table>';
 
             // Generate alerts
@@ -2153,7 +2153,7 @@ async function fetchHealth() {
                 alerts += '<div style="background:#742a2a;border:1px solid #fc8181;border-radius:6px;padding:0.75rem;margin-bottom:0.75rem;font-size:0.85rem;color:#fc8181">&#9888; Zallet wallet is not responding to RPC calls.</div>';
             }
         } else {
-            phHtml = '<span style="color:#718096">No payout health data yet</span>';
+            phHtml = '<span style="color:#b0bccd">No payout health data yet</span>';
         }
         document.getElementById('payout-health-content').innerHTML = phHtml;
         document.getElementById('health-alerts').innerHTML = alerts;

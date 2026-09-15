@@ -943,28 +943,28 @@ const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <title>Wallet Status - Zcash Mining Pool</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #f2f2f2; min-height: 100vh; }
         .header { background: linear-gradient(135deg, #1a1f2e 0%, #0d1117 100%); border-bottom: 1px solid #f4b728; padding: 1.5rem 2rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
         .header h1 { color: #f4b728; font-size: 1.5rem; }
-        .header a { color: #718096; text-decoration: none; font-size: 0.9rem; }
+        .header a { color: #b0bccd; text-decoration: none; font-size: 0.9rem; }
         .header a:hover { color: #f4b728; }
         .container { max-width: 700px; margin: 0 auto; padding: 2rem; }
         .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }
-        .card h2 { font-size: 1rem; color: #a0aec0; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #2d3748; }
+        .card h2 { font-size: 1rem; color: #d6dde8; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #2d3748; }
         .badge { padding: 0.25rem 0.75rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
         .badge-ok { background: #22543d; color: #68d391; }
         .badge-fail { background: #742a2a; color: #fc8181; }
         .balance-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
-        .balance-item .label { font-size: 0.7rem; text-transform: uppercase; color: #718096; margin-bottom: 0.25rem; }
+        .balance-item .label { font-size: 0.7rem; text-transform: uppercase; color: #b0bccd; margin-bottom: 0.25rem; }
         .balance-item .value { font-size: 1.25rem; color: #f4b728; }
         .error { color: #fc8181; margin-top: 0.5rem; }
-        .note { font-size: 0.75rem; color: #718096; margin-top: 1rem; }
+        .note { font-size: 0.75rem; color: #b0bccd; margin-top: 1rem; }
         .maturity-table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
-        .maturity-table th { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: #718096; padding: 0.4rem 0.5rem; text-align: left; border-bottom: 1px solid #2d3748; }
-        .maturity-table td { font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace; font-size: 0.8rem; padding: 0.4rem 0.5rem; border-bottom: 1px solid #1a2332; color: #a0aec0; }
+        .maturity-table th { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: #b0bccd; padding: 0.4rem 0.5rem; text-align: left; border-bottom: 1px solid #2d3748; }
+        .maturity-table td { font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace; font-size: 0.8rem; padding: 0.4rem 0.5rem; border-bottom: 1px solid #1a2332; color: #d6dde8; }
         .progress-bar { background: #2d3748; border-radius: 4px; height: 16px; overflow: hidden; min-width: 80px; }
         .progress-fill { height: 100%; background: linear-gradient(90deg, #d69e2e, #f4b728); border-radius: 4px; transition: width 0.5s ease; }
-        .empty-msg { color: #4a5568; font-size: 0.8rem; padding: 1rem 0; text-align: center; }
+        .empty-msg { color: #8a97ab; font-size: 0.8rem; padding: 1rem 0; text-align: center; }
     </style>
 </head>
 <body style="opacity:0;transition:opacity 0.15s">
