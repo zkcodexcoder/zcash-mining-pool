@@ -916,6 +916,12 @@ pub(crate) async fn reconcile(c: &mut SqliteConnection) -> Result<PpsLedgerSumma
     if orphan_attribution != 0 {
         return Err(PpsDbError::Invariant);
     }
+    // Every reversal names exactly the settled payout it undoes.
+    let bad_reversals:i64=sqlx::query_scalar("SELECT COUNT(*) FROM pps_payout_reversals x LEFT JOIN pps_payouts p ON p.id=x.payout_id WHERE p.id IS NULL OR x.attempt_id<>p.attempt_id OR x.miner_id<>p.miner_id OR x.txid<>p.txid OR x.amount<>p.amount")
+        .fetch_one(&mut *c).await?;
+    if bad_reversals != 0 {
+        return Err(PpsDbError::Invariant);
+    }
     let meta = sqlx::query("SELECT * FROM pps_meta WHERE singleton=1")
         .fetch_optional(&mut *c)
         .await?
@@ -991,7 +997,9 @@ pub(crate) async fn reconcile(c: &mut SqliteConnection) -> Result<PpsLedgerSumma
         if reservation != paying {
             return Err(PpsDbError::Invariant);
         }
-        let settled = sqlx::query("SELECT amount FROM pps_payouts WHERE miner_id=?1")
+        // A settled payout whose transaction can never confirm was reversed by the
+        // operator tool (pps_payout_reversals) and no longer counts as paid.
+        let settled = sqlx::query("SELECT amount FROM pps_payouts p WHERE miner_id=?1 AND NOT EXISTS(SELECT 1 FROM pps_payout_reversals x WHERE x.payout_id=p.id)")
             .bind(m)
             .fetch_all(&mut *c)
             .await?;
@@ -1893,6 +1901,66 @@ mod tests {
         assert!(replay.duplicate);
         assert!(f.db.pps_credit_readiness_snapshot(&f.e).await.unwrap().financial_halt);
         assert_eq!(f.db.pps_funding_snapshot().await.unwrap().gross_subzatoshis, 3 * PPS_SCALE);
+    }
+    #[tokio::test]
+    async fn a_conflicted_settled_payout_is_reversed_to_pending_with_its_fee() {
+        // Operator decision 2026-09-15 (#9): a settled payout whose transaction the
+        // wallet reports conflicted can never confirm; the guarded tool returns the
+        // amount to pending, journals it, and the fee counts as never paid.
+        let (f, a, intent) = conventional_fixture().await;
+        conventional_sent(&f, a, &intent).await;
+        assert_eq!(f.db.confirm_pps_conventional_payout(a, &"c".repeat(64), 7).await.unwrap(), 1);
+        let before = f.db.pps_funding_snapshot().await.unwrap();
+        assert_eq!((before.paid_zatoshis, before.paid_fees_zatoshis), (1, 7));
+        let settled = f.db.get_pps_settled_payouts(a).await.unwrap();
+        assert_eq!((settled.len(), settled[0].miner_id, settled[0].amount_zatoshis, settled[0].reversed), (1, f.m, 1, false));
+        // A settled payout is not a releasable send; a wrong or unknown attempt is refused.
+        assert!(matches!(f.db.release_conflicted_conventional_send(a, &"c".repeat(64), "ev").await, Err(PpsDbError::Invalid)));
+        assert!(matches!(f.db.reverse_conflicted_pps_payout(a, &"d".repeat(64), "op", "ev").await, Err(PpsDbError::Invalid)));
+        assert!(matches!(f.db.reverse_conflicted_pps_payout(a + 100, &"c".repeat(64), "op", "ev").await, Err(PpsDbError::Invalid)));
+        assert!(matches!(f.db.reverse_conflicted_pps_payout(a, &"c".repeat(64), "", "ev").await, Err(PpsDbError::Invalid)));
+        assert_eq!(
+            f.db.reverse_conflicted_pps_payout(a, &"c".repeat(64), "op@host", "{\"node\":\"absent\",\"wallet_confirmations\":-1}").await.unwrap(),
+            1
+        );
+        let after = f.db.pps_funding_snapshot().await.unwrap();
+        assert_eq!(
+            (after.paid_zatoshis, after.paid_fees_zatoshis, after.pps_outstanding_subzatoshis),
+            (0, 0, before.pps_outstanding_subzatoshis + PPS_SCALE)
+        );
+        assert!(f.db.get_pps_settled_payouts(a).await.unwrap()[0].reversed);
+        assert!(matches!(f.db.reverse_conflicted_pps_payout(a, &"c".repeat(64), "op", "ev").await, Err(PpsDbError::DuplicateMismatch)));
+        assert!(f.db.pps_invariant().await.is_ok());
+        assert!(sqlx::query("DELETE FROM pps_payout_reversals").execute(f.db.inner()).await.is_err());
+        assert!(sqlx::query("UPDATE pps_payout_reversals SET amount=2").execute(f.db.inner()).await.is_err());
+        assert_eq!(f.db.get_pps_payout_attempt_status(a).await.unwrap().unwrap().0, "failed");
+        // The balance is due again and can be paid by a later round.
+        let b = f.db.create_payout_attempt(1, 1, "again").await.unwrap();
+        f.db.reserve_pps_payout(b, &[(f.m, 1)], &funded(&f).await, &fee(b)).await.unwrap();
+        assert!(f.db.pps_invariant().await.is_ok());
+    }
+    #[tokio::test]
+    async fn a_conflicted_unsettled_send_is_released_back_to_pending() {
+        // The sent transaction conflicted before settling: the claims return to
+        // pending, the reservation is released and the send journaled.
+        let (f, a, intent) = conventional_fixture().await;
+        conventional_sent(&f, a, &intent).await;
+        assert!(matches!(f.db.release_conflicted_conventional_send(a, &"d".repeat(64), "ev").await, Err(PpsDbError::Invalid)));
+        assert!(matches!(f.db.reverse_conflicted_pps_payout(a, &"c".repeat(64), "op", "ev").await, Err(PpsDbError::Invalid)));
+        assert_eq!(f.db.release_conflicted_conventional_send(a, &"c".repeat(64), "{\"wallet_confirmations\":-1}").await.unwrap(), 1);
+        let s = f.db.pps_funding_snapshot().await.unwrap();
+        assert_eq!((s.pps_paying_zatoshis, s.paid_zatoshis, s.reserved_fees_zatoshis, s.paid_fees_zatoshis), (0, 0, 0, 0));
+        let r = f.db.get_pps_conventional_attempt(a).await.unwrap().unwrap();
+        assert_eq!((r.status.as_str(), r.sealed, r.operation_id, r.expected_txid), ("released", false, None, None));
+        let journaled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_released_sends WHERE attempt_id=?1 AND operation_id='opid-fixture'")
+            .bind(a).fetch_one(f.db.inner()).await.unwrap();
+        assert_eq!(journaled, 1);
+        assert_eq!(f.db.get_pps_payout_attempt_status(a).await.unwrap().unwrap().0, "failed");
+        assert!(f.db.confirm_pps_conventional_payout(a, &"c".repeat(64), 7).await.is_err());
+        assert!(matches!(f.db.release_conflicted_conventional_send(a, &"c".repeat(64), "ev").await, Err(PpsDbError::Invalid)));
+        let b = f.db.create_payout_attempt(1, 1, "again").await.unwrap();
+        f.db.reserve_pps_payout(b, &[(f.m, 1)], &funded(&f).await, &fee(b)).await.unwrap();
+        assert!(f.db.pps_invariant().await.is_ok());
     }
     #[tokio::test]
     async fn an_audited_release_lifts_the_halt_fence_and_settles_an_over_bound_fee() {

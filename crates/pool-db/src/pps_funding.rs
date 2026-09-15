@@ -711,7 +711,7 @@ pub(crate) async fn snapshot(
     s.unused_credit_subzatoshis = s.cap_subzatoshis.saturating_sub(s.pps_outstanding_subzatoshis);
     cursor = None;
     loop {
-        let rows=sqlx::query("SELECT f.*,p.attempt_id AS conventional_id,p.intent_id,p.fee_bound,p.actual_fee,p.operation_id,p.observed_txid,p.excess_fee,i.canonical_json,h.category AS halt_category,(r.attempt_id IS NOT NULL) AS halt_released FROM pps_fee_reservations f LEFT JOIN pps_conventional_attempts p ON p.attempt_id=f.attempt_id LEFT JOIN pps_conventional_intents i ON i.attempt_id=f.attempt_id LEFT JOIN pps_conventional_halts h ON h.attempt_id=f.attempt_id LEFT JOIN pps_halt_releases r ON r.attempt_id=f.attempt_id WHERE (?1 IS NULL OR f.attempt_id>?1) ORDER BY f.attempt_id LIMIT 256")
+        let rows=sqlx::query("SELECT f.*,p.attempt_id AS conventional_id,p.intent_id,p.fee_bound,p.actual_fee,p.operation_id,p.observed_txid,p.excess_fee,i.canonical_json,h.category AS halt_category,(r.attempt_id IS NOT NULL) AS halt_released,(SELECT COUNT(*) FROM pps_payout_reversals x WHERE x.attempt_id=f.attempt_id) AS reversed_payouts FROM pps_fee_reservations f LEFT JOIN pps_conventional_attempts p ON p.attempt_id=f.attempt_id LEFT JOIN pps_conventional_intents i ON i.attempt_id=f.attempt_id LEFT JOIN pps_conventional_halts h ON h.attempt_id=f.attempt_id LEFT JOIN pps_halt_releases r ON r.attempt_id=f.attempt_id WHERE (?1 IS NULL OR f.attempt_id>?1) ORDER BY f.attempt_id LIMIT 256")
             .bind(cursor).fetch_all(&mut *c).await?;
         if rows.is_empty() {
             break;
@@ -758,13 +758,16 @@ pub(crate) async fn snapshot(
                         && txid == expected
                         && txid.as_deref().is_some_and(canonical_hash) =>
                 {
-                    s.paid_fees_zatoshis = plus(
-                        s.paid_fees_zatoshis,
-                        conventional
-                            .as_ref()
-                            .and_then(|a| a.settled_fee_zatoshis())
-                            .unwrap_or(fee),
-                    )?
+                    // A reversed payout's transaction never confirmed: no fee was paid.
+                    if r.try_get::<i64, _>("reversed_payouts")? == 0 {
+                        s.paid_fees_zatoshis = plus(
+                            s.paid_fees_zatoshis,
+                            conventional
+                                .as_ref()
+                                .and_then(|a| a.settled_fee_zatoshis())
+                                .unwrap_or(fee),
+                        )?
+                    }
                 }
                 "released" if txid.is_none() && sealed == 0 => (),
                 _ => return Err(PpsDbError::Invariant),
@@ -906,6 +909,52 @@ impl PpsHaltKind {
             Self::ExcessFee => "excess_fee",
         }
     }
+}
+/// A settled payout row of one attempt, for the operator tools.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PpsSettledPayout {
+    pub id: i64,
+    pub miner_id: i64,
+    pub amount_zatoshis: i64,
+    pub txid: String,
+    pub reversed: bool,
+}
+/// Return every claim of an unsettled attempt from paying to pending and drop
+/// its payout items. Shared by the operator release paths.
+async fn return_claims_to_pending(tx: &mut SqliteConnection, attempt: i64) -> Result<i64, PpsDbError> {
+    let items = sqlx::query("SELECT miner_id,amount FROM pps_payout_items WHERE attempt_id=?1")
+        .bind(attempt)
+        .fetch_all(&mut *tx)
+        .await?;
+    if items.is_empty() {
+        return Err(PpsDbError::Invalid);
+    }
+    let mut released = 0i64;
+    for item in &items {
+        let miner: i64 = item.try_get("miner_id")?;
+        let amount: i64 = item.try_get("amount")?;
+        let row = sqlx::query("SELECT pending,paying FROM pps_accounts WHERE miner_id=?1")
+            .bind(miner)
+            .fetch_one(&mut *tx)
+            .await?;
+        let pending: i64 = row.try_get("pending")?;
+        let paying: i64 = row.try_get("paying")?;
+        if amount <= 0 || paying < amount {
+            return Err(PpsDbError::Invariant);
+        }
+        sqlx::query("UPDATE pps_accounts SET pending=?1,paying=?2 WHERE miner_id=?3")
+            .bind(pending.checked_add(amount).ok_or(PpsDbError::Invariant)?)
+            .bind(paying - amount)
+            .bind(miner)
+            .execute(&mut *tx)
+            .await?;
+        released = released.checked_add(amount).ok_or(PpsDbError::Invariant)?;
+    }
+    sqlx::query("DELETE FROM pps_payout_items WHERE attempt_id=?1")
+        .bind(attempt)
+        .execute(&mut *tx)
+        .await?;
+    Ok(released)
 }
 /// An unreleased financial halt, as listed for the operator.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1283,38 +1332,7 @@ impl PoolDb {
         {
             return Err(PpsDbError::Invalid);
         }
-        let items = sqlx::query("SELECT miner_id,amount FROM pps_payout_items WHERE attempt_id=?1")
-            .bind(attempt)
-            .fetch_all(&mut *tx)
-            .await?;
-        if items.is_empty() {
-            return Err(PpsDbError::Invalid);
-        }
-        let mut released = 0i64;
-        for item in &items {
-            let miner: i64 = item.try_get("miner_id")?;
-            let amount: i64 = item.try_get("amount")?;
-            let row = sqlx::query("SELECT pending,paying FROM pps_accounts WHERE miner_id=?1")
-                .bind(miner)
-                .fetch_one(&mut *tx)
-                .await?;
-            let pending: i64 = row.try_get("pending")?;
-            let paying: i64 = row.try_get("paying")?;
-            if amount <= 0 || paying < amount {
-                return Err(PpsDbError::Invariant);
-            }
-            sqlx::query("UPDATE pps_accounts SET pending=?1,paying=?2 WHERE miner_id=?3")
-                .bind(pending.checked_add(amount).ok_or(PpsDbError::Invariant)?)
-                .bind(paying - amount)
-                .bind(miner)
-                .execute(&mut *tx)
-                .await?;
-            released = released.checked_add(amount).ok_or(PpsDbError::Invariant)?;
-        }
-        sqlx::query("DELETE FROM pps_payout_items WHERE attempt_id=?1")
-            .bind(attempt)
-            .execute(&mut *tx)
-            .await?;
+        let released = return_claims_to_pending(&mut tx, attempt).await?;
         // A released reservation is unsealed and carries no operation; the
         // immutable release record keeps the operation id and the evidence.
         sqlx::query("INSERT INTO pps_released_sends(attempt_id,operation_id,released_zatoshis,evidence) VALUES(?1,?2,?3,?4)")
@@ -1346,6 +1364,149 @@ impl PoolDb {
         crate::pps_live::reconcile(&mut tx).await?;
         tx.commit().await?;
         Ok(released)
+    }
+    /// Operator tool (2026-09-15, #9): a SENT, unsettled send whose transaction
+    /// the wallet reports conflicted (its notes were spent elsewhere after a
+    /// reorg) can never confirm. The claims return to pending, the reservation is
+    /// released and the send is journaled in pps_released_sends with the evidence.
+    pub async fn release_conflicted_conventional_send(
+        &self,
+        attempt: i64,
+        txid: &str,
+        evidence: &str,
+    ) -> Result<i64, PpsDbError> {
+        if attempt <= 0 || !canonical_hash(txid) || evidence.is_empty() || evidence.len() > 4096 {
+            return Err(PpsDbError::Invalid);
+        }
+        let mut c = self.inner().acquire().await?;
+        sqlx::query("PRAGMA synchronous=FULL").execute(&mut *c).await?;
+        let mut tx = c.begin_with("BEGIN IMMEDIATE").await?;
+        crate::pps_live::reconcile(&mut tx).await?;
+        let a = conventional_attempt(&mut tx, attempt).await?.ok_or(PpsDbError::Invalid)?;
+        let reservation_txid: Option<String> =
+            sqlx::query_scalar("SELECT txid FROM pps_fee_reservations WHERE attempt_id=?1")
+                .bind(attempt).fetch_one(&mut *tx).await?;
+        let settled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_payouts WHERE attempt_id=?1")
+            .bind(attempt).fetch_one(&mut *tx).await?;
+        let Some(operation) = a.operation_id.clone() else { return Err(PpsDbError::Invalid) };
+        if !a.sealed
+            || a.status != "reserved"
+            || a.expected_txid.as_deref() != Some(txid)
+            || a.actual_fee_zatoshis.is_some()
+            || a.excess_fee_zatoshis.is_some()
+            || a.halt_category.is_some()
+            || reservation_txid.is_some()
+            || settled != 0
+        {
+            return Err(PpsDbError::Invalid);
+        }
+        let released = return_claims_to_pending(&mut tx, attempt).await?;
+        sqlx::query("INSERT INTO pps_released_sends(attempt_id,operation_id,released_zatoshis,evidence) VALUES(?1,?2,?3,?4)")
+            .bind(attempt).bind(&operation).bind(released).bind(evidence)
+            .execute(&mut *tx).await?;
+        let cleared = sqlx::query("UPDATE pps_conventional_attempts SET operation_id=NULL,observed_txid=NULL WHERE attempt_id=?1 AND operation_id=?2 AND observed_txid=?3 AND actual_fee IS NULL AND excess_fee IS NULL")
+            .bind(attempt).bind(&operation).bind(txid)
+            .execute(&mut *tx).await?.rows_affected();
+        let unsealed = sqlx::query("UPDATE pps_fee_reservations SET status='released',sealed=0,expected_txid=NULL WHERE attempt_id=?1 AND status='reserved' AND sealed=1 AND txid IS NULL AND expected_txid=?2")
+            .bind(attempt).bind(txid)
+            .execute(&mut *tx).await?.rows_affected();
+        if cleared != 1 || unsealed != 1 {
+            return Err(PpsDbError::Invariant);
+        }
+        sqlx::query("UPDATE payout_attempts SET status='failed',error_message='released: transaction conflicted after a reorg and can never confirm',updated_at=datetime('now') WHERE id=?1")
+            .bind(attempt).execute(&mut *tx).await?;
+        bump_generation(&mut tx).await?;
+        crate::pps_live::reconcile(&mut tx).await?;
+        tx.commit().await?;
+        Ok(released)
+    }
+    /// Operator tool (2026-09-15, #9): a SETTLED payout whose transaction the
+    /// wallet reports conflicted can never confirm. Every settled amount of the
+    /// attempt returns from paid to pending and is journaled in
+    /// pps_payout_reversals (the pps_payouts rows stay for the audit trail); the
+    /// attempt is marked failed. Returns the total returned.
+    pub async fn reverse_conflicted_pps_payout(
+        &self,
+        attempt: i64,
+        txid: &str,
+        operator: &str,
+        evidence: &str,
+    ) -> Result<i64, PpsDbError> {
+        if attempt <= 0 || !canonical_hash(txid)
+            || operator.is_empty() || operator.len() > 128
+            || evidence.is_empty() || evidence.len() > 4096
+        {
+            return Err(PpsDbError::Invalid);
+        }
+        let mut c = self.inner().acquire().await?;
+        sqlx::query("PRAGMA synchronous=FULL").execute(&mut *c).await?;
+        let mut tx = c.begin_with("BEGIN IMMEDIATE").await?;
+        crate::pps_live::reconcile(&mut tx).await?;
+        let already: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_payout_reversals WHERE attempt_id=?1")
+            .bind(attempt).fetch_one(&mut *tx).await?;
+        if already != 0 {
+            return Err(PpsDbError::DuplicateMismatch);
+        }
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM payout_attempts WHERE id=?1")
+            .bind(attempt).fetch_optional(&mut *tx).await?;
+        if status.as_deref() != Some("confirmed") {
+            return Err(PpsDbError::Invalid);
+        }
+        let rows = sqlx::query("SELECT id,miner_id,amount,txid FROM pps_payouts WHERE attempt_id=?1 ORDER BY id")
+            .bind(attempt).fetch_all(&mut *tx).await?;
+        if rows.is_empty() {
+            return Err(PpsDbError::Invalid);
+        }
+        let mut total = 0i64;
+        for r in &rows {
+            let payout_id: i64 = r.try_get("id")?;
+            let miner: i64 = r.try_get("miner_id")?;
+            let amount: i64 = r.try_get("amount")?;
+            if r.try_get::<String, _>("txid")? != txid {
+                return Err(PpsDbError::Invalid);
+            }
+            let account = sqlx::query("SELECT pending,paid FROM pps_accounts WHERE miner_id=?1")
+                .bind(miner).fetch_one(&mut *tx).await?;
+            let pending: i64 = account.try_get("pending")?;
+            let paid: i64 = account.try_get("paid")?;
+            if amount <= 0 || paid < amount {
+                return Err(PpsDbError::Invariant);
+            }
+            sqlx::query("UPDATE pps_accounts SET pending=?1,paid=?2 WHERE miner_id=?3")
+                .bind(pending.checked_add(amount).ok_or(PpsDbError::Invariant)?)
+                .bind(paid - amount)
+                .bind(miner)
+                .execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO pps_payout_reversals(payout_id,attempt_id,miner_id,txid,amount,operator,evidence) VALUES(?1,?2,?3,?4,?5,?6,?7)")
+                .bind(payout_id).bind(attempt).bind(miner).bind(txid).bind(amount).bind(operator).bind(evidence)
+                .execute(&mut *tx).await?;
+            total = total.checked_add(amount).ok_or(PpsDbError::Invariant)?;
+        }
+        sqlx::query("UPDATE payout_attempts SET status='failed',error_message='reversed: transaction conflicted after a reorg and can never confirm',updated_at=datetime('now') WHERE id=?1")
+            .bind(attempt).execute(&mut *tx).await?;
+        bump_generation(&mut tx).await?;
+        crate::pps_live::reconcile(&mut tx).await?;
+        tx.commit().await?;
+        Ok(total)
+    }
+    /// Settled payouts of one attempt, with whether each was reversed.
+    pub async fn get_pps_settled_payouts(&self, attempt: i64) -> Result<Vec<PpsSettledPayout>, PpsDbError> {
+        let rows = sqlx::query("SELECT p.id,p.miner_id,p.amount,p.txid,EXISTS(SELECT 1 FROM pps_payout_reversals x WHERE x.payout_id=p.id) AS reversed FROM pps_payouts p WHERE p.attempt_id=?1 ORDER BY p.id")
+            .bind(attempt).fetch_all(self.inner()).await?;
+        rows.iter()
+            .map(|r| Ok(PpsSettledPayout {
+                id: r.try_get("id")?,
+                miner_id: r.try_get("miner_id")?,
+                amount_zatoshis: r.try_get("amount")?,
+                txid: r.try_get("txid")?,
+                reversed: r.try_get::<i64, _>("reversed")? == 1,
+            }))
+            .collect()
+    }
+    /// (status, created_at, updated_at) of a payout attempt.
+    pub async fn get_pps_payout_attempt_status(&self, attempt: i64) -> Result<Option<(String, String, String)>, PpsDbError> {
+        Ok(sqlx::query_as("SELECT status,created_at,updated_at FROM payout_attempts WHERE id=?1")
+            .bind(attempt).fetch_optional(self.inner()).await?)
     }
     /// The result transaction is learned AFTER the one asynchronous wallet
     /// invocation. No signer/broadcast action is performed by this method.

@@ -954,7 +954,7 @@ impl Reconciler {
     async fn check_pps_phantom_payouts(&self, summary: &mut SweepSummary) {
         if self.pps_policy.is_none() { return; }
         let newest: Result<Vec<(String, i64)>, _> = sqlx::query_as(
-            "SELECT txid, MAX(id) m FROM pps_payouts GROUP BY txid ORDER BY m DESC LIMIT ?1",
+            "SELECT txid, MAX(id) m FROM pps_payouts p WHERE NOT EXISTS(SELECT 1 FROM pps_payout_reversals x WHERE x.payout_id=p.id) GROUP BY txid ORDER BY m DESC LIMIT ?1",
         ).bind(PPS_AUDIT_NEWEST).fetch_all(self.db.inner()).await;
         let newest = match newest {
             Ok(v) => v,
@@ -967,7 +967,7 @@ impl Reconciler {
         // Older slice: below both the cursor and the newest window.
         let below = newest.iter().map(|(_, m)| *m).min().unwrap_or(i64::MAX).min(cursor);
         let older: Result<Vec<(String, i64)>, _> = sqlx::query_as(
-            "SELECT txid, MAX(id) m FROM pps_payouts GROUP BY txid HAVING m < ?1 ORDER BY m DESC LIMIT ?2",
+            "SELECT txid, MAX(id) m FROM pps_payouts p WHERE NOT EXISTS(SELECT 1 FROM pps_payout_reversals x WHERE x.payout_id=p.id) GROUP BY txid HAVING m < ?1 ORDER BY m DESC LIMIT ?2",
         ).bind(below).bind(PPS_AUDIT_OLDER).fetch_all(self.db.inner()).await;
         let older = match older {
             Ok(v) => v,
