@@ -78,18 +78,19 @@ pub struct PnlPeriod {
     net_zat: i64,
     /// Block value the credited work was expected to find: credited / (1 - fee).
     expected_zat: i64,
-    /// Blocks found (confirmed + maturing) / expected; None when nothing was credited.
-    luck: Option<f64>,
+    /// Effort: expected block value / blocks found (confirmed + maturing). Lower is
+    /// better, the same reading as block luck. None when no block was found.
+    effort: Option<f64>,
 }
 
 impl PnlPeriod {
-    /// Derive the net result, expected block value and luck from the raw totals.
+    /// Derive the net result, expected block value and effort from the raw totals.
     fn finish(mut self, fee_bps: i64) -> Self {
         self.net_zat = self.income_zat - self.credited_zat - self.tx_fees_zat;
         let kept_bps = 10_000 - fee_bps.clamp(0, 9_999);
         self.expected_zat = (i128::from(self.credited_zat) * 10_000 / i128::from(kept_bps)) as i64;
-        self.luck = (self.expected_zat > 0)
-            .then(|| (self.income_zat + self.maturing_zat) as f64 / self.expected_zat as f64);
+        let found = self.income_zat + self.maturing_zat;
+        self.effort = (found > 0).then(|| self.expected_zat as f64 / found as f64);
         self
     }
 
@@ -565,7 +566,7 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
     <div class="sec-head"><h2>Pool P&amp;L</h2><span class="note">block rewards in, minus what the pool owes miners for their shares, minus payout fees</span></div>
     <div class="tiles" id="pnl-tiles"></div>
     <div class="panel" style="padding:.4rem .6rem;margin-top:1rem"><div class="tablewrap"><table>
-      <thead><tr><th>Period (UTC)</th><th class="num">Blocks</th><th class="num">Income</th><th class="num">Maturing</th><th class="num">Credited</th><th class="num">Payout fees</th><th class="num">Net</th><th class="num">Luck</th></tr></thead>
+      <thead><tr><th>Period (UTC)</th><th class="num">Blocks</th><th class="num">Income</th><th class="num">Maturing</th><th class="num">Credited</th><th class="num">Payout fees</th><th class="num">Net</th><th class="num">Effort</th></tr></thead>
       <tbody id="pnl-rows"></tbody>
     </table></div></div>
     <div class="throttle"><b>How to read this.</b> PPS pays miners the expected value of every share, minus the fee, whether or not the pool finds blocks, so the net result swings with luck and evens out over time. Income counts confirmed blocks only; blocks still maturing are listed separately until they confirm. Luck compares blocks found (confirmed and maturing) with what the credited work should have found. Blocks column: confirmed, +maturing, · orphaned. Rows under the totals are per UTC hour for the last 24 hours. All amounts in TAZ.</div>
@@ -775,7 +776,7 @@ async function render(){
       [`<span class="${netCls(ep.net_zat)}">${signed(ep.net_zat)}</span>`, 'net result', 'this epoch · income − credited − payout fees'],
       [zt(ep.income_zat), 'block income', `${ep.blocks_confirmed} confirmed blocks`],
       [zt(ep.credited_zat), 'credited to miners', `net of the ${(pnl.fee_bps/100).toFixed(1)}% fee`],
-      [lk(ep.luck), 'luck', 'blocks found ÷ expected'],
+      [lk(ep.effort), 'effort', 'expected ÷ blocks found · lower is better'],
       [ep.blocks_orphaned, 'orphaned blocks', `${zt(ep.orphaned_zat)} TAZ lost`],
       [zt(ep.tx_fees_zat), 'payout fees', `${zt(ep.maturing_zat)} TAZ maturing`],
     ].map(([n,l,s]) => `<div class="tile"><div class="n">${n}</div><div class="l">${l}</div><div class="s">${s}</div></div>`).join('');
@@ -783,7 +784,7 @@ async function render(){
   const pnlRow = (x, cls) => `<tr class="${cls}"><td>${x.label}</td>`
     + `<td class="num">${x.blocks_confirmed}${x.blocks_maturing ? ' +' + x.blocks_maturing : ''}${x.blocks_orphaned ? ' · ' + x.blocks_orphaned : ''}</td>`
     + `<td class="num">${zt(x.income_zat)}</td><td class="num">${zt(x.maturing_zat)}</td><td class="num">${zt(x.credited_zat)}</td>`
-    + `<td class="num">${zt(x.tx_fees_zat)}</td><td class="num ${netCls(x.net_zat)}">${signed(x.net_zat)}</td><td class="num">${lk(x.luck)}</td></tr>`;
+    + `<td class="num">${zt(x.tx_fees_zat)}</td><td class="num ${netCls(x.net_zat)}">${signed(x.net_zat)}</td><td class="num">${lk(x.effort)}</td></tr>`;
   $('pnl-rows').innerHTML = pnl.periods.map((x, i) => pnlRow(x, i === pnl.periods.length - 1 ? 'pnl-sep' : '')).join('')
     // Testing aid: per-hour rows (last 24 h) in place of pnl.daily for now.
     + (pnl.hourly || []).map(x => pnlRow({...x, label: x.label.slice(5)}, 'pnl-day')).join('');
@@ -804,7 +805,7 @@ mod pnl_tests {
     use pool_db::PoolDb;
 
     #[test]
-    fn net_result_expected_value_and_luck_follow_the_fee() {
+    fn net_result_expected_value_and_effort_follow_the_fee() {
         let p = PnlPeriod {
             income_zat: 1_000, maturing_zat: 100, credited_zat: 990, tx_fees_zat: 5,
             ..Default::default()
@@ -812,8 +813,9 @@ mod pnl_tests {
         .finish(100);
         assert_eq!(p.net_zat, 5);
         assert_eq!(p.expected_zat, 1_000);
-        assert_eq!(p.luck, Some(1.1));
-        assert_eq!(PnlPeriod::default().finish(100).luck, None);
+        // 1,100 found against 1,000 expected: lucky, so effort is below 100%.
+        assert_eq!(p.effort, Some(1_000.0 / 1_100.0));
+        assert_eq!(PnlPeriod::default().finish(100).effort, None);
     }
 
     #[tokio::test]
