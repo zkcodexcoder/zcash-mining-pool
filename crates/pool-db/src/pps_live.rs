@@ -39,6 +39,8 @@ pub enum PpsDbError {
     PayoutHalted,
     #[error("PPS accounting halted pending operator review; new credits refused")]
     FinancialHalt,
+    #[error("PPS new-account exposure cap reached; credit refused until a payout settles")]
+    AccountExposureCapped,
     #[error("PPS accounting invariant failed")]
     Invariant,
     #[error("PPS database operation failed")]
@@ -432,6 +434,33 @@ impl PoolDb {
             return Err(PpsDbError::FinancialHalt);
         }
         let now = clock()?;
+        // Withholding defence (operator decision 2026-09-15, #10): an account
+        // younger than the configured age may not run up more than the exposure
+        // cap in outstanding balance; its shares are refused until a payout
+        // settles. The block-solving share is still submitted by the caller.
+        if let Some((young_seconds, exposure)) = crate::pps_funding::admission_limits(&mut tx).await? {
+            if exposure > 0 {
+                let created: i64 = sqlx::query_scalar(
+                    "SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM miners WHERE id=?1",
+                )
+                .bind(m)
+                .fetch_one(&mut *tx)
+                .await?;
+                if now.saturating_sub(created) < young_seconds {
+                    let outstanding: i64 = sqlx::query_scalar(
+                        "SELECT COALESCE((SELECT pending+paying+(fraction>0) FROM pps_accounts WHERE miner_id=?1),0)",
+                    )
+                    .bind(m)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let credit_zats = i64::try_from(s.amount_subzatoshis.div_ceil(PPS_SCALE))
+                        .map_err(|_| PpsDbError::Invalid)?;
+                    if outstanding.checked_add(credit_zats).is_none_or(|v| v > exposure) {
+                        return Err(PpsDbError::AccountExposureCapped);
+                    }
+                }
+            }
+        }
         // An absent or stale funding lease never rejects a valid share; a fresh proof
         // that the wallet cannot cover what is owed does (see advisory_funding).
         let funding_advisory = advisory_funding(
@@ -1901,6 +1930,57 @@ mod tests {
         assert!(replay.duplicate);
         assert!(f.db.pps_credit_readiness_snapshot(&f.e).await.unwrap().financial_halt);
         assert_eq!(f.db.pps_funding_snapshot().await.unwrap().gross_subzatoshis, 3 * PPS_SCALE);
+    }
+    #[tokio::test]
+    async fn a_young_account_is_capped_until_it_is_paid_and_an_old_one_is_not() {
+        // Operator decision 2026-09-15 (#10): an account younger than the configured
+        // age may not hold more than the exposure cap outstanding.
+        let f = setup(true, 1_000_000).await;
+        f.db.set_pps_admission_limits(86_400, 3).await.unwrap();
+        f.db.set_pps_admission_limits(86_400, 3).await.unwrap(); // idempotent upsert
+        f.db.credit_pps_share(&f.e, &event(&f, 1, 2 * PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await.unwrap();
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 2, 2 * PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await,
+            Err(PpsDbError::AccountExposureCapped)
+        ));
+        // A sub-zatoshi credit counts as one zatoshi of exposure: 2 + 1 fits exactly.
+        f.db.credit_pps_share(&f.e, &event(&f, 3, PPS_SCALE / 2), Some(&f.l), Some(&funded(&f).await), NOW).await.unwrap();
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 4, 1), Some(&f.l), Some(&funded(&f).await), NOW).await,
+            Err(PpsDbError::AccountExposureCapped)
+        ));
+        // Exposure 0 disables the cap.
+        f.db.set_pps_admission_limits(86_400, 0).await.unwrap();
+        f.db.credit_pps_share(&f.e, &event(&f, 5, 5 * PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await.unwrap();
+        // Re-enabled, the account is over the cap; an OLD account is never capped.
+        f.db.set_pps_admission_limits(86_400, 3).await.unwrap();
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 6, 1), Some(&f.l), Some(&funded(&f).await), NOW).await,
+            Err(PpsDbError::AccountExposureCapped)
+        ));
+        sqlx::query("UPDATE miners SET created_at=datetime(?1,'unixepoch','-2 days') WHERE id=?2")
+            .bind(NOW).bind(f.m).execute(f.db.inner()).await.unwrap();
+        f.db.credit_pps_share(&f.e, &event(&f, 6, 1), Some(&f.l), Some(&funded(&f).await), NOW).await.unwrap();
+        assert!(f.db.pps_invariant().await.is_ok());
+    }
+    #[tokio::test]
+    async fn withholding_report_counts_expected_and_found_blocks_per_miner() {
+        // The fixture quote has assigned target 0x0202… over network target 0x0101…:
+        // each share is "expected" to solve two blocks.
+        let f = setup(true, 1_000_000).await;
+        for i in 1..=3 {
+            f.db.credit_pps_share(&f.e, &event(&f, i, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await.unwrap();
+        }
+        sqlx::query("INSERT INTO blocks(height,hash,reward,status,found_by) VALUES(1,'h1',1,'confirmed',?1)")
+            .bind(f.w).execute(f.db.inner()).await.unwrap();
+        let report = f.db.pps_withholding_report(NOW - 100).await.unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!((report[0].miner_id, report[0].found_blocks), (f.m, 1));
+        assert!((report[0].expected_blocks - 6.0).abs() < 1e-9, "{}", report[0].expected_blocks);
+        assert_eq!(report[0].address, "synthetic-miner");
+        // Shares before the window do not count; the block (stamped now) still does.
+        let later = f.db.pps_withholding_report(NOW + 1).await.unwrap();
+        assert_eq!((later.len(), later[0].expected_blocks, later[0].found_blocks), (1, 0.0, 1));
     }
     #[tokio::test]
     async fn a_conflicted_settled_payout_is_reversed_to_pending_with_its_fee() {

@@ -76,6 +76,7 @@ impl PoolDb {
         sqlx::raw_sql(include_str!("../migrations/023_pps_halt_releases.sql")).execute(&mut *pps_migration).await?;
         sqlx::raw_sql(include_str!("../migrations/024_pps_payout_reversals.sql")).execute(&mut *pps_migration).await?;
         sqlx::raw_sql(include_str!("../migrations/025_pps_send_note_snapshots.sql")).execute(&mut *pps_migration).await?;
+        sqlx::raw_sql(include_str!("../migrations/026_pps_admission_limits.sql")).execute(&mut *pps_migration).await?;
         pps_migration.commit().await?;
         Ok(())
     }

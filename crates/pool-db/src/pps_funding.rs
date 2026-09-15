@@ -884,6 +884,23 @@ fn fresh_lease<'a>(
     }
     Ok(l)
 }
+/// The young-account admission limits (seconds, exposure zatoshis), if written.
+pub(crate) async fn admission_limits(c: &mut SqliteConnection) -> Result<Option<(i64, i64)>, PpsDbError> {
+    Ok(sqlx::query_as("SELECT young_account_seconds,young_account_exposure FROM pps_admission_limits WHERE singleton=1")
+        .fetch_optional(&mut *c)
+        .await?)
+}
+/// One miner's expected-vs-found blocks over a window (withholding defence, #10).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PpsMinerLuck {
+    pub miner_id: i64,
+    pub address: String,
+    pub expected_blocks: f64,
+    pub found_blocks: i64,
+}
+fn target_as_f64(bytes: &[u8]) -> f64 {
+    bytes.iter().fold(0.0_f64, |acc, b| acc * 256.0 + f64::from(*b))
+}
 /// A financial halt: a send that failed byte-for-byte verification (recipient,
 /// fee, version or source mismatch) or an excess fee, not yet released by an
 /// operator (pps_halt_releases, audit B10). Sends are fenced while one is
@@ -1155,6 +1172,63 @@ impl PoolDb {
         }
         self.mark_pps_proposal(attempt, proposal_id, Some(expected_txid), false)
             .await
+    }
+    /// Writes the young-account admission limits from configuration (upsert).
+    pub async fn set_pps_admission_limits(&self, young_account_seconds: i64, young_account_exposure_zatoshis: i64) -> Result<(), PpsDbError> {
+        if young_account_seconds < 0 || young_account_exposure_zatoshis < 0 {
+            return Err(PpsDbError::Invalid);
+        }
+        sqlx::query(
+            "INSERT INTO pps_admission_limits(singleton,young_account_seconds,young_account_exposure,updated_at) VALUES(1,?1,?2,datetime('now')) \
+             ON CONFLICT(singleton) DO UPDATE SET young_account_seconds=excluded.young_account_seconds, \
+             young_account_exposure=excluded.young_account_exposure, updated_at=excluded.updated_at",
+        )
+        .bind(young_account_seconds).bind(young_account_exposure_zatoshis)
+        .execute(self.inner()).await?;
+        Ok(())
+    }
+    /// Expected blocks (the sum over credited shares of assigned target over
+    /// network target) and found blocks per miner since `since_unix`
+    /// (withholding defence, #10). Blocks of every status count as found.
+    pub async fn pps_withholding_report(&self, since_unix: i64) -> Result<Vec<PpsMinerLuck>, PpsDbError> {
+        use std::collections::BTreeMap;
+        let mut expected: BTreeMap<i64, f64> = BTreeMap::new();
+        let rows = sqlx::query(
+            "SELECT e.miner_id,q.assigned_target,q.network_target,COUNT(*) AS n FROM pps_events e \
+             JOIN pps_quotes q ON q.quote_id=e.quote_id WHERE e.accepted_at>=?1 GROUP BY e.miner_id,e.quote_id",
+        )
+        .bind(since_unix).fetch_all(self.inner()).await?;
+        for r in &rows {
+            let miner: i64 = r.try_get("miner_id")?;
+            let assigned: Vec<u8> = r.try_get("assigned_target")?;
+            let network: Vec<u8> = r.try_get("network_target")?;
+            let n: i64 = r.try_get("n")?;
+            let (assigned, network) = (target_as_f64(&assigned), target_as_f64(&network));
+            if network <= 0.0 || assigned < 0.0 { return Err(PpsDbError::Invariant); }
+            *expected.entry(miner).or_default() += n as f64 * (assigned / network);
+        }
+        let mut found: BTreeMap<i64, i64> = BTreeMap::new();
+        let rows = sqlx::query(
+            "SELECT w.miner_id,COUNT(*) AS n FROM blocks b JOIN workers w ON w.id=b.found_by \
+             WHERE b.created_at>=datetime(?1,'unixepoch') GROUP BY w.miner_id",
+        )
+        .bind(since_unix).fetch_all(self.inner()).await?;
+        for r in &rows {
+            found.insert(r.try_get("miner_id")?, r.try_get("n")?);
+        }
+        let mut miners: Vec<i64> = expected.keys().chain(found.keys()).copied().collect();
+        miners.sort(); miners.dedup();
+        let mut report = Vec::with_capacity(miners.len());
+        for miner in miners {
+            let address: String = sqlx::query_scalar("SELECT address FROM miners WHERE id=?1")
+                .bind(miner).fetch_optional(self.inner()).await?.unwrap_or_default();
+            report.push(PpsMinerLuck {
+                miner_id: miner, address,
+                expected_blocks: expected.get(&miner).copied().unwrap_or(0.0),
+                found_blocks: found.get(&miner).copied().unwrap_or(0),
+            });
+        }
+        Ok(report)
     }
     /// The wallet's unspent note txids just before this attempt's send
     /// (lost-operation recovery, #8). Insert-once; the attempt must be reserved

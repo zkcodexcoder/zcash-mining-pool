@@ -139,6 +139,7 @@ impl Reconciler {
         self.check_clawbacks(&mut summary).await;
         self.check_invariant(&mut summary).await;
         self.check_pps_invariant(&mut summary).await;
+        self.check_pps_withholding(&mut summary).await;
         self.check_coinbase_outputs(&mut summary).await;
 
         let health = serde_json::json!({
@@ -1017,6 +1018,40 @@ impl Reconciler {
         }
     }
 
+    /// Withholding defence (operator decision 2026-09-15, #10): per-account and
+    /// pool-wide expected-vs-found blocks over the last day. Far fewer blocks
+    /// than the credited shares predict is the signature of a miner withholding
+    /// solutions. Alert only; the young-account exposure cap in the credit path
+    /// bounds the payoff.
+    async fn check_pps_withholding(&self, summary: &mut SweepSummary) {
+        if self.pps_policy.is_none() { return; }
+        let since = chrono::Utc::now().timestamp() - WITHHOLDING_WINDOW_SECONDS;
+        let report = match self.db.pps_withholding_report(since).await {
+            Ok(r) => r,
+            Err(e) => { summary.alerts.push(format!("PPS withholding check failed: {e}")); return; }
+        };
+        let (mut expected_total, mut found_total) = (0.0_f64, 0_i64);
+        for m in &report {
+            expected_total += m.expected_blocks;
+            found_total += m.found_blocks;
+            if m.expected_blocks >= WITHHOLDING_MIN_EXPECTED {
+                let p = poisson_lower_tail(m.expected_blocks, m.found_blocks);
+                if p < WITHHOLDING_P_THRESHOLD {
+                    summary.alerts.push(format!(
+                        "PPS withholding suspicion: miner {} ({}) expected {:.1} blocks in 24h, found {} (p={:.1e}); review before paying further",
+                        m.miner_id, m.address.chars().take(12).collect::<String>(), m.expected_blocks, m.found_blocks, p));
+                }
+            }
+        }
+        if expected_total >= WITHHOLDING_MIN_EXPECTED {
+            let p = poisson_lower_tail(expected_total, found_total);
+            if p < WITHHOLDING_P_THRESHOLD {
+                summary.alerts.push(format!(
+                    "PPS pool-wide luck breaker: expected {expected_total:.1} blocks in 24h, found {found_total} (p={p:.1e})"));
+            }
+        }
+    }
+
     /// True when the payout wallet reports the transaction conflicted (-1 confirmations).
     async fn pps_wallet_conflicted(&self, txid: &str) -> bool {
         matches!(
@@ -1025,6 +1060,25 @@ impl Reconciler {
             Ok(Ok(v)) if v.get("confirmations").and_then(|c| c.as_i64()).is_some_and(|c| c < 0)
         )
     }
+}
+
+/// Withholding defence window and thresholds (#10).
+const WITHHOLDING_WINDOW_SECONDS: i64 = 86_400;
+const WITHHOLDING_MIN_EXPECTED: f64 = 5.0;
+const WITHHOLDING_P_THRESHOLD: f64 = 1e-3;
+
+/// P(X <= k) for X ~ Poisson(lambda), summed in log space.
+pub(crate) fn poisson_lower_tail(lambda: f64, k: i64) -> f64 {
+    if k < 0 { return 0.0; }
+    if lambda <= 0.0 { return 1.0; }
+    let mut log_term = -lambda;
+    let mut acc = log_term;
+    for i in 1..=k {
+        log_term += lambda.ln() - (i as f64).ln();
+        let (hi, lo) = if acc >= log_term { (acc, log_term) } else { (log_term, acc) };
+        acc = hi + (lo - hi).exp().ln_1p();
+    }
+    acc.exp().min(1.0)
 }
 
 #[derive(Debug, Default)]
@@ -1043,6 +1097,16 @@ pub(crate) mod tests {
     use axum::{extract::State, routing::post, Json, Router};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
+    #[test]
+    fn poisson_lower_tail_matches_known_values() {
+        assert!((poisson_lower_tail(10.0, 10) - 0.5830).abs() < 1e-3);
+        assert!((poisson_lower_tail(5.0, 0) - (-5.0_f64).exp()).abs() < 1e-12);
+        assert!(poisson_lower_tail(20.0, 2) < 1e-6);
+        assert_eq!(poisson_lower_tail(0.0, 3), 1.0);
+        assert_eq!(poisson_lower_tail(3.0, -1), 0.0);
+        assert!((poisson_lower_tail(2.0, 100) - 1.0).abs() < 1e-12);
+    }
+
 
     /// Mock JSON-RPC server: answers each method from a canned response map.
     /// Unknown methods get a JSON-RPC error (matching a node that doesn't
@@ -1528,7 +1592,7 @@ pub(crate) mod tests {
             network: "testnet".into(), epoch: "audit-test".into(), fee_bps: 100,
             max_liability_zatoshis: 1_000, total_exposure_zatoshis: 2_000,
             fee_allowance_zatoshis: 10, reserve_min_zatoshis: 1, max_payout_zatoshis: 100,
-            funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY,
+            funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY, young_account_seconds: 604_800, young_account_exposure_zatoshis: None,
             settle_confirmations: 10,
         }
     }

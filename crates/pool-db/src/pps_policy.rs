@@ -17,6 +17,7 @@ fn default_settle_confirmations() -> u64 {
 /// asserts it at compile time.
 pub const PAYOUT_NOTE_MATURITY: u32 = 10;
 fn default_funding_maturity_confirmations() -> u32 { PAYOUT_NOTE_MATURITY }
+fn default_young_account_seconds() -> i64 { 7 * 86_400 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +36,14 @@ pub struct PpsPolicy {
     /// admission does not pause while the wallet holds the money.
     #[serde(default = "default_funding_maturity_confirmations")]
     pub funding_maturity_confirmations: u32,
+    /// Withholding defence (#10): an account younger than this may not hold more
+    /// than `young_account_exposure_zatoshis` outstanding. 0 disables the age test.
+    #[serde(default = "default_young_account_seconds")]
+    pub young_account_seconds: i64,
+    /// Outstanding-balance cap for young accounts. Absent: twice
+    /// `max_payout_zatoshis`; 0 disables the cap.
+    #[serde(default)]
+    pub young_account_exposure_zatoshis: Option<i64>,
     /// Confirmations before a sent payout settles (paying -> paid). Never read from
     /// `[pps]`; the dashboard sets it from `[payout] pps_settle_confirmations`.
     #[serde(skip, default = "default_settle_confirmations")]
@@ -83,7 +92,17 @@ impl PpsPolicy {
         if !(1..=PAYOUT_NOTE_MATURITY).contains(&self.funding_maturity_confirmations) {
             return Err("PPS funding_maturity_confirmations must be within 1..=10");
         }
+        if !(0..=366_i64 * 86_400).contains(&self.young_account_seconds)
+            || self.young_account_exposure_zatoshis.is_some_and(|v| v < 0 || v > MAX_MONEY)
+        {
+            return Err("PPS young-account limits out of range");
+        }
         Ok(())
+    }
+
+    /// The outstanding-balance cap for young accounts (0 disables it).
+    pub fn young_account_exposure(&self) -> i64 {
+        self.young_account_exposure_zatoshis.unwrap_or(self.max_payout_zatoshis.saturating_mul(2))
     }
 
     pub fn epoch_config(&self) -> crate::pps_live::PpsEpoch {
@@ -114,9 +133,22 @@ mod tests {
             fee_allowance_zatoshis: 10_000_000,
             reserve_min_zatoshis: 10_000_000,
             max_payout_zatoshis: 20_000_000,
-            funding_maturity_confirmations: PAYOUT_NOTE_MATURITY,
+            funding_maturity_confirmations: PAYOUT_NOTE_MATURITY, young_account_seconds: 604_800, young_account_exposure_zatoshis: None,
             settle_confirmations: DEFAULT_SETTLE_CONFIRMATIONS,
         }
+    }
+
+    #[test]
+    fn young_account_limits_default_to_a_week_and_twice_the_payout_cap() {
+        let p = policy();
+        assert_eq!((p.young_account_seconds, p.young_account_exposure()), (7 * 86_400, 40_000_000));
+        let mut q = policy(); q.young_account_exposure_zatoshis = Some(0);
+        assert!(q.validate("testnet").is_ok()); assert_eq!(q.young_account_exposure(), 0);
+        q.young_account_seconds = -1; assert!(q.validate("testnet").is_err());
+        q.young_account_seconds = 0; q.young_account_exposure_zatoshis = Some(-1);
+        assert!(q.validate("testnet").is_err());
+        let parsed: PpsPolicy = serde_json::from_str(r#"{"network":"testnet","epoch":"e","fee_bps":10,"max_liability_zatoshis":100000000,"total_exposure_zatoshis":110000000,"fee_allowance_zatoshis":10000000,"reserve_min_zatoshis":1,"max_payout_zatoshis":20000000,"young_account_seconds":3600,"young_account_exposure_zatoshis":5}"#).unwrap();
+        assert_eq!((parsed.young_account_seconds, parsed.young_account_exposure()), (3600, 5));
     }
 
     #[test]

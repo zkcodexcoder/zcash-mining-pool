@@ -229,7 +229,7 @@ fn synthetic_policy() -> PpsPolicy {
         fee_allowance_zatoshis: 10_000_000,
         reserve_min_zatoshis: 10_000_000,
         max_payout_zatoshis: 100_000_000,
-        funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY,
+        funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY, young_account_seconds: 604_800, young_account_exposure_zatoshis: None,
         settle_confirmations: 10,
     }
 }

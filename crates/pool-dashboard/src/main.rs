@@ -478,6 +478,7 @@ async fn main() -> Result<()> {
     db.assert_reward_mode(config.pps.is_some()).await?;
     if let Some(policy) = &config.pps {
         db.verify_pps_epoch(&policy.epoch_config()).await?;
+        db.set_pps_admission_limits(policy.young_account_seconds, policy.young_account_exposure()).await?;
         db.pps_invariant().await?;
     }
 

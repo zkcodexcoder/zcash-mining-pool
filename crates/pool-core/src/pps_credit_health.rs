@@ -75,6 +75,7 @@ const CATEGORIES: &[&str] = &[
     "unknown", "not_attempted", "ok", "missing", "malformed", "stale",
     "funding_missing", "funding_expired", "chain_invalid", "generation_changed",
     "financial_halt", "payout_halted", "liability_over_cap", "reserve_low", "fee_capacity_exhausted", "funding_insufficient",
+    "account_exposure_capped",
     "accounting_unavailable", "accounting_invalid", "epoch_mismatch", "legacy_recovery",
     "invalid_input", "duplicate_mismatch", "chain_lease_required", "funding_lease_required",
     "route_policy", "unsupported_recipient", "network_mismatch", "fee_contract_unavailable",
@@ -288,6 +289,7 @@ pub(crate) fn db_category(error:&PpsDbError) -> &'static str {
         PpsDbError::FundingLeaseRequired=>"funding_lease_required", PpsDbError::FundingInsufficient=>"funding_insufficient",
         PpsDbError::FeeBudgetExceeded=>"fee_capacity_exhausted", PpsDbError::Invariant=>"accounting_invalid",
         PpsDbError::PayoutHalted=>"payout_halted", PpsDbError::FinancialHalt=>"financial_halt",
+        PpsDbError::AccountExposureCapped=>"account_exposure_capped",
         PpsDbError::Database(_)=>"accounting_unavailable",
     }
 }

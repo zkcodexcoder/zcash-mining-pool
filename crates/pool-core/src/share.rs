@@ -1451,6 +1451,10 @@ impl ShareValidator {
                         // credits until an operator unhalts (operator decision 2026-09-15).
                         pool_db::pps_live::PpsDbError::FinancialHalt =>
                             "PPS admission paused: pool accounting halted",
+                        // Withholding defence (#10): this account is young and at its
+                        // exposure cap; its shares resume once a payout settles.
+                        pool_db::pps_live::PpsDbError::AccountExposureCapped =>
+                            "PPS admission paused: new-account exposure cap",
                         _ => "PPS admission paused: ledger or authorization gate",
                     }) })?;
             drop(latest);

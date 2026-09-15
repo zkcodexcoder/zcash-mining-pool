@@ -74,6 +74,7 @@ fn pre_send_error_category(error: &anyhow::Error) -> &'static str {
             PpsDbError::FeeBudgetExceeded => "fee_budget_exceeded",
             PpsDbError::PayoutHalted => "payout_halted",
             PpsDbError::FinancialHalt => "financial_halt",
+            PpsDbError::AccountExposureCapped => "account_exposure_capped",
             PpsDbError::Invariant => "accounting_invariant",
             PpsDbError::Database(_) => "database_unavailable",
         };
@@ -394,6 +395,20 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
     let total = pre_send_phase("claim_total", async {
         items.iter().try_fold(0_i64,|sum,(_,v)|sum.checked_add(*v)).context("PPS total overflow")
     }).await?;
+    // Payouts spend only mature notes (PAYOUT_NOTE_MATURITY). When the mature
+    // balance cannot cover what is already committed plus this batch and its fee
+    // bound, the reservation would be refused: wait for change to mature instead
+    // of leaving a failed attempt every round.
+    let committed = pre_send_phase("committed_outflow", async {
+        Ok::<_,anyhow::Error>(db.pps_funding_snapshot().await?.committed_outflow_zatoshis)
+    }).await?;
+    let needed = committed.checked_add(total).and_then(|v| v.checked_add(bound.fee_upper_bound_zatoshis))
+        .context("PPS batch overflow")?;
+    if funding.mature_spendable_zatoshis < needed {
+        tracing::info!(mature = funding.mature_spendable_zatoshis, needed,
+            "PPS payout waiting for mature notes; no attempt created");
+        return Ok(None);
+    }
     let attempt = pre_send_phase("attempt_create",
         db.create_payout_attempt(items.len() as i64,total,"pps-conventional-testnet")).await?;
     if pre_send_phase("reserve", db.reserve_pps_conventional_payout(attempt,&items,&funding,&bound))
