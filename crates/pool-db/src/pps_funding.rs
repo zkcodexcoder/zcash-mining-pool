@@ -746,13 +746,15 @@ pub(crate) async fn snapshot(
     if bad_attribution != 0 {
         return Err(PpsDbError::Invariant);
     }
-    // Exposure is outstanding liability plus committed fees (refill model) — not
-    // lifetime gross, which is expected to grow past the cap indefinitely.
-    if committed_fees > e.fee_allowance_zatoshis
-        || s.pps_outstanding_subzatoshis
-            .checked_add(subunits(committed_fees, 0)?)
-            .map_or(true, |v| v > e.total_exposure_zatoshis as u128 * PPS_SCALE)
-    {
+    // The fee allowance is a hard budget: what the pool may still spend on sends.
+    // Total exposure (outstanding liability plus committed fees) is an operator
+    // policy figure and, like the liability cap, a warning rather than a fault:
+    // being over it is exactly the state that paying miners and maturing income
+    // resolve, so it must not fail the snapshot, the payout seal or crediting
+    // (2026-09-15: it froze payouts on testnet once liability passed the cap).
+    // Proven insolvency — the wallet below what is owed plus reserve floor and fee
+    // allowance — is the credit stop (decision #1).
+    if committed_fees > e.fee_allowance_zatoshis {
         return Err(PpsDbError::FeeBudgetExceeded);
     }
     // Audit B3: the wallet must cover what is actually OWED (outstanding, rounded up

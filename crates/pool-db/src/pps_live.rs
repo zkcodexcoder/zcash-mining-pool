@@ -1174,6 +1174,27 @@ mod tests {
         assert_eq!(r.funding_advisory, None);
     }
     #[tokio::test]
+    async fn liability_over_total_exposure_is_a_warning_not_an_accounting_fault() {
+        // 2026-09-15: outstanding liability passed the cap (a warning) and then the
+        // policy's total exposure, and the snapshot treated that as a fault — every
+        // payout seal and funding refresh failed until it was fixed. Cap 10, exposure 110.
+        let f = setup(true, 10).await;
+        let big = event(&f, 1, 200 * PPS_SCALE);
+        let r = f.db.credit_pps_share(&f.e, &big, Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        assert_eq!(r.liability_advisory, Some("liability_over_cap"));
+        let s = f.db.pps_funding_snapshot().await.unwrap();
+        assert_eq!(s.pps_outstanding_subzatoshis, 200 * PPS_SCALE);
+        assert!(f.db.pps_invariant().await.is_ok());
+        // Paying is what brings exposure back down, so a reservation is still allowed.
+        let attempt = f.db.create_payout_attempt(1, 5, "fixture-pps").await.unwrap();
+        f.db.reserve_pps_payout(attempt, &[(f.m, 5)], &funded(&f).await, &fee(attempt))
+            .await
+            .unwrap();
+        assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, 5);
+    }
+    #[tokio::test]
     async fn proven_insolvency_refuses_the_credit_until_a_fresh_proof_covers_it() {
         // Operator decision 2026-09-15: a lease that passes every freshness check
         // and still cannot cover what is owed (plus reserve floor and fee allowance)
