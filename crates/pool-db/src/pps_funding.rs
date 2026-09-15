@@ -249,6 +249,9 @@ pub struct PpsConventionalAttempt {
     pub intent_id: String,
     pub canonical_intent: Option<String>,
     pub halt_category: Option<PpsConventionalHalt>,
+    /// An operator released this attempt's halt (pps_halt_releases): the fence is
+    /// lifted and an over-bound fee may settle at the amount actually paid.
+    pub halt_released: bool,
     pub operation_id: Option<String>,
     pub expected_txid: Option<String>,
     pub fee_upper_bound_zatoshis: i64,
@@ -256,6 +259,14 @@ pub struct PpsConventionalAttempt {
     pub excess_fee_zatoshis: Option<i64>,
     pub sealed: bool,
     pub status: String,
+}
+impl PpsConventionalAttempt {
+    /// The fee this send settles at: the actual fee within the bound, or the
+    /// over-bound fee once an operator released it (pps_halt_releases).
+    pub fn settled_fee_zatoshis(&self) -> Option<i64> {
+        self.actual_fee_zatoshis
+            .or(if self.halt_released { self.excess_fee_zatoshis } else { None })
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PpsConventionalHalt {
@@ -265,7 +276,7 @@ pub enum PpsConventionalHalt {
     SourceMismatch,
 }
 impl PpsConventionalHalt {
-    fn code(self) -> &'static str {
+    pub fn code(self) -> &'static str {
         match self {
             Self::RecipientMismatch => "recipient_mismatch",
             Self::FeeMismatch => "fee_mismatch",
@@ -365,6 +376,7 @@ fn conventional_from_row(
         canonical_intent: r.try_get("canonical_json")?,
         halt_category: r.try_get::<Option<String>, _>("halt_category")?
             .map(|v| PpsConventionalHalt::parse(&v)).transpose()?,
+        halt_released: r.try_get::<i64, _>("halt_released")? == 1,
         operation_id: r.try_get("operation_id")?,
         expected_txid: r.try_get("observed_txid")?,
         fee_upper_bound_zatoshis: r.try_get("fee_bound")?,
@@ -396,7 +408,10 @@ fn conventional_from_row(
         || (a.actual_fee_zatoshis.is_some() && a.excess_fee_zatoshis.is_some())
         || match a.status.as_str() {
             "reserved" => a.actual_fee_zatoshis.is_some(),
-            "paid" => a.actual_fee_zatoshis.is_none() || a.excess_fee_zatoshis.is_some(),
+            // Paid within the bound records actual_fee; an over-bound fee an
+            // operator released settles as the recorded excess_fee (the schema
+            // keeps actual_fee within the bound).
+            "paid" => a.settled_fee_zatoshis().is_none(),
             "released" => {
                 a.sealed || a.actual_fee_zatoshis.is_some() || a.excess_fee_zatoshis.is_some()
             }
@@ -412,7 +427,7 @@ async fn conventional_attempt(
     c: &mut SqliteConnection,
     attempt: i64,
 ) -> Result<Option<PpsConventionalAttempt>, PpsDbError> {
-    let r=sqlx::query("SELECT f.*,p.intent_id,p.fee_bound,p.actual_fee,p.operation_id,p.observed_txid,p.excess_fee,i.canonical_json,h.category AS halt_category FROM pps_conventional_attempts p LEFT JOIN pps_fee_reservations f ON f.attempt_id=p.attempt_id LEFT JOIN pps_conventional_intents i ON i.attempt_id=p.attempt_id LEFT JOIN pps_conventional_halts h ON h.attempt_id=p.attempt_id WHERE p.attempt_id=?1")
+    let r=sqlx::query("SELECT f.*,p.intent_id,p.fee_bound,p.actual_fee,p.operation_id,p.observed_txid,p.excess_fee,i.canonical_json,h.category AS halt_category,(r.attempt_id IS NOT NULL) AS halt_released FROM pps_conventional_attempts p LEFT JOIN pps_fee_reservations f ON f.attempt_id=p.attempt_id LEFT JOIN pps_conventional_intents i ON i.attempt_id=p.attempt_id LEFT JOIN pps_conventional_halts h ON h.attempt_id=p.attempt_id LEFT JOIN pps_halt_releases r ON r.attempt_id=p.attempt_id WHERE p.attempt_id=?1")
         .bind(attempt).fetch_optional(&mut *c).await?;
     r.as_ref().map(conventional_from_row).transpose()
 }
@@ -448,6 +463,11 @@ pub(crate) async fn validate_confirmation(
             if let Some(old) = a.excess_fee_zatoshis {
                 if old != actual {
                     return Err(PpsDbError::DuplicateMismatch);
+                }
+                // An operator's audited release (pps_halt_releases) accepts the
+                // over-bound fee as the real cost of this send, which then settles.
+                if a.halt_released {
+                    return Ok(false);
                 }
                 return Err(PpsDbError::FeeBudgetExceeded);
             }
@@ -691,7 +711,7 @@ pub(crate) async fn snapshot(
     s.unused_credit_subzatoshis = s.cap_subzatoshis.saturating_sub(s.pps_outstanding_subzatoshis);
     cursor = None;
     loop {
-        let rows=sqlx::query("SELECT f.*,p.attempt_id AS conventional_id,p.intent_id,p.fee_bound,p.actual_fee,p.operation_id,p.observed_txid,p.excess_fee,i.canonical_json,h.category AS halt_category FROM pps_fee_reservations f LEFT JOIN pps_conventional_attempts p ON p.attempt_id=f.attempt_id LEFT JOIN pps_conventional_intents i ON i.attempt_id=f.attempt_id LEFT JOIN pps_conventional_halts h ON h.attempt_id=f.attempt_id WHERE (?1 IS NULL OR f.attempt_id>?1) ORDER BY f.attempt_id LIMIT 256")
+        let rows=sqlx::query("SELECT f.*,p.attempt_id AS conventional_id,p.intent_id,p.fee_bound,p.actual_fee,p.operation_id,p.observed_txid,p.excess_fee,i.canonical_json,h.category AS halt_category,(r.attempt_id IS NOT NULL) AS halt_released FROM pps_fee_reservations f LEFT JOIN pps_conventional_attempts p ON p.attempt_id=f.attempt_id LEFT JOIN pps_conventional_intents i ON i.attempt_id=f.attempt_id LEFT JOIN pps_conventional_halts h ON h.attempt_id=f.attempt_id LEFT JOIN pps_halt_releases r ON r.attempt_id=f.attempt_id WHERE (?1 IS NULL OR f.attempt_id>?1) ORDER BY f.attempt_id LIMIT 256")
             .bind(cursor).fetch_all(&mut *c).await?;
         if rows.is_empty() {
             break;
@@ -742,7 +762,7 @@ pub(crate) async fn snapshot(
                         s.paid_fees_zatoshis,
                         conventional
                             .as_ref()
-                            .and_then(|a| a.actual_fee_zatoshis)
+                            .and_then(|a| a.settled_fee_zatoshis())
                             .unwrap_or(fee),
                     )?
                 }
@@ -862,14 +882,41 @@ fn fresh_lease<'a>(
     Ok(l)
 }
 /// A financial halt: a send that failed byte-for-byte verification (recipient,
-/// fee, version or source mismatch) or an excess fee. Sends are fenced until an
-/// operator unhalts; since 2026-09-15 new credits are refused too.
+/// fee, version or source mismatch) or an excess fee, not yet released by an
+/// operator (pps_halt_releases, audit B10). Sends are fenced while one is
+/// active; since 2026-09-15 new credits are refused too.
 pub(crate) async fn financial_halt_active(c: &mut SqliteConnection) -> Result<bool, PpsDbError> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pps_conventional_halts) OR EXISTS(SELECT 1 FROM pps_conventional_attempts WHERE excess_fee IS NOT NULL)",
+        "SELECT EXISTS(SELECT 1 FROM pps_conventional_halts h WHERE NOT EXISTS(SELECT 1 FROM pps_halt_releases r WHERE r.attempt_id=h.attempt_id)) \
+         OR EXISTS(SELECT 1 FROM pps_conventional_attempts a WHERE a.excess_fee IS NOT NULL AND NOT EXISTS(SELECT 1 FROM pps_halt_releases r WHERE r.attempt_id=a.attempt_id))",
     )
     .fetch_one(&mut *c)
     .await?)
+}
+/// Which halt an operator released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PpsHaltKind {
+    ContractHalt,
+    ExcessFee,
+}
+impl PpsHaltKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ContractHalt => "contract_halt",
+            Self::ExcessFee => "excess_fee",
+        }
+    }
+}
+/// An unreleased financial halt, as listed for the operator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PpsActiveHalt {
+    pub attempt_id: i64,
+    pub kind: PpsHaltKind,
+    pub category: Option<PpsConventionalHalt>,
+    pub excess_fee_zatoshis: Option<i64>,
+    pub fee_upper_bound_zatoshis: i64,
+    pub expected_txid: Option<String>,
+    pub status: String,
 }
 pub(crate) async fn check(
     c: &mut SqliteConnection,
@@ -969,10 +1016,18 @@ pub(crate) async fn settle_fee(
         return Err(PpsDbError::Invalid);
     }
     if let Some(actual) = actual_fee {
-        let changed=sqlx::query("UPDATE pps_conventional_attempts SET actual_fee=?1 WHERE attempt_id=?2 AND actual_fee IS NULL AND excess_fee IS NULL AND fee_bound>=?1 AND observed_txid=?3")
-            .bind(actual).bind(attempt).bind(txid).execute(&mut *c).await?;
-        if changed.rows_affected() != 1 {
-            return Err(PpsDbError::Invariant);
+        // An over-bound fee an operator released (pps_halt_releases) settles as the
+        // recorded excess_fee itself: the schema keeps actual_fee within the bound.
+        let released_excess: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pps_conventional_attempts p JOIN pps_halt_releases r ON r.attempt_id=p.attempt_id \
+             WHERE p.attempt_id=?1 AND p.excess_fee=?2 AND p.actual_fee IS NULL AND p.observed_txid=?3)")
+            .bind(attempt).bind(actual).bind(txid).fetch_one(&mut *c).await?;
+        if !released_excess {
+            let changed=sqlx::query("UPDATE pps_conventional_attempts SET actual_fee=?1 WHERE attempt_id=?2 AND actual_fee IS NULL AND excess_fee IS NULL AND fee_bound>=?1 AND observed_txid=?3")
+                .bind(actual).bind(attempt).bind(txid).execute(&mut *c).await?;
+            if changed.rows_affected() != 1 {
+                return Err(PpsDbError::Invariant);
+            }
         }
     }
     sqlx::query("UPDATE pps_fee_reservations SET status=?1,txid=?2 WHERE attempt_id=?3")
@@ -1108,6 +1163,86 @@ impl PoolDb {
     /// pending, releases the fee reservation, and records the release immutably.
     /// Anything suggesting money may have left the wallet (an observed transaction,
     /// a settlement, a fee observation, a halt) refuses.
+    /// Unreleased financial halts, oldest first.
+    pub async fn list_active_pps_halts(&self) -> Result<Vec<PpsActiveHalt>, PpsDbError> {
+        let rows = sqlx::query(
+            "SELECT p.attempt_id,h.category,p.excess_fee,p.fee_bound,p.observed_txid,f.status \
+             FROM pps_conventional_attempts p \
+             LEFT JOIN pps_conventional_halts h ON h.attempt_id=p.attempt_id \
+             LEFT JOIN pps_fee_reservations f ON f.attempt_id=p.attempt_id \
+             LEFT JOIN pps_halt_releases r ON r.attempt_id=p.attempt_id \
+             WHERE r.attempt_id IS NULL AND (h.attempt_id IS NOT NULL OR p.excess_fee IS NOT NULL) \
+             ORDER BY p.attempt_id",
+        )
+        .fetch_all(self.inner())
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let category = r
+                    .try_get::<Option<String>, _>("category")?
+                    .map(|v| PpsConventionalHalt::parse(&v))
+                    .transpose()?;
+                Ok(PpsActiveHalt {
+                    attempt_id: r.try_get("attempt_id")?,
+                    kind: if category.is_some() { PpsHaltKind::ContractHalt } else { PpsHaltKind::ExcessFee },
+                    category,
+                    excess_fee_zatoshis: r.try_get("excess_fee")?,
+                    fee_upper_bound_zatoshis: r.try_get("fee_bound")?,
+                    expected_txid: r.try_get("observed_txid")?,
+                    status: r.try_get::<Option<String>, _>("status")?.unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+    /// Whether an unreleased financial halt fences sends and new credits.
+    pub async fn pps_financial_halt_active(&self) -> Result<bool, PpsDbError> {
+        let mut c = self.inner().acquire().await?;
+        financial_halt_active(&mut c).await
+    }
+    /// An operator's audited release of one halt (audit B10; operator decision
+    /// 2026-09-15). Journaled in pps_halt_releases with who, why and which
+    /// reconciler run was reviewed. Lifts the fence once no unreleased halt
+    /// remains; the attempt itself stays for the confirm and reversal tools. A
+    /// released over-bound fee settles at the amount actually paid. Bumps the
+    /// funding generation so every cached proof is re-collected.
+    pub async fn release_pps_halt(
+        &self,
+        attempt: i64,
+        operator: &str,
+        reason: &str,
+        reconciler_last_run: &str,
+    ) -> Result<PpsHaltKind, PpsDbError> {
+        if attempt <= 0
+            || operator.is_empty() || operator.len() > 128
+            || reason.trim().is_empty() || reason.len() > 1024
+            || reconciler_last_run.is_empty() || reconciler_last_run.len() > 64
+        {
+            return Err(PpsDbError::Invalid);
+        }
+        let mut c = self.inner().acquire().await?;
+        sqlx::query("PRAGMA synchronous=FULL").execute(&mut *c).await?;
+        let mut tx = c.begin_with("BEGIN IMMEDIATE").await?;
+        let a = conventional_attempt(&mut tx, attempt).await?.ok_or(PpsDbError::Invalid)?;
+        let kind = if a.halt_category.is_some() {
+            PpsHaltKind::ContractHalt
+        } else if a.excess_fee_zatoshis.is_some() {
+            PpsHaltKind::ExcessFee
+        } else {
+            return Err(PpsDbError::Invalid);
+        };
+        if a.halt_released {
+            return Err(PpsDbError::DuplicateMismatch);
+        }
+        sqlx::query(
+            "INSERT INTO pps_halt_releases(attempt_id,kind,operator,reason,reconciler_last_run) VALUES(?1,?2,?3,?4,?5)",
+        )
+        .bind(attempt).bind(kind.code()).bind(operator).bind(reason).bind(reconciler_last_run)
+        .execute(&mut *tx)
+        .await?;
+        bump_generation(&mut tx).await?;
+        tx.commit().await?;
+        Ok(kind)
+    }
     pub async fn release_failed_conventional_send(
         &self,
         attempt: i64,
@@ -1339,11 +1474,7 @@ impl PoolDb {
             // halt or over-ceiling fee stands. Enforced here (not in snapshot),
             // inside BEGIN IMMEDIATE, so it serializes against the halt-recording
             // commit -- a halt stops sending without bricking anything else.
-            let send_blocked: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pps_conventional_halts) \
-                 OR EXISTS(SELECT 1 FROM pps_conventional_attempts WHERE excess_fee IS NOT NULL)")
-                .fetch_one(&mut *tx).await?;
-            if send_blocked { return Err(PpsDbError::PayoutHalted); }
+            if financial_halt_active(&mut tx).await? { return Err(PpsDbError::PayoutHalted); }
             let state = snapshot(&mut tx, &epoch, false).await?;
             if funding.is_some() {
                 // This attempt's items and fee are already reserved, so they are in

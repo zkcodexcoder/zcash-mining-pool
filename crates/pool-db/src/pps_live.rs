@@ -1895,6 +1895,62 @@ mod tests {
         assert_eq!(f.db.pps_funding_snapshot().await.unwrap().gross_subzatoshis, 3 * PPS_SCALE);
     }
     #[tokio::test]
+    async fn an_audited_release_lifts_the_halt_fence_and_settles_an_over_bound_fee() {
+        use crate::pps_funding::PpsHaltKind;
+        // Contract halt: the fence drops, the attempt stays held for the reversal tool.
+        let (f, a, intent) = conventional_fixture().await;
+        conventional_sent(&f, a, &intent).await;
+        f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::RecipientMismatch).await.unwrap();
+        assert!(f.db.pps_financial_halt_active().await.unwrap());
+        let halts = f.db.list_active_pps_halts().await.unwrap();
+        assert_eq!((halts.len(), halts[0].attempt_id, halts[0].kind, halts[0].category),
+            (1, a, PpsHaltKind::ContractHalt, Some(PpsConventionalHalt::RecipientMismatch)));
+        assert!(matches!(f.db.release_pps_halt(a, "", "why", "run").await, Err(PpsDbError::Invalid)));
+        assert!(matches!(f.db.release_pps_halt(a + 100, "op", "why", "run").await, Err(PpsDbError::Invalid)));
+        assert_eq!(f.db.release_pps_halt(a, "op@host", "reviewed: recipient was the miner's old address", "2026-09-15T18:00:00Z").await.unwrap(), PpsHaltKind::ContractHalt);
+        assert!(!f.db.pps_financial_halt_active().await.unwrap());
+        assert!(f.db.list_active_pps_halts().await.unwrap().is_empty());
+        assert!(matches!(f.db.release_pps_halt(a, "op@host", "again", "run").await, Err(PpsDbError::DuplicateMismatch)));
+        f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await.unwrap();
+        let b = f.db.create_payout_attempt(1, 1, "after-release").await.unwrap();
+        f.db.reserve_pps_payout(b, &[(f.m, 1)], &funded(&f).await, &fee(b)).await.unwrap();
+        f.db.seal_pps_payout(b, &fee(b).proposal_id).await.unwrap();
+        // The halted send itself still cannot be confirmed or refunded here.
+        assert!(f.db.confirm_pps_conventional_payout(a, &"c".repeat(64), 7).await.is_err());
+        assert!(f.db.refund_pps_payout(a).await.is_err());
+        assert!(sqlx::query("DELETE FROM pps_halt_releases").execute(f.db.inner()).await.is_err());
+        assert!(sqlx::query("UPDATE pps_halt_releases SET reason='x'").execute(f.db.inner()).await.is_err());
+
+        // Over-bound fee: after the release the send settles at the fee actually paid.
+        let (f, a, intent) = conventional_fixture().await;
+        conventional_sent(&f, a, &intent).await;
+        assert!(matches!(
+            f.db.confirm_pps_conventional_payout(a, &"c".repeat(64), CONVENTIONAL_BOUND + 1).await,
+            Err(PpsDbError::FeeBudgetExceeded)
+        ));
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await,
+            Err(PpsDbError::FinancialHalt)
+        ));
+        let halts = f.db.list_active_pps_halts().await.unwrap();
+        assert_eq!((halts.len(), halts[0].kind, halts[0].excess_fee_zatoshis), (1, PpsHaltKind::ExcessFee, Some(CONVENTIONAL_BOUND + 1)));
+        assert_eq!(f.db.release_pps_halt(a, "op@host", "fee accepted", "2026-09-15T18:00:00Z").await.unwrap(), PpsHaltKind::ExcessFee);
+        assert!(!f.db.pps_financial_halt_active().await.unwrap());
+        f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await.unwrap();
+        // A different fee than the one observed is still refused; the observed one settles.
+        assert!(matches!(
+            f.db.confirm_pps_conventional_payout(a, &"c".repeat(64), CONVENTIONAL_BOUND + 2).await,
+            Err(PpsDbError::DuplicateMismatch)
+        ));
+        assert_eq!(f.db.confirm_pps_conventional_payout(a, &"c".repeat(64), CONVENTIONAL_BOUND + 1).await.unwrap(), 1);
+        let receipt = f.db.get_pps_conventional_attempt(a).await.unwrap().unwrap();
+        assert_eq!((receipt.status.as_str(), receipt.actual_fee_zatoshis, receipt.excess_fee_zatoshis, receipt.halt_released, receipt.settled_fee_zatoshis()),
+            ("paid", None, Some(CONVENTIONAL_BOUND + 1), true, Some(CONVENTIONAL_BOUND + 1)));
+        let s = f.db.pps_funding_snapshot().await.unwrap();
+        assert_eq!((s.paid_fees_zatoshis, s.reserved_fees_zatoshis, s.paid_zatoshis), (CONVENTIONAL_BOUND + 1, 0, 1));
+        assert!(f.db.pps_invariant().await.is_ok());
+    }
+    #[tokio::test]
     async fn conventional_contract_halt_is_permanent_global_and_preserves_claims() {
         let (f, a, intent) = conventional_fixture().await;
         assert!(f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::RecipientMismatch).await.is_err());
