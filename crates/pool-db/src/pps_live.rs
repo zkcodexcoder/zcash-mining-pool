@@ -114,6 +114,20 @@ pub struct PpsReceipt {
 /// refused (operator decision 2026-09-15). Found blocks are still submitted (audit
 /// B1), and their income lifts the pause once it is spendable. Accounting
 /// corruption or unavailability also refuses.
+/// Restarting an existing epoch never fails on funding: a missing, stale or short
+/// proof is the share path's business (decision #1 refuses new credits against a
+/// short one, so the pool keeps serving work and submitting blocks). Only
+/// accounting faults stop a restart. 2026-09-15: pool-server crash-looped on a
+/// short proof at startup once that proof was no longer discarded.
+fn restart_tolerates_funding(result: Result<(), PpsDbError>) -> Result<(), PpsDbError> {
+    match result {
+        Ok(())
+        | Err(PpsDbError::FundingLeaseRequired
+        | PpsDbError::FundingInsufficient
+        | PpsDbError::FeeBudgetExceeded) => Ok(()),
+        Err(other) => Err(other),
+    }
+}
 fn advisory_funding(result: Result<(), PpsDbError>) -> Result<Option<&'static str>, PpsDbError> {
     match result {
         Ok(()) => Ok(None),
@@ -226,21 +240,7 @@ impl PoolDb {
             true,
         )
         .await;
-        if existing {
-            // Restarting an existing epoch never fails on funding: a missing, stale
-            // or short proof is the share path's business (decision #1 refuses new
-            // credits against a short one, so the pool keeps serving work and
-            // submitting blocks). Only accounting faults stop a restart.
-            match pre {
-                Ok(())
-                | Err(PpsDbError::FundingLeaseRequired
-                | PpsDbError::FundingInsufficient
-                | PpsDbError::FeeBudgetExceeded) => {}
-                Err(other) => return Err(other),
-            }
-        } else {
-            pre?;
-        }
+        if existing { restart_tolerates_funding(pre)?; } else { pre?; }
         crate::pps_funding::persist_policy(&mut tx, e).await?;
         let meta = sqlx::query("SELECT * FROM pps_meta WHERE singleton=1")
             .fetch_optional(&mut *tx)
@@ -293,7 +293,7 @@ impl PoolDb {
             false,
         )
         .await;
-        if existing { let _ = advisory_funding(post)?; } else { post?; }
+        if existing { restart_tolerates_funding(post)?; } else { post?; }
         tx.commit().await?;
         Ok(())
     }
