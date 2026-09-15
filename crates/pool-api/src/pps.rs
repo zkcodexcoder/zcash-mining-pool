@@ -639,7 +639,7 @@ const REASON = {
   ok:'', funding_missing:'no funding lease yet — shares still credited, payouts held until proven',
   funding_expired:'funding lease lapsed — shares still credited, payouts held until re-proven',
   generation_changed:'a payout just moved funds — re-proving funding (~12s), shares still credited',
-  funding_insufficient:'wallet below required cover — shares still credited, payouts held',
+  funding_insufficient:'wallet cannot cover what miners are owed plus reserve and fees — valid shares are being REJECTED until income or a top-up is spendable; found blocks are still submitted',
   invalid_evidence:'funding evidence rejected — shares still credited, payouts held',
   fee_capacity_exhausted:'payout fee budget spent — shares still credited, payouts held',
   financial_halt:'operator halt — shares still credited, no sends',

@@ -38,7 +38,7 @@ pub enum CreditAdmissionState { Ready, Degraded, Paused, Unknown }
 fn degrades_only(reason: &str) -> bool {
     matches!(reason,
         "chain_invalid" | "liability_over_cap" | "financial_halt" | "funding_missing" | "funding_expired"
-        | "generation_changed" | "invalid_evidence" | "funding_insufficient" | "fee_capacity_exhausted")
+        | "generation_changed" | "invalid_evidence" | "fee_capacity_exhausted")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,12 +329,22 @@ fn assess(h:&mut PpsCreditHealth, epoch:&PpsEpoch, route:&PpsFundingRoute,
         s.cap_subzatoshis>0 && s.unused_credit_subzatoshis
             < s.cap_subzatoshis/5 + u128::from(s.cap_subzatoshis%5!=0));
     h.generation_matches=lease.map(|l| l.generation==snapshot.generation);
-    // Audit B14: report the WORST state. Unreadable accounting, the one gate that
-    // rejects valid shares, is evaluated first, so a warning can never mask it.
-    // Liability over the cap and chain agreement are warnings only and are
-    // reported first among those.
+    // Audit B14: report the WORST state. The gates that reject valid shares —
+    // unreadable accounting and proven insolvency — are evaluated first, so a
+    // warning can never mask a rejection. Liability over the cap and chain
+    // agreement are warnings only and are reported first among those.
     let funding=snapshot.funding.as_ref();
+    // Proven insolvency: a lease that is present, current, for this generation and
+    // valid, yet below the requirement. The ledger refuses credits against it
+    // (operator decision 2026-09-15); a shortfall shown by any other lease is not proof.
+    let insolvent = match (lease, funding) {
+        (Some(l), Some(s)) => h.funding_expiry_valid && h.generation_matches == Some(true)
+            && crate::pps_funding::validate_funding_lease(l, epoch, now).is_ok()
+            && l.spendable_zatoshis < s.required_spendable_zatoshis,
+        _ => false,
+    };
     let reason=if funding.is_none() { Some("accounting_invalid") }
+        else if insolvent { Some("funding_insufficient") }
         else if funding.is_some_and(|s| s.unused_credit_subzatoshis==0) { Some("liability_over_cap") }
         else if !h.chain_expiry_valid { Some("chain_invalid") }
         else if snapshot.financial_halt { Some("financial_halt") }
@@ -343,7 +353,6 @@ fn assess(h:&mut PpsCreditHealth, epoch:&PpsEpoch, route:&PpsFundingRoute,
         else if h.generation_matches != Some(true) { Some("generation_changed") }
         else if let (Some(l),Some(s))=(lease,funding) {
             if crate::pps_funding::validate_funding_lease(l,epoch,now).is_err() { Some("invalid_evidence") }
-            else if l.spendable_zatoshis < s.required_spendable_zatoshis { Some("funding_insufficient") }
             else if s.paid_fees_zatoshis.checked_add(s.reserved_fees_zatoshis)
                 .is_none_or(|v|v>=s.fee_allowance_zatoshis)
                 || crate::pps_funding::validate_credit_fee_capacity(route,s).is_err() { Some("fee_capacity_exhausted") }
@@ -532,7 +541,8 @@ mod tests {
         assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.state,CreditAdmissionState::Ready);
         s.generation+=1; assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"generation_changed");
         s.generation=7; s.funding.as_mut().unwrap().required_spendable_zatoshis+=1;
-        assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"funding_insufficient");
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"funding_insufficient"));
         s.funding.as_mut().unwrap().required_spendable_zatoshis-=1;
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=0;
         assess(&mut h,&e,&route,Some(&l),&s,100);
@@ -551,18 +561,28 @@ mod tests {
         assess(&mut h,&e,&route,Some(&l),&s,100);
         assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"liability_over_cap"));
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
-        s.funding.as_mut().unwrap().required_spendable_zatoshis+=1;
         h.chain_expiry_valid=false;
         assess(&mut h,&e,&route,Some(&l),&s,100);
         // Chain agreement is a warning only: it degrades and is reported ahead of
-        // funding_insufficient...
+        // the send-side warnings...
         assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"chain_invalid"));
-        // ...and liability over the cap is reported ahead of it, still only a warning.
+        // ...liability over the cap is reported ahead of it, still only a warning...
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=0;
         assess(&mut h,&e,&route,Some(&l),&s,100);
         assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"liability_over_cap"));
-        s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
-        h.chain_expiry_valid=true;
+        // ...and a current lease below the requirement is proven insolvency, which
+        // refuses credits and so outranks both warnings.
+        s.funding.as_mut().unwrap().required_spendable_zatoshis+=1;
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"funding_insufficient"));
+        // The same shortfall shown by a lease for an older generation proves
+        // nothing: that only degrades.
+        s.generation+=1; s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;
+        h.chain_expiry_valid=true; s.financial_halt=false;
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"generation_changed"));
+        s.generation=7; s.financial_halt=true;
+        s.funding.as_mut().unwrap().required_spendable_zatoshis-=1;
         // Unreadable accounting rejects credits, so it outranks a halt too.
         s.funding=None;
         assess(&mut h,&e,&route,Some(&l),&s,100);

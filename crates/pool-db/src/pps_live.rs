@@ -82,11 +82,13 @@ pub struct PpsReceipt {
     pub share_id: i64,
     pub duplicate: bool,
     pub credited_subzatoshis: u128,
-    /// Set when the share was credited even though the credit-path funding gate
-    /// was stale or momentarily insufficient (e.g. the ~12s window after a payout
-    /// bumps the funding generation). The share is never rejected for this; the
-    /// payout seal re-proves funding hard before any money moves. Carries the
-    /// bypassed category so the caller can log/alert without counting a denial.
+    /// Set when the share was credited even though the credit-path funding lease
+    /// was absent or stale (e.g. the ~12s window after a payout bumps the funding
+    /// generation) or the fee budget is spent. The share is never rejected for
+    /// those; the payout seal re-proves funding hard before any money moves. A
+    /// fresh lease that cannot cover what is owed is not advisory: that credit is
+    /// refused with `FundingInsufficient`. Carries the bypassed category so the
+    /// caller can log/alert without counting a denial.
     pub funding_advisory: Option<&'static str>,
     /// Set when the share was credited although the chain-agreement lease was
     /// absent, stale or disagreeing. Chain agreement is a warning only (health
@@ -98,18 +100,24 @@ pub struct PpsReceipt {
     pub liability_advisory: Option<&'static str>,
 }
 
-/// Credit-path funding policy: a valid proof-of-work share is NEVER rejected for a
-/// stale, absent, or momentarily insufficient funding lease, nor for an exhausted
-/// fee budget. Those are send-side solvency concerns and are enforced hard where
-/// money actually moves — the payout seal re-proves the funding lease and reserves
-/// the fee before every `z_sendmany`. The liability cap is likewise a warning only
-/// (`PpsReceipt::liability_advisory`). Only accounting corruption or unavailability
-/// stays fatal here.
+/// Credit-path funding policy. A valid proof-of-work share is never rejected for
+/// an absent or stale funding lease (the proof may simply be mid-refresh, e.g. the
+/// ~12 s after a payout bumps the funding generation), nor for a spent fee budget:
+/// those are reported on the receipt and enforced hard where money moves — the
+/// payout seal re-proves funding before every send. The liability cap is a warning
+/// too (`PpsReceipt::liability_advisory`).
+///
+/// Proven insolvency is different. `FundingInsufficient` only arises from a lease
+/// that passed every freshness check and still cannot cover what miners are owed
+/// (plus the reserve floor and fee allowance) once this credit is counted.
+/// Crediting more would promise money the pool does not have, so the share is
+/// refused (operator decision 2026-09-15). Found blocks are still submitted (audit
+/// B1), and their income lifts the pause once it is spendable. Accounting
+/// corruption or unavailability also refuses.
 fn advisory_funding(result: Result<(), PpsDbError>) -> Result<Option<&'static str>, PpsDbError> {
     match result {
         Ok(()) => Ok(None),
         Err(PpsDbError::FundingLeaseRequired) => Ok(Some("funding_lease_required")),
-        Err(PpsDbError::FundingInsufficient) => Ok(Some("funding_insufficient")),
         Err(PpsDbError::FeeBudgetExceeded) => Ok(Some("fee_budget_exceeded")),
         Err(other) => Err(other),
     }
@@ -400,7 +408,8 @@ impl PoolDb {
         }
         epoch_check(&mut tx, e).await?;
         let now = clock()?;
-        // Advisory: a stale funding lease never rejects a valid share (see advisory_funding).
+        // An absent or stale funding lease never rejects a valid share; a fresh proof
+        // that the wallet cannot cover what is owed does (see advisory_funding).
         let funding_advisory = advisory_funding(
             crate::pps_funding::check_credit(&mut tx, e, funding, now).await)?;
         // A share stamped after the ledger clock is a clock fault, not a chain question.
@@ -517,7 +526,8 @@ impl PoolDb {
         // Warning only at commit time too: the proof may have lapsed during the write.
         let chain_advisory =
             chain_advisory.or((!chain_current(commit_now)).then_some("chain_lease_required"));
-        // Advisory at commit time too: the lease may have gone stale during the write.
+        // Re-checked at commit time with this credit counted: a lease that went stale
+        // during the write is advisory; a proof that no longer covers what is owed refuses.
         let funding_advisory = funding_advisory.or(advisory_funding(
             crate::pps_funding::check(&mut tx, e, funding, commit_now, false).await)?);
         tx.commit().await?;
@@ -1123,45 +1133,88 @@ mod tests {
     }
     #[tokio::test]
     async fn funding_absent_stale_wrong_network_or_policy_still_credits_advisory() {
-        // Never-reject: a valid share is credited regardless of the funding lease.
-        // The lease is still validated in full; a failure surfaces on the receipt
-        // as `funding_advisory` (so the operator is told) instead of a rejection.
-        // Solvency is enforced hard where money moves — the payout seal.
+        // Never-reject for an unproven lease: a valid share is credited when the
+        // funding lease is absent, stale or otherwise not a current proof. The lease
+        // is still validated in full; the failure surfaces on the receipt as
+        // `funding_advisory` (so the operator is told) instead of a rejection.
+        // Solvency is enforced hard where money moves — the payout seal — and, for
+        // a proven shortfall, at credit time (see the insolvency test below).
         let f = setup(true, 10).await;
         let r = f.db.credit_pps_share(&f.e, &event(&f, 1, 1), Some(&f.l), None, NOW)
             .await
             .unwrap();
         assert!(!r.duplicate);
         assert_eq!(r.funding_advisory, Some("funding_lease_required"));
-        for kind in 0..8 {
+        for kind in 0..7 {
             let mut l = funded(&f).await;
-            let required = f.db.pps_funding_snapshot().await.unwrap().required_spendable_zatoshis;
-            let expected = match kind {
-                0 => { l.valid_until_unix = NOW; "funding_lease_required" }
-                1 => { l.valid_until_unix = NOW + crate::pps_funding::FUNDING_LEASE_SECONDS + 1; "funding_lease_required" }
-                2 => { l.checked_at_unix = NOW + 1; "funding_lease_required" }
-                3 => { l.network = "mainnet".into(); "funding_lease_required" }
-                4 => { l.reserve_floor_zatoshis -= 1; "funding_lease_required" }
-                5 => { l.reserved_fee_allowance_zatoshis -= 1; "funding_lease_required" }
-                6 => { l.generation += 1; "funding_lease_required" }
-                _ => { l.spendable_zatoshis = required - 1; "funding_insufficient" }
-            };
+            match kind {
+                0 => l.valid_until_unix = NOW,
+                1 => l.valid_until_unix = NOW + crate::pps_funding::FUNDING_LEASE_SECONDS + 1,
+                2 => l.checked_at_unix = NOW + 1,
+                3 => l.network = "mainnet".into(),
+                4 => l.reserve_floor_zatoshis -= 1,
+                5 => l.reserved_fee_allowance_zatoshis -= 1,
+                _ => l.generation += 1,
+            }
             let r = f
                 .db
                 .credit_pps_share(&f.e, &event(&f, 10 + kind, 1), Some(&f.l), Some(&l), NOW)
                 .await
                 .unwrap();
             assert!(!r.duplicate, "kind {kind}");
-            assert_eq!(r.funding_advisory, Some(expected), "kind {kind}");
+            assert_eq!(r.funding_advisory, Some("funding_lease_required"), "kind {kind}");
         }
         // Every one of those valid shares was credited and recorded exactly once.
-        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 9);
-        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 9);
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 8);
+        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 8);
         // A fully valid lease credits with no advisory at all.
         let r = f.db.credit_pps_share(&f.e, &event(&f, 20, 1), Some(&f.l), Some(&funded(&f).await), NOW)
             .await
             .unwrap();
         assert_eq!(r.funding_advisory, None);
+    }
+    #[tokio::test]
+    async fn proven_insolvency_refuses_the_credit_until_a_fresh_proof_covers_it() {
+        // Operator decision 2026-09-15: a lease that passes every freshness check
+        // and still cannot cover what is owed (plus reserve floor and fee allowance)
+        // once this credit is counted proves the pool cannot pay for more work. The
+        // credit is refused and nothing partial is recorded; a later proof that
+        // covers it lifts the pause.
+        let f = setup(true, 10).await;
+        let required = f.db.pps_funding_snapshot().await.unwrap().required_spendable_zatoshis;
+        let mut lease = funded(&f).await;
+        // Covers what is owed now, but not a one-zatoshi credit on top of it.
+        lease.spendable_zatoshis = required;
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 1, PPS_SCALE), Some(&f.l), Some(&lease), NOW).await,
+            Err(PpsDbError::FundingInsufficient)
+        ));
+        let s = f.db.pps_invariant().await.unwrap();
+        assert_eq!((s.accepted_events, s.gross_subzatoshis), (0, 0));
+        assert_eq!(f.db.get_total_shares_count().await.unwrap(), 0);
+        lease.spendable_zatoshis = required + 1;
+        let r = f.db.credit_pps_share(&f.e, &event(&f, 1, PPS_SCALE), Some(&f.l), Some(&lease), NOW)
+            .await
+            .unwrap();
+        assert!(!r.duplicate);
+        assert_eq!(r.funding_advisory, None);
+        // The same proof is now one zatoshi short for the next credit.
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&lease), NOW).await,
+            Err(PpsDbError::FundingInsufficient)
+        ));
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 1);
+        // A replay of the credited share is the idempotent duplicate, not a new claim.
+        let dup = f.db.credit_pps_share(&f.e, &event(&f, 1, PPS_SCALE), Some(&f.l), Some(&lease), NOW)
+            .await
+            .unwrap();
+        assert!(dup.duplicate);
+        // Income landed: a fresh proof that covers the requirement lifts the pause.
+        let r = f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        assert!(!r.duplicate);
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 2);
     }
     #[tokio::test]
     async fn funding_rechecks_clock_before_commit_and_current_legacy_obligations() {
@@ -1190,14 +1243,14 @@ mod tests {
         l.spendable_zatoshis = f.db.pps_funding_snapshot().await.unwrap().required_spendable_zatoshis;
         // A new legacy liability after attestation is observed inside the credit
         // transaction, even though it has not changed wallet spend generation:
-        // the wallet no longer covers required backing, so the credit carries the
-        // insufficiency advisory (and is still credited).
+        // the proof no longer covers required backing, so the credit is refused
+        // and nothing is recorded.
         f.db.credit_balance(f.m, 1).await.unwrap();
-        let r = f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&l), NOW)
-            .await
-            .unwrap();
-        assert_eq!(r.funding_advisory, Some("funding_insufficient"));
-        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 2);
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&l), NOW).await,
+            Err(PpsDbError::FundingInsufficient)
+        ));
+        assert_eq!(f.db.pps_invariant().await.unwrap().accepted_events, 1);
     }
     #[tokio::test]
     async fn funding_generation_invalidates_all_legacy_wallet_outflow_lifecycles() {

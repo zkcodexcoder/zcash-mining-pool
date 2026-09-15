@@ -154,6 +154,13 @@ mod actual_validator {
         pub(super) async fn invalidate_funding(&self) {
             *self.validator.pps.as_ref().unwrap().funding.write().await = None;
         }
+        /// A current proof showing the wallet cannot cover what is owed.
+        pub(super) async fn underfund(&self) {
+            let p = self.validator.pps.as_ref().unwrap();
+            let mut lease = super::synthetic_funding(&self.validator.db, &p.epoch).await;
+            lease.spendable_zatoshis = 0;
+            *p.funding.write().await = Some(lease);
+        }
         pub(super) async fn credit_health(&self)->super::pps_credit_health::PpsCreditHealth {
             let p=self.validator.pps.as_ref().unwrap();
             super::pps_credit_health::sample_health(&self.validator.db,&p.epoch,&p.funding_route,
@@ -236,7 +243,9 @@ async fn synthetic_funding(
         network: epoch.network.clone(),
         checked_at_unix: now,
         valid_until_unix: now + 60,
-        spendable_zatoshis: 10_000_000_000.max(s.required_spendable_zatoshis),
+        // Covers what is owed with 100 ZEC to spare: a proof that cannot cover a
+        // credit refuses it (decision #1), so every fixture must be backed.
+        spendable_zatoshis: s.required_spendable_zatoshis + 10_000_000_000,
         reserve_floor_zatoshis: epoch.reserve_floor_zatoshis,
         reserved_fee_allowance_zatoshis: epoch.fee_allowance_zatoshis,
         generation: s.generation,
@@ -697,7 +706,7 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
     // Failure injection into the genuine acceptance path: no partial share or
     // partial liability may survive a refused credit, and (audit B1) the found
     // block is submitted whatever PPS admission decides.
-    for failure in ["cap", "lease", "funding", "database"] {
+    for failure in ["cap", "lease", "funding", "insolvent", "database"] {
         let (fdb, fpool) = reconciler::tests::setup_db().await;
         let mut fpolicy = policy.clone();
         if failure == "cap" {
@@ -725,6 +734,9 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
         if failure == "funding" {
             failing.invalidate_funding().await;
         }
+        if failure == "insolvent" {
+            failing.underfund().await;
+        }
         if failure == "database" {
             sqlx::query("CREATE TRIGGER reject_test_credit BEFORE INSERT ON pps_events BEGIN SELECT RAISE(ABORT, 'synthetic commit failure'); END")
                 .execute(&fpool).await.unwrap();
@@ -739,10 +751,15 @@ async fn credit_restart_replay_and_unsupported_wallet_case() {
                 assert_eq!(fdb.pps_invariant().await.unwrap().accepted_events, 1);
             }
         } else {
-            // Credit refused (database), but the block-solving share is
-            // still accepted and nothing partial is credited.
+            // Credit refused (proven insolvency, database), but the block-solving
+            // share is still accepted and nothing partial is credited.
             assert!(outcome.as_ref().is_ok_and(|r| r.is_block), "{failure}: block must be accepted");
             assert_uncredited(&fdb).await;
+            if failure == "insolvent" {
+                let health = failing.credit_health().await;
+                assert_eq!((health.state, health.category.as_str()),
+                    (pps_credit_health::CreditAdmissionState::Paused, "funding_insufficient"));
+            }
         }
         assert_eq!(node.calls("submitblock").len(), submits_before + 1,
             "{failure}: a found block must be submitted");
@@ -769,6 +786,9 @@ async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:
             let miner=db.get_or_create_miner(CANARY_ADDRESS).await.unwrap();
             let worker=db.get_or_create_worker(miner.id,"synthetic-seed").await.unwrap();
             let now=Utc::now().timestamp();
+            // The seed is nearly the whole cap; its proof must cover it.
+            let mut covering=synthetic_funding(&db,&epoch).await;
+            covering.spendable_zatoshis+=policy.max_liability_zatoshis;
             // Seed a valid ledger through its normal transactional API, leaving
             // a POSITIVE remainder one zatoshi below the real fixture's price.
             db.credit_pps_share(&epoch,&PpsCredit {proof_id:"1".repeat(64),quote_id:"2".repeat(64),
@@ -776,7 +796,7 @@ async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:
                 difficulty:1.0,is_block:false,quote_height:1,network_target_be:[1;32],
                 assigned_share_target_be:[2;32],miner_subsidy_zats:MINER_SUBSIDY as u64,
                 amount_subzatoshis:(policy.max_liability_zatoshis-(MINER_SUBSIDY-1)) as u128*PPS_SCALE,
-                accepted_at_unix:now},Some(&synthetic_lease()),Some(&synthetic_funding(&db,&epoch).await),now).await.unwrap();
+                accepted_at_unix:now},Some(&synthetic_lease()),Some(&covering),now).await.unwrap();
         }
         let harness=actual_validator::Harness::new_for_route(db.clone(),Arc::new(ZcashRpcClient::new(&node.url)),
             Arc::new(ZcashRpcClient::new(&wallet.url)),epoch,synthetic_lease(),block.to_vec(),

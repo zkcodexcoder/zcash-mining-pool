@@ -94,9 +94,11 @@ fn finish_pps_funding_refresh(
             // On the testnet route, a transient read failure keeps the
             // previous proof: its own valid_until, generation and spendable
             // still gate every DB credit, so retention authorizes nothing
-            // new. Any substantive rejection (insolvency, accounting, signer,
-            // chain) still revokes immediately — and the PCZT route already
-            // cleared its cache in begin_pps_funding_refresh.
+            // new. Any substantive rejection (accounting, signer, chain) still
+            // revokes immediately — and the PCZT route already cleared its
+            // cache in begin_pps_funding_refresh. A proven shortfall is not a
+            // rejection here: the credit collector keeps that proof (Ok) so the
+            // ledger refuses new credits with it.
             if !(route.holds_new_legacy_sends() && pps_transient_refresh_category(category)) {
                 *cached = None;
             }
@@ -1439,7 +1441,12 @@ impl ShareValidator {
             }, lease.as_ref(), funding.as_ref(), now).await
                 .map_err(|error| { crate::pps_credit_health::denial(&pps.health,"ledger_credit",
                     crate::pps_credit_health::db_category(&error));
-                    StratumError::other("PPS admission paused: ledger or authorization gate") })?;
+                    // Proven insolvency (operator decision 2026-09-15): the wallet cannot
+                    // cover what miners are already owed, so no new work is bought.
+                    // A block-solving share is still submitted below (audit B1).
+                    StratumError::other(if matches!(error, pool_db::pps_live::PpsDbError::FundingInsufficient) {
+                        "PPS admission paused: pool cannot cover payouts"
+                    } else { "PPS admission paused: ledger or authorization gate" }) })?;
             drop(latest);
             // Never-reject: the share was credited even though the credit-path funding
             // gate was stale (typically the ~12s window after a payout bumps the funding
