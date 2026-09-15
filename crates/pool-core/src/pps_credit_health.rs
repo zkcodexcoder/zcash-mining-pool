@@ -37,7 +37,7 @@ pub enum CreditAdmissionState { Ready, Degraded, Paused, Unknown }
 /// hard credit gate and maps to `Paused`.
 fn degrades_only(reason: &str) -> bool {
     matches!(reason,
-        "chain_invalid" | "liability_over_cap" | "financial_halt" | "funding_missing" | "funding_expired"
+        "chain_invalid" | "liability_over_cap" | "reserve_low" | "financial_halt" | "funding_missing" | "funding_expired"
         | "generation_changed" | "invalid_evidence" | "fee_capacity_exhausted")
 }
 
@@ -74,7 +74,7 @@ pub struct PpsCreditHealth {
 const CATEGORIES: &[&str] = &[
     "unknown", "not_attempted", "ok", "missing", "malformed", "stale",
     "funding_missing", "funding_expired", "chain_invalid", "generation_changed",
-    "financial_halt", "payout_halted", "liability_over_cap", "fee_capacity_exhausted", "funding_insufficient",
+    "financial_halt", "payout_halted", "liability_over_cap", "reserve_low", "fee_capacity_exhausted", "funding_insufficient",
     "accounting_unavailable", "accounting_invalid", "epoch_mismatch", "legacy_recovery",
     "invalid_input", "duplicate_mismatch", "chain_lease_required", "funding_lease_required",
     "route_policy", "unsupported_recipient", "network_mismatch", "fee_contract_unavailable",
@@ -343,9 +343,18 @@ fn assess(h:&mut PpsCreditHealth, epoch:&PpsEpoch, route:&PpsFundingRoute,
             && l.spendable_zatoshis < s.required_spendable_zatoshis,
         _ => false,
     };
+    // The reserve floor is a warning level: the wallet's buffer above what is owed
+    // (and fees) is the real reserve, and this says it has thinned below the floor.
+    let reserve_low = match (lease, funding) {
+        (Some(l), Some(s)) => h.funding_expiry_valid && h.generation_matches == Some(true)
+            && crate::pps_funding::validate_funding_lease(l, epoch, now).is_ok()
+            && l.spendable_zatoshis.saturating_sub(s.required_spendable_zatoshis) < s.reserve_floor_zatoshis,
+        _ => false,
+    };
     let reason=if funding.is_none() { Some("accounting_invalid") }
         else if insolvent { Some("funding_insufficient") }
         else if funding.is_some_and(|s| s.unused_credit_subzatoshis==0) { Some("liability_over_cap") }
+        else if reserve_low { Some("reserve_low") }
         else if !h.chain_expiry_valid { Some("chain_invalid") }
         else if snapshot.financial_halt { Some("financial_halt") }
         else if lease.is_none() { Some("funding_missing") }
@@ -522,15 +531,15 @@ mod tests {
     fn state_fixture() -> (PpsEpoch,PpsFundingLease,pool_db::pps_funding::PpsCreditReadinessSnapshot) {
         let e=PpsEpoch {id:"synthetic".into(),network:"testnet".into(),fee_bps:0,
             max_liability_zatoshis:95_000_000_000,total_exposure_zatoshis:100_000_000_000,
-            fee_allowance_zatoshis:5_000_000_000,reserve_floor_zatoshis:1,quote_provenance:"synthetic".into()};
+            fee_allowance_zatoshis:5_000_000_000,reserve_floor_zatoshis:0,quote_provenance:"synthetic".into()};
         let l=PpsFundingLease {network:e.network.clone(),checked_at_unix:80,valid_until_unix:140,
-            spendable_zatoshis:100_000_000_001,reserve_floor_zatoshis:1,
+            spendable_zatoshis:100_000_000_001,reserve_floor_zatoshis:0,
             reserved_fee_allowance_zatoshis:5_000_000_000,generation:7};
         let s=pool_db::pps_funding::PpsFundingSnapshot {network:e.network.clone(),generation:7,
             legacy_pending_zatoshis:0,legacy_paying_zatoshis:0,pps_outstanding_subzatoshis:0,
             unused_credit_subzatoshis:95_000_000_000_u128*pool_db::pps_live::PPS_SCALE,
             gross_subzatoshis:0,paid_zatoshis:0,cap_subzatoshis:95_000_000_000_u128*pool_db::pps_live::PPS_SCALE,
-            total_exposure_zatoshis:100_000_000_000,reserve_floor_zatoshis:1,fee_allowance_zatoshis:5_000_000_000,
+            total_exposure_zatoshis:100_000_000_000,reserve_floor_zatoshis:0,fee_allowance_zatoshis:5_000_000_000,
             paid_fees_zatoshis:0,reserved_fees_zatoshis:0,required_spendable_zatoshis:100_000_000_001,
             pps_paying_zatoshis:0,committed_outflow_zatoshis:0};
         (e,l,pool_db::pps_funding::PpsCreditReadinessSnapshot {generation:7,financial_halt:false,funding:Some(s)})
@@ -588,6 +597,26 @@ mod tests {
         s.funding=None;
         assess(&mut h,&e,&route,Some(&l),&s,100);
         assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"accounting_invalid"));
+    }
+    #[test]
+    fn a_thin_buffer_above_what_is_owed_warns_without_pausing() {
+        // The reserve floor is a warning level (operator, 2026-09-15): the buffer the
+        // wallet holds above what is owed is the reserve, and health says when it
+        // has thinned below the floor. Only a wallet short of what is owed pauses.
+        let route=PpsFundingRoute::ZecdConventionalTestnet{hold_new_legacy_sends:true};
+        let (e,l,mut s)=state_fixture(); let mut h=ready();
+        s.funding.as_mut().unwrap().reserve_floor_zatoshis=5;
+        // Covered exactly: nothing above what is owed.
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"reserve_low"));
+        // Five above: the floor is met.
+        let mut roomy=l.clone(); roomy.spendable_zatoshis+=5;
+        assess(&mut h,&e,&route,Some(&roomy),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Ready,"ok"));
+        // Below what is owed is still the stop.
+        let mut short=l.clone(); short.spendable_zatoshis-=1;
+        assess(&mut h,&e,&route,Some(&short),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"funding_insufficient"));
     }
     #[tokio::test]
     async fn credit_refresh_diagnostics_keep_exact_failure_before_collapse_and_are_task_local() {

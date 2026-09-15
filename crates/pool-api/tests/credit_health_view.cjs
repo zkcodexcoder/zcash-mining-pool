@@ -57,6 +57,7 @@ assert.equal(view({...ready, current_quote_fits: false}).state, 'degraded');   /
 assert.equal(view({...ready, current_quote_fits: false}).category, 'liability_over_cap');
 assert.equal(view({...ready, current_quote_fits: false}).label, 'Crediting (over liability cap)');
 assert.equal(view({...ready, state: 'degraded', category: 'liability_over_cap'}).label, 'Crediting (over liability cap)');
+assert.equal(view({...ready, state: 'degraded', category: 'reserve_low'}).label, 'Crediting (reserve low)');
 assert.equal(view({...ready, current_quote_fits: false}, 1015).state, 'ready');   // a stale quote says nothing
 assert.equal(view({...ready, version: 1}).state, 'unknown');
 for (const field of ['quote_required', 'budget_low']) {

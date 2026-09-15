@@ -109,7 +109,7 @@ pub struct PpsReceipt {
 ///
 /// Proven insolvency is different. `FundingInsufficient` only arises from a lease
 /// that passed every freshness check and still cannot cover what miners are owed
-/// (plus the reserve floor and fee allowance) once this credit is counted.
+/// (plus the fee allowance) once this credit is counted.
 /// Crediting more would promise money the pool does not have, so the share is
 /// refused (operator decision 2026-09-15). Found blocks are still submitted (audit
 /// B1), and their income lifts the pause once it is spendable. Accounting
@@ -1107,10 +1107,11 @@ mod tests {
             (s.legacy_pending_zatoshis, s.legacy_paying_zatoshis),
             (25, 15)
         );
-        // Audit B3: required = legacy 40 + floor + OUTSTANDING (0) + fees — no cap.
-        assert_eq!(s.required_spendable_zatoshis, 150);
+        // Audit B3: required = legacy 40 + OUTSTANDING (0) + fees — no cap, and
+        // (2026-09-15) no reserve floor: the floor is a warning level.
+        assert_eq!(s.required_spendable_zatoshis, 140);
         let mut l = funded(&f).await;
-        l.spendable_zatoshis = 149;
+        l.spendable_zatoshis = 139;
         assert!(matches!(
             f.db.initialize_pps_epoch(&f.e, Some(&l)).await,
             Err(PpsDbError::FundingInsufficient)
@@ -1215,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn payouts_may_spend_into_the_reserve_floor_to_settle_what_is_owed() {
         // Operator decision 2026-09-15: the reserve floor backs NEW credits (the
-        // credit rule wants owed + floor + allowance); settling existing debts only
+        // credit rule wants owed + allowance); settling existing debts only
         // needs the wallet to cover what is committed to leave it plus this batch.
         // Fixture: floor 10, allowance 100, one miner owed 5.
         let f = setup(true, 10).await;
@@ -1383,8 +1384,8 @@ mod tests {
         assert_eq!((s.paid_fees_zatoshis, s.reserved_fees_zatoshis), (1, 0));
         assert_eq!(s.gross_subzatoshis, 3 * PPS_SCALE + 1);
         // Audit B3: required backs what is OWED — outstanding 2 zat + 1 sub-zat rounds
-        // up to 3 — plus floor and unspent fees; the cap is no longer collateral.
-        assert_eq!(s.required_spendable_zatoshis, 112);
+        // up to 3 — plus unspent fees (99); neither the cap nor the floor is collateral.
+        assert_eq!(s.required_spendable_zatoshis, 102);
         let mut e = f.e.clone();
         e.id = "next".into();
         f.db.initialize_pps_epoch(&e, Some(&funded(&f).await))
@@ -1627,7 +1628,7 @@ mod tests {
                 s.legacy_paying_zatoshis,
                 s.required_spendable_zatoshis
             ),
-            (299, 1, 410)
+            (299, 1, 400)
         );
         sqlx::query("UPDATE balances SET paying=0 WHERE miner_id=?1")
             .bind(last)
@@ -1909,9 +1910,10 @@ mod tests {
                 s.paid_zatoshis,
                 s.required_spendable_zatoshis
             ),
-            // Audit B3: required backing is reserve + OUTSTANDING (2 of 3 credited
-            // remain after 1 paid) + unspent fees — not the full cap.
-            (7, 0, 1, 5 + CONVENTIONAL_BOUND * 4)
+            // Audit B3: required backing is OUTSTANDING (2 of 3 credited remain
+            // after 1 paid) + unspent fees (allowance - 7 paid) — neither the full
+            // cap nor the reserve floor (a warning level since 2026-09-15).
+            (7, 0, 1, CONVENTIONAL_BOUND * 4 - 5)
         );
         assert_eq!(s.gross_subzatoshis, 3 * PPS_SCALE);
         let receipt = f.db.get_pps_conventional_attempt(a).await.unwrap().unwrap();
@@ -2395,10 +2397,10 @@ mod tests {
         let before = f.db.pps_invariant().await.unwrap();
         let history = extension_history(&f).await;
         let lease = extension_lease(&f).await;
-        // Audit B3: projected backing = legacy 17 + floor 10 + outstanding (3 zat + 7
-        // sub-zat credited, 1 paid -> rounds up to 3) + the next epoch's unspent fee
-        // allowance (5e9 - 7 paid). Raising the cap adds no collateral.
-        assert_eq!(lease.spendable_zatoshis, 5_000_000_000 - 7 + 17 + 10 + 3);
+        // Audit B3: projected backing = legacy 17 + outstanding (3 zat + 7 sub-zat
+        // credited, 1 paid -> rounds up to 3) + the next epoch's unspent fee
+        // allowance (5e9 - 7 paid). Neither the cap nor the floor is collateral.
+        assert_eq!(lease.spendable_zatoshis, 5_000_000_000 - 7 + 17 + 3);
         assert!(f.db.verify_pps_epoch(&crate::pps_funding::testnet_budget_extension_epoch(&f.e).unwrap()).await.is_err());
         f.db.extend_testnet_pps_budget(&f.e,&lease).await.unwrap();
         assert_eq!(extension_history(&f).await,history);

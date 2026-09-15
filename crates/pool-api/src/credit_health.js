@@ -38,8 +38,8 @@ function ppsCreditView(health, now = Math.floor(Date.now() / 1000)) {
     // and is reported ahead of other warnings, as the server ranks it.
     if (!chainCurrent) return degraded('chain_invalid', 'Crediting (chain warning)');
     const overCapLabel = 'Crediting (over liability cap)';
-    if (health.state === 'degraded')
-        return degraded(health.category, health.category === 'liability_over_cap' ? overCapLabel : undefined);
+    const labels = {liability_over_cap: overCapLabel, reserve_low: 'Crediting (reserve low)'};
+    if (health.state === 'degraded') return degraded(health.category, labels[health.category]);
     if (health.category !== 'ok' || health.generation_matches !== true) return unknown('malformed');
     if (!fundingCurrent) return degraded('funding_expired');
     // A fresh quote above the remaining headroom is a warning only: shares are still credited.

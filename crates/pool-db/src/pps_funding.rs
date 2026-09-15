@@ -105,16 +105,15 @@ pub struct PpsFundingSnapshot {
     pub fee_allowance_zatoshis: i64,
     pub paid_fees_zatoshis: i64,
     pub reserved_fees_zatoshis: i64,
-    /// What NEW credits must be backed by: owed + reserve floor + unspent fee
-    /// allowance (audit B3). Decision #1 refuses credits when a fresh proof falls short.
+    /// What NEW credits must be backed by: owed + unspent fee allowance (audit B3
+    /// as amended 2026-09-15; the reserve floor is a warning level, not part of
+    /// this). Decision #1 refuses credits when a fresh proof falls short.
     pub required_spendable_zatoshis: i64,
     /// PPS reservations in flight (pps_payout_items), whole zatoshis.
     pub pps_paying_zatoshis: i64,
     /// Money already committed to leave the wallet: legacy pending and paying, PPS
     /// reservations in flight and reserved fee bounds. A payout needs the wallet to
-    /// cover this plus its own batch and fee, never the reserve floor: the floor
-    /// backs new credits, not the settlement of existing ones (operator decision
-    /// 2026-09-15).
+    /// cover this plus its own batch and fee (operator decision 2026-09-15).
     pub committed_outflow_zatoshis: i64,
 }
 
@@ -770,11 +769,12 @@ pub(crate) async fn snapshot(
     if committed_fees > e.fee_allowance_zatoshis {
         return Err(PpsDbError::FeeBudgetExceeded);
     }
-    // Audit B3: the wallet must cover what is actually OWED (outstanding, rounded up
-    // to whole zatoshis) plus the reserve floor and the unspent fee allowance — not
-    // the full cap. The cap bounds how much outstanding liability may accrue;
-    // demanding it as permanent collateral stalled payouts in every drought.
-    // reserve_floor is the variance buffer. Paid fees need no remaining backing.
+    // Audit B3 as amended by the operator (2026-09-15): new credits must be backed
+    // by what is actually OWED (outstanding, rounded up to whole zatoshis) plus the
+    // unspent fee allowance — not the full cap, and not the reserve floor either.
+    // Whatever the wallet holds above what is owed IS the reserve; the configured
+    // floor is the level below which health warns (`reserve_low`). Paid fees need
+    // no remaining backing.
     let remaining = s.pps_outstanding_subzatoshis;
     let remaining = i64::try_from(
         remaining
@@ -784,13 +784,7 @@ pub(crate) async fn snapshot(
     )
     .map_err(|_| PpsDbError::Invariant)?;
     s.required_spendable_zatoshis = plus(
-        plus(
-            plus(
-                plus(s.legacy_pending_zatoshis, s.legacy_paying_zatoshis)?,
-                e.reserve_floor_zatoshis,
-            )?,
-            remaining,
-        )?,
+        plus(plus(s.legacy_pending_zatoshis, s.legacy_paying_zatoshis)?, remaining)?,
         e.fee_allowance_zatoshis - s.paid_fees_zatoshis,
     )?;
     // What must leave the wallet on commitments already made. Paying may spend
@@ -801,8 +795,9 @@ pub(crate) async fn snapshot(
     )?;
     Ok(s)
 }
-/// Credit rule: a fresh proof must cover owed + reserve floor + unspent fee
-/// allowance (`required_spendable_zatoshis`). Decision #1 refuses new credits below it.
+/// Credit rule: a fresh proof must cover owed + unspent fee allowance
+/// (`required_spendable_zatoshis`). Decision #1 refuses new credits below it; the
+/// reserve floor only warns (health `reserve_low`).
 pub(crate) fn validate_lease(
     s: &PpsFundingSnapshot,
     l: Option<&PpsFundingLease>,
