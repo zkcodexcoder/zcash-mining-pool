@@ -6,7 +6,7 @@
 //! these reads with the ledger's payout generation before admitting liability.
 use crate::{funding::exact_zatoshis, ZcashRpcClient};
 use serde_json::{json, Value};
-use std::{collections::HashSet, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashSet, sync::atomic::{AtomicU32, Ordering}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 pub const MAX_RPC_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_UNSPENT_OUTPUTS: usize = 8192;
@@ -17,6 +17,22 @@ pub const EVIDENCE_LIFETIME_SECONDS: i64 = 600;
 /// Collection remains bounded below the evidence's original-start lifetime.
 /// Slow successful reads consume validity; completing collection never renews it.
 pub const COLLECTION_TIMEOUT_SECONDS: u64 = 45;
+/// Confirmations a note needs before a payout may spend it: the `minconf` the
+/// dashboard passes to `z_sendmany`. The mature balance backs sends.
+pub const PAYOUT_NOTE_MATURITY: u32 = 10;
+/// Confirmations a note needs before it backs NEW CREDITS. Defaults to the payout
+/// maturity; `[pps] funding_maturity_confirmations` (1..=10) lowers it so change
+/// from the pool's own payouts counts as soon as it confirms instead of hiding
+/// for ten blocks (operator decision 2026-09-15: mine whenever owed < reserve).
+static CREDIT_NOTE_MATURITY: AtomicU32 = AtomicU32::new(PAYOUT_NOTE_MATURITY);
+pub fn set_credit_note_maturity(confirmations: u32) -> Result<(), &'static str> {
+    if !(1..=PAYOUT_NOTE_MATURITY).contains(&confirmations) {
+        return Err("PPS funding_maturity_confirmations must be within 1..=10");
+    }
+    CREDIT_NOTE_MATURITY.store(confirmations, Ordering::Relaxed);
+    Ok(())
+}
+pub fn credit_note_maturity() -> u32 { CREDIT_NOTE_MATURITY.load(Ordering::Relaxed) }
 /// The wallet tip may advance FORWARD by up to this many blocks during the
 /// funding read. A testnet fast-block burst moves the tip every few seconds, so
 /// requiring it to hold perfectly still across the multi-RPC read pauses all
@@ -70,12 +86,14 @@ pub enum DiagnosticSignerReadiness { PassphraseUnlocked, IdentityNotProven }
 /// can turn this into a funding proof by supplying a boolean or deserializing it.
 pub struct ZecdFundingDiagnostics {
     confirmed_eligible_zatoshis: i64,
+    mature_eligible_zatoshis: i64,
     checked_at_unix: i64,
     valid_until_unix: i64,
     signer_readiness: DiagnosticSignerReadiness,
 }
 impl ZecdFundingDiagnostics {
     pub fn confirmed_eligible_zatoshis(&self) -> i64 { self.confirmed_eligible_zatoshis }
+    pub fn mature_eligible_zatoshis(&self) -> i64 { self.mature_eligible_zatoshis }
     pub fn checked_at_unix(&self) -> i64 { self.checked_at_unix }
     pub fn valid_until_unix(&self) -> i64 { self.valid_until_unix }
     pub fn signer_readiness(&self) -> DiagnosticSignerReadiness { self.signer_readiness }
@@ -91,7 +109,11 @@ impl std::fmt::Debug for ZecdFundingDiagnostics {
 /// successful evidence. Zero is a valid verified amount, not funded approval.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ZecdFundingEvidence {
+    /// Notes at the credit maturity: what backs new credits.
     pub confirmed_eligible_zatoshis: i64,
+    /// Notes at `PAYOUT_NOTE_MATURITY`: what a send can spend now. Never above
+    /// `confirmed_eligible_zatoshis`.
+    pub mature_eligible_zatoshis: i64,
     pub checked_at_unix: i64,
     pub valid_until_unix: i64,
     pub signer_readiness: SignerReadiness,
@@ -354,11 +376,12 @@ fn source_owned(value: &Value, source: &str) -> Result<(), ZecdFundingError> {
 /// every disallowed unspent output is conservative, then cap by eligible
 /// listed notes. This excludes ALL transparent funds, including coinbase,
 /// plus Sapling which is outside the separately reviewed cached payout path.
-fn eligible_balance(total: &Value, outputs: &Value) -> Result<i64, ZecdFundingError> {
+/// Returns (eligible at the credit maturity, eligible at the payout maturity).
+fn eligible_balance(total: &Value, outputs: &Value, credit_maturity: u32) -> Result<(i64, i64), ZecdFundingError> {
     let total = amount(total)?;
     let rows = outputs.as_array().ok_or(ZecdFundingError::InvalidEvidence)?;
     if rows.len() > MAX_UNSPENT_OUTPUTS { return Err(ZecdFundingError::EnumerationTooLarge); }
-    let (mut excluded, mut eligible, mut listed) = (0, 0, 0);
+    let (mut excluded, mut eligible, mut mature, mut listed) = (0, 0, 0, 0);
     let mut unique = HashSet::new();
     for row in rows {
         let pool = row.get("pool").and_then(Value::as_str).ok_or(ZecdFundingError::InvalidEvidence)?;
@@ -377,26 +400,32 @@ fn eligible_balance(total: &Value, outputs: &Value) -> Result<i64, ZecdFundingEr
             excluded = checked_sum(excluded, value)?;
             continue;
         }
-        // An Orchard/Ironwood note counts toward eligible ONLY if it is mature
-        // (>=10 confirmations) AND fully spendable. A note failing either -- e.g.
-        // a fresh payout change note still under 10 confirmations -- is simply
-        // not counted yet; it must NOT invalidate the whole funding evidence.
-        // The old hard error paused ALL share admission for ~10 blocks after
-        // every payout. Under-counting eligible is conservative: the lease still
-        // requires eligible >= required_spendable, so this can never
+        // An Orchard/Ironwood note counts ONLY if it is confirmed deep enough AND
+        // fully spendable: toward `eligible` (backs new credits) at the credit
+        // maturity, toward `mature` (what a send can spend now) at the payout
+        // maturity. A note failing either -- e.g. a fresh payout change note
+        // still shallow -- is simply not counted yet; it must NOT invalidate the
+        // whole funding evidence. The old hard error paused ALL share admission
+        // for ~10 blocks after every payout. Under-counting is conservative: the
+        // lease still requires eligible >= required_spendable, so this can never
         // over-authorize, only (harmlessly) undercount while a note matures.
-        let mature = row.get("confirmations").and_then(Value::as_i64)
-            .is_some_and(|d| (10..=u32::MAX as i64).contains(&d));
+        let depth = row.get("confirmations").and_then(Value::as_i64)
+            .filter(|d| (0..=u32::MAX as i64).contains(d));
         let spendable_now = row.get("safe").and_then(Value::as_bool) == Some(true)
             && row.get("spendable").and_then(Value::as_bool) == Some(true)
             && row.get("solvable").and_then(Value::as_bool) == Some(true)
             && row.get("address").and_then(Value::as_str).filter(|a| a.len() <= 2048).is_some();
-        if mature && spendable_now {
-            eligible = checked_sum(eligible, value)?;
+        if spendable_now {
+            if depth.is_some_and(|d| d >= i64::from(credit_maturity)) {
+                eligible = checked_sum(eligible, value)?;
+            }
+            if depth.is_some_and(|d| d >= i64::from(PAYOUT_NOTE_MATURITY)) {
+                mature = checked_sum(mature, value)?;
+            }
         }
     }
     let remainder = total.checked_sub(excluded).filter(|n| *n >= 0).ok_or(ZecdFundingError::InvalidEvidence)?;
-    Ok(remainder.min(eligible))
+    Ok((remainder.min(eligible), remainder.min(mature)))
 }
 
 /// Fixed read-only RPC sequence. The wallet and node are existing configured
@@ -435,6 +464,7 @@ pub async fn collect_testnet_funding(wallet: &ZcashRpcClient, source: &str, node
             return Err(ZecdFundingError::InvalidEvidence);
         }
         Ok(ZecdFundingEvidence { confirmed_eligible_zatoshis: proof.confirmed_eligible_zatoshis,
+            mature_eligible_zatoshis: proof.mature_eligible_zatoshis,
             checked_at_unix: proof.checked_at_unix, valid_until_unix: proof.valid_until_unix,
             signer_readiness: readiness, _private: () })
     }).await.map_err(|_| ZecdFundingError::Timeout)?
@@ -491,15 +521,16 @@ async fn collect_money(wallet: &ZcashRpcClient, source: &str, node: &ZcashRpcCli
         // on failure; no closing proof starts while either read is pending.
         // This does not claim that separate wallet RPCs are an atomic snapshot.
         probe_stage("balance_inventory_read");
+        let maturity = credit_note_maturity();
         let (total,outputs) = tokio::join!(
-            wallet.zecd_funding_read("getbalance", json!(["*", 10])),
-            wallet.zecd_funding_read("listunspent", json!([10, u32::MAX, [], false])));
+            wallet.zecd_funding_read("getbalance", json!(["*", maturity])),
+            wallet.zecd_funding_read("listunspent", json!([maturity, u32::MAX, [], false])));
         // Preserve the previous balance-first error priority. Values are still
         // parsed only by the exact integer/conservative routine below.
         let total = total.map_err(|error| { probe_stage("balance_read"); error })?;
         let outputs = outputs.map_err(|error| { probe_stage("inventory_read"); error })?;
         probe_stage("inventory_check");
-        let available = eligible_balance(&total, &outputs)?;
+        let (available, mature) = eligible_balance(&total, &outputs, maturity)?;
         if let Some(signer)=signer {
             // Historical receipt/status reads can survive an actor failure.
             // The private historical proof remains provisional until THIS
@@ -566,7 +597,8 @@ async fn collect_money(wallet: &ZcashRpcClient, source: &str, node: &ZcashRpcCli
         probe_stage("diagnostic_final_freshness");
         let finished = now()?;
         if finished < checked_at || finished >= until { return Err(ZecdFundingError::InvalidEvidence); }
-        Ok(ZecdFundingDiagnostics { confirmed_eligible_zatoshis: available, checked_at_unix: checked_at,
+        Ok(ZecdFundingDiagnostics { confirmed_eligible_zatoshis: available, mature_eligible_zatoshis: mature,
+            checked_at_unix: checked_at,
             valid_until_unix: until, signer_readiness: after_signer })
 }
 
@@ -825,6 +857,7 @@ mod tests {
                 return Err(ZecdFundingError::InvalidEvidence);
             }
             Ok(ZecdFundingEvidence { confirmed_eligible_zatoshis: proof.confirmed_eligible_zatoshis,
+            mature_eligible_zatoshis: proof.mature_eligible_zatoshis,
                 checked_at_unix: proof.checked_at_unix, valid_until_unix: proof.valid_until_unix,
                 signer_readiness: readiness, _private: () })
         }).await.map_err(|_| ZecdFundingError::Timeout)?
@@ -1229,7 +1262,7 @@ mod tests {
         assert_eq!(timeout.stage,"signer_history_actor_read");
         assert_eq!(timeout.category,"deadline_exceeded");
         let success=run_funding_probe(async { Ok(ZecdFundingEvidence {
-            confirmed_eligible_zatoshis:123456789,checked_at_unix:111,
+            confirmed_eligible_zatoshis:123456789,mature_eligible_zatoshis:123456789,checked_at_unix:111,
             valid_until_unix:171,signer_readiness:SignerReadiness::PassphraseUnlocked,_private:()
         }) }).await;
         assert_eq!(serde_json::to_value(success).unwrap(),json!({"passed":true,"stage":"complete","category":"passed"}));
@@ -1285,38 +1318,46 @@ mod tests {
     #[test]
     fn conservative_balance_excludes_pending_watchonly_and_nonroute_pools() {
         let rows=json!([note("transparent",1,"1"),note("sapling",2,"2"),note("orchard",3,"3"),note("ironwood",4,"4")]);
-        assert_eq!(eligible_balance(&json!(10),&rows),Ok(700_000_000));
-        assert_eq!(eligible_balance(&json!(8),&rows),Ok(500_000_000)); // Aggregate caps nonspendable notes.
-        assert_eq!(eligible_balance(&json!(20),&rows),Ok(700_000_000)); // Listing caps aggregate too.
-        assert!(eligible_balance(&json!(2),&rows).is_err());
+        assert_eq!(eligible_balance(&json!(10),&rows,10),Ok((700_000_000,700_000_000)));
+        assert_eq!(eligible_balance(&json!(8),&rows,10),Ok((500_000_000,500_000_000))); // Aggregate caps nonspendable notes.
+        assert_eq!(eligible_balance(&json!(20),&rows,10),Ok((700_000_000,700_000_000))); // Listing caps aggregate too.
+        assert!(eligible_balance(&json!(2),&rows,10).is_err());
         // An immature note is now excluded (not counted), never an error, so a
         // fresh payout change note cannot pause admission.
         let mut pending=note("orchard",3,"1"); pending["confirmations"]=json!(0);
-        assert_eq!(eligible_balance(&json!(1),&json!([pending])),Ok(0));
+        assert_eq!(eligible_balance(&json!(1),&json!([pending.clone()]),10),Ok((0,0)));
+        assert_eq!(eligible_balance(&json!(1),&json!([pending]),1),Ok((0,0)));
+        // At a lower credit maturity a shallow note backs new credits as soon as it
+        // confirms, while a send (minconf 10) still cannot spend it.
+        let mut shallow=note("ironwood",5,"1"); shallow["confirmations"]=json!(1);
+        let mut deep=note("orchard",6,"2"); deep["confirmations"]=json!(10);
+        assert_eq!(eligible_balance(&json!(3),&json!([shallow.clone(),deep.clone()]),1),Ok((300_000_000,200_000_000)));
+        assert_eq!(eligible_balance(&json!(3),&json!([shallow.clone(),deep.clone()]),2),Ok((200_000_000,200_000_000)));
+        assert_eq!(eligible_balance(&json!(3),&json!([shallow,deep]),10),Ok((200_000_000,200_000_000)));
         let tiny=serde_json::from_str::<Value>("1.000000000000001").unwrap();
-        assert!(eligible_balance(&tiny,&json!([])).is_err());
-        assert!(eligible_balance(&Value::Null,&json!([])).is_err());
-        assert_eq!(eligible_balance(&json!(0),&json!([])),Ok(0));
+        assert!(eligible_balance(&tiny,&json!([]),10).is_err());
+        assert!(eligible_balance(&Value::Null,&json!([]),10).is_err());
+        assert_eq!(eligible_balance(&json!(0),&json!([]),10),Ok((0,0)));
     }
 
     #[test]
     fn enumeration_is_typed_bounded_unique_and_complete() {
         let n=note("orchard",1,"1");
-        assert!(eligible_balance(&json!(2),&json!([n.clone(),n.clone()])).is_err());
+        assert!(eligible_balance(&json!(2),&json!([n.clone(),n.clone()]),10).is_err());
         // Structural corruption still invalidates the whole evidence:
         for field in ["pool","txid","vout","amount"] {
             let mut bad=n.clone(); bad.as_object_mut().unwrap().remove(field);
-            assert!(eligible_balance(&json!(1),&json!([bad])).is_err(),"{field}");
+            assert!(eligible_balance(&json!(1),&json!([bad]),10).is_err(),"{field}");
         }
         // A missing eligibility field now EXCLUDES that note (it just is not
         // counted yet) rather than pausing all admission:
         for field in ["address","confirmations","safe","spendable","solvable"] {
             let mut bad=n.clone(); bad.as_object_mut().unwrap().remove(field);
-            assert_eq!(eligible_balance(&json!(1),&json!([bad])),Ok(0),"{field}");
+            assert_eq!(eligible_balance(&json!(1),&json!([bad]),10),Ok((0,0)),"{field}");
         }
         let rows=Value::Array(vec![n;MAX_UNSPENT_OUTPUTS+1]);
-        assert_eq!(eligible_balance(&json!(1),&rows),Err(ZecdFundingError::EnumerationTooLarge));
-        assert!(eligible_balance(&json!(1),&json!({"partial":[]})).is_err());
+        assert_eq!(eligible_balance(&json!(1),&rows,10),Err(ZecdFundingError::EnumerationTooLarge));
+        assert!(eligible_balance(&json!(1),&json!({"partial":[]}),10).is_err());
     }
 
     #[test]

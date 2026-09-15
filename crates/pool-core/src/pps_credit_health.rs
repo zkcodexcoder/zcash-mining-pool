@@ -533,7 +533,7 @@ mod tests {
             max_liability_zatoshis:95_000_000_000,total_exposure_zatoshis:100_000_000_000,
             fee_allowance_zatoshis:5_000_000_000,reserve_floor_zatoshis:0,quote_provenance:"synthetic".into()};
         let l=PpsFundingLease {network:e.network.clone(),checked_at_unix:80,valid_until_unix:140,
-            spendable_zatoshis:100_000_000_001,reserve_floor_zatoshis:0,
+            spendable_zatoshis:100_000_000_001,mature_spendable_zatoshis:100_000_000_001,reserve_floor_zatoshis:0,
             reserved_fee_allowance_zatoshis:5_000_000_000,generation:7};
         let s=pool_db::pps_funding::PpsFundingSnapshot {network:e.network.clone(),generation:7,
             legacy_pending_zatoshis:0,legacy_paying_zatoshis:0,pps_outstanding_subzatoshis:0,

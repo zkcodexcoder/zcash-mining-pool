@@ -1528,6 +1528,7 @@ pub(crate) mod tests {
             network: "testnet".into(), epoch: "audit-test".into(), fee_bps: 100,
             max_liability_zatoshis: 1_000, total_exposure_zatoshis: 2_000,
             fee_allowance_zatoshis: 10, reserve_min_zatoshis: 1, max_payout_zatoshis: 100,
+            funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY,
             settle_confirmations: 10,
         }
     }

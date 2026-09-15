@@ -12,6 +12,12 @@ fn default_settle_confirmations() -> u64 {
     DEFAULT_SETTLE_CONFIRMATIONS
 }
 
+/// Confirmations a wallet note needs before a payout may spend it (the send's
+/// minconf). Must equal node-rpc's `zecd_funding::PAYOUT_NOTE_MATURITY`; pool-core
+/// asserts it at compile time.
+pub const PAYOUT_NOTE_MATURITY: u32 = 10;
+fn default_funding_maturity_confirmations() -> u32 { PAYOUT_NOTE_MATURITY }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PpsPolicy {
@@ -23,6 +29,12 @@ pub struct PpsPolicy {
     pub fee_allowance_zatoshis: i64,
     pub reserve_min_zatoshis: i64,
     pub max_payout_zatoshis: i64,
+    /// Confirmations a wallet note needs before it backs NEW CREDITS (1..=10).
+    /// Payouts always spend notes at `PAYOUT_NOTE_MATURITY`; a lower credit
+    /// maturity lets a payout's own change count as soon as it confirms, so
+    /// admission does not pause while the wallet holds the money.
+    #[serde(default = "default_funding_maturity_confirmations")]
+    pub funding_maturity_confirmations: u32,
     /// Confirmations before a sent payout settles (paying -> paid). Never read from
     /// `[pps]`; the dashboard sets it from `[payout] pps_settle_confirmations`.
     #[serde(skip, default = "default_settle_confirmations")]
@@ -68,6 +80,9 @@ impl PpsPolicy {
         if !SETTLE_CONFIRMATIONS_RANGE.contains(&self.settle_confirmations) {
             return Err("PPS settle confirmations must be within 3..=100");
         }
+        if !(1..=PAYOUT_NOTE_MATURITY).contains(&self.funding_maturity_confirmations) {
+            return Err("PPS funding_maturity_confirmations must be within 1..=10");
+        }
         Ok(())
     }
 
@@ -99,8 +114,21 @@ mod tests {
             fee_allowance_zatoshis: 10_000_000,
             reserve_min_zatoshis: 10_000_000,
             max_payout_zatoshis: 20_000_000,
+            funding_maturity_confirmations: PAYOUT_NOTE_MATURITY,
             settle_confirmations: DEFAULT_SETTLE_CONFIRMATIONS,
         }
+    }
+
+    #[test]
+    fn funding_maturity_is_bounded_by_the_payout_maturity() {
+        for bad in [0, PAYOUT_NOTE_MATURITY + 1, u32::MAX] {
+            let mut p = policy();
+            p.funding_maturity_confirmations = bad;
+            assert!(p.validate("testnet").is_err());
+        }
+        let mut p = policy();
+        p.funding_maturity_confirmations = 1;
+        assert!(p.validate("testnet").is_ok());
     }
 
     #[test]

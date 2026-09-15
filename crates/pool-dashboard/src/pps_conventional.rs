@@ -415,7 +415,8 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
     }).await?;
     // No fallback and no transport retry. Even a reported RPC failure can
     // follow submission. All errors after this one-shot fence retain funds.
-    let sent=rpc(wallet,"z_sendmany",json!([from,recipients,10,null,"AllowRevealedRecipients"])).await
+    // minconf = the payout maturity the funding proof's mature balance was measured at.
+    let sent=rpc(wallet,"z_sendmany",json!([from,recipients,node_rpc::zecd_funding::PAYOUT_NOTE_MATURITY,null,"AllowRevealedRecipients"])).await
         .inspect_err(|_| tracing::warn!(attempt, stage = "send", "PPS conventional send outcome unknown; attempt held"))?;
     let opid=sent.as_str().filter(|v|valid_opid(v)).context("PPS operation ID invalid")
         .inspect_err(|_| tracing::warn!(attempt, stage = "operation_id", "PPS conventional send returned no valid operation; attempt held"))?;

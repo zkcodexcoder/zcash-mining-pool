@@ -114,6 +114,8 @@ pub enum PpsFundingError {
 /// This is validation, not a capability factory. A lease is issued only by a
 /// fresh wallet read bracketed by matching DB snapshots and a verified fixed
 /// PCZT RPC contract. Config cannot supply a manual wallet attestation.
+const _: () = assert!(node_rpc::zecd_funding::PAYOUT_NOTE_MATURITY == pool_db::pps_policy::PAYOUT_NOTE_MATURITY);
+
 pub fn validate_funding_lease(lease: &PpsFundingLease, epoch: &PpsEpoch, now: i64)
     -> Result<(), PpsFundingError>
 {
@@ -122,6 +124,7 @@ pub fn validate_funding_lease(lease: &PpsFundingLease, epoch: &PpsEpoch, now: i6
         || lease.valid_until_unix.saturating_sub(lease.checked_at_unix) > FUNDING_LEASE_SECONDS
         || lease.valid_until_unix <= lease.checked_at_unix
         || lease.spendable_zatoshis < 0
+        || lease.mature_spendable_zatoshis < 0
         || lease.reserve_floor_zatoshis != epoch.reserve_floor_zatoshis
         || lease.reserved_fee_allowance_zatoshis != epoch.fee_allowance_zatoshis
     { return Err(PpsFundingError::InvalidEvidence); }
@@ -140,7 +143,7 @@ pub enum Shortfall {
 }
 
 fn finish_evidence(before: &PpsFundingSnapshot, after: &PpsFundingSnapshot,
-    spendable: i64, epoch: &PpsEpoch, checked_at: i64, now: i64, shortfall: Shortfall)
+    spendable: i64, mature: i64, epoch: &PpsEpoch, checked_at: i64, now: i64, shortfall: Shortfall)
     -> Result<PpsFundingLease, PpsFundingError>
 {
     // The requirement counts outstanding liability, so every credit between the
@@ -162,6 +165,7 @@ fn finish_evidence(before: &PpsFundingSnapshot, after: &PpsFundingSnapshot,
         valid_until_unix: checked_at.checked_add(FUNDING_LEASE_SECONDS)
             .ok_or(PpsFundingError::InvalidEvidence)?,
         spendable_zatoshis: spendable,
+        mature_spendable_zatoshis: mature.min(spendable),
         reserve_floor_zatoshis: epoch.reserve_floor_zatoshis,
         reserved_fee_allowance_zatoshis: epoch.fee_allowance_zatoshis,
         generation: after.generation,
@@ -313,7 +317,7 @@ fn finish_testnet_evidence(before: &PpsFundingSnapshot, after: &PpsFundingSnapsh
     // The outer generation bracket starts no later than the wallet evidence.
     // Using its earlier clock shortens the lease and never refreshes stale data.
     let lease = finish_evidence(before, after, proof.confirmed_eligible_zatoshis,
-        epoch, checked_at, now, shortfall)?;
+        proof.mature_eligible_zatoshis, epoch, checked_at, now, shortfall)?;
     if lease.valid_until_unix > proof.valid_until_unix {
         return Err(PpsFundingError::InvalidEvidence);
     }
@@ -362,7 +366,7 @@ async fn collect_pczt(db: &PoolDb, wallet: &ZcashRpcClient, epoch: &PpsEpoch, fr
         let after = db.pps_funding_snapshot_for_epoch(epoch).await
             .map_err(|_| PpsFundingError::AccountingUnavailable)?;
         crate::pps_credit_health::stage("funding_finish");
-        finish_evidence(&before, &after, spendable, epoch, checked_at, chrono::Utc::now().timestamp(), shortfall)
+        finish_evidence(&before, &after, spendable, spendable, epoch, checked_at, chrono::Utc::now().timestamp(), shortfall)
     }).await.map_err(|_| PpsFundingError::Timeout)?
 }
 
@@ -455,7 +459,7 @@ mod tests {
     fn lease_rejects_expiry_future_and_mutated_economic_bounds() {
         let e = epoch();
         let lease = PpsFundingLease { network: "testnet".into(), checked_at_unix:100,
-            valid_until_unix:160, spendable_zatoshis:1_000_000_001,
+            valid_until_unix:160, spendable_zatoshis:1_000_000_001, mature_spendable_zatoshis:1_000_000_001,
             reserve_floor_zatoshis:1, reserved_fee_allowance_zatoshis:10_000_000, generation:0 };
         assert!(validate_funding_lease(&lease,&e,159).is_ok());
         for now in [99,160,170] { assert!(validate_funding_lease(&lease,&e,now).is_err()); }
@@ -481,23 +485,29 @@ mod tests {
             required_spendable_zatoshis:1_000_000_006,
             pps_paying_zatoshis:0, committed_outflow_zatoshis:5,
         };
-        assert!(finish_evidence(&s,&s,1_000_000_006,&e,100,100,Shortfall::Refuse).is_ok());
-        assert_eq!(finish_evidence(&s,&s,1_000_000_005,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::InsufficientFunding));
-        assert_eq!(finish_evidence(&s,&s,1_000_000_006,&e,100,100+FUNDING_LEASE_SECONDS,Shortfall::Refuse),Err(PpsFundingError::InvalidEvidence));
+        assert!(finish_evidence(&s,&s,1_000_000_006,1_000_000_006,&e,100,100,Shortfall::Refuse).is_ok());
+        assert_eq!(finish_evidence(&s,&s,1_000_000_005,1_000_000_005,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::InsufficientFunding));
+        assert_eq!(finish_evidence(&s,&s,1_000_000_006,1_000_000_006,&e,100,100+FUNDING_LEASE_SECONDS,Shortfall::Refuse),Err(PpsFundingError::InvalidEvidence));
         let mut changed=s.clone(); changed.generation+=1;
-        assert_eq!(finish_evidence(&s,&changed,i64::MAX,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::ConcurrentChange));
+        assert_eq!(finish_evidence(&s,&changed,i64::MAX,i64::MAX,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::ConcurrentChange));
         // A credit between the reads moves the requirement, not the generation:
         // the refresh succeeds only if the proof covers the larger requirement.
         let mut changed=s.clone(); changed.required_spendable_zatoshis+=1;
-        assert!(finish_evidence(&s,&changed,1_000_000_007,&e,100,100,Shortfall::Refuse).is_ok());
-        assert_eq!(finish_evidence(&s,&changed,1_000_000_006,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::InsufficientFunding));
-        assert_eq!(finish_evidence(&changed,&s,1_000_000_006,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::InsufficientFunding));
+        assert!(finish_evidence(&s,&changed,1_000_000_007,1_000_000_007,&e,100,100,Shortfall::Refuse).is_ok());
+        assert_eq!(finish_evidence(&s,&changed,1_000_000_006,1_000_000_006,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::InsufficientFunding));
+        assert_eq!(finish_evidence(&changed,&s,1_000_000_006,1_000_000_006,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::InsufficientFunding));
         // Share admission keeps a short proof, unchanged, so the ledger can refuse
         // new credits with it; a broken requirement is still refused.
-        let short = finish_evidence(&s,&s,1_000_000_005,&e,100,100,Shortfall::Keep).unwrap();
+        let short = finish_evidence(&s,&s,1_000_000_005,1_000_000_005,&e,100,100,Shortfall::Keep).unwrap();
         assert_eq!((short.spendable_zatoshis, short.generation), (1_000_000_005, 7));
+        // The mature balance rides along for the payout rule, never above the
+        // confirmed one and never negative.
+        let split = finish_evidence(&s,&s,1_000_000_006,400,&e,100,100,Shortfall::Refuse).unwrap();
+        assert_eq!((split.spendable_zatoshis, split.mature_spendable_zatoshis), (1_000_000_006, 400));
+        assert_eq!(finish_evidence(&s,&s,7,9,&e,100,100,Shortfall::Keep).unwrap().mature_spendable_zatoshis, 7);
+        assert_eq!(finish_evidence(&s,&s,1_000_000_006,-1,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::InvalidEvidence));
         let mut broken = s.clone(); broken.required_spendable_zatoshis = 0;
-        assert_eq!(finish_evidence(&broken,&broken,1,&e,100,100,Shortfall::Keep),Err(PpsFundingError::InsufficientFunding));
+        assert_eq!(finish_evidence(&broken,&broken,1,1,&e,100,100,Shortfall::Keep),Err(PpsFundingError::InsufficientFunding));
     }
 
     #[test]
@@ -523,7 +533,7 @@ mod tests {
         // The ordinary/payout funding finish remains available after reserving
         // a batch; only the explicitly named credit wrapper applies this gate.
         let e=conventional_epoch();
-        assert!(finish_evidence(&reserved,&reserved,1,&e,100,100,Shortfall::Refuse).is_ok());
+        assert!(finish_evidence(&reserved,&reserved,1,1,&e,100,100,Shortfall::Refuse).is_ok());
         reserved.reserved_fees_zatoshis=-1;
         assert_eq!(validate_credit_fee_capacity(&route,&reserved),Err(PpsFundingError::InvalidEvidence));
     }

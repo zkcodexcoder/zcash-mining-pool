@@ -39,6 +39,7 @@ async fn fixture(address: &str) -> (PoolDb, sqlx::SqlitePool, PpsPolicy, i64) {
         fee_allowance_zatoshis: 10_000_000,
         reserve_min_zatoshis: 10_000_000,
         max_payout_zatoshis: 20_000_000,
+        funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY,
         settle_confirmations: 10,
     };
     db.initialize_pps_epoch(&policy.epoch_config(), Some(&funding(&db, &policy).await))
@@ -86,6 +87,7 @@ async fn funding(db: &PoolDb, policy: &PpsPolicy) -> PpsFundingLease {
         checked_at_unix: now,
         valid_until_unix: now + 60,
         spendable_zatoshis: 10_000_000_000,
+        mature_spendable_zatoshis: 10_000_000_000,
         reserve_floor_zatoshis: policy.reserve_min_zatoshis,
         reserved_fee_allowance_zatoshis: policy.fee_allowance_zatoshis,
         generation: s.generation,

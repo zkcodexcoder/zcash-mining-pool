@@ -2032,7 +2032,7 @@ mod tests {
 
     fn refresh_test_proof() -> PpsFundingLease {
         PpsFundingLease { network:"testnet".into(),checked_at_unix:100,valid_until_unix:160,
-            spendable_zatoshis:1_000_000_001,reserve_floor_zatoshis:1,
+            spendable_zatoshis:1_000_000_001,mature_spendable_zatoshis:1_000_000_001,reserve_floor_zatoshis:1,
             reserved_fee_allowance_zatoshis:50_000_000,generation:7 }
     }
 

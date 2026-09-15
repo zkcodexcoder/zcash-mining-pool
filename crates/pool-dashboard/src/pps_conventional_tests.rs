@@ -69,6 +69,7 @@ async fn funding(db: &PoolDb, p: &PpsPolicy) -> PpsFundingLease {
         checked_at_unix: now,
         valid_until_unix: now + 60,
         spendable_zatoshis: 200_000_000_000,
+        mature_spendable_zatoshis: 200_000_000_000,
         reserve_floor_zatoshis: p.reserve_min_zatoshis,
         reserved_fee_allowance_zatoshis: p.fee_allowance_zatoshis,
         generation: s.generation,
@@ -133,6 +134,7 @@ impl Fixture {
             fee_allowance_zatoshis: 5_000_000_000,
             reserve_min_zatoshis: 1,
             max_payout_zatoshis: CREDIT,
+            funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY,
             settle_confirmations: pool_db::pps_policy::DEFAULT_SETTLE_CONFIRMATIONS,
         };
         db.initialize_pps_epoch(&policy.epoch_config(), Some(&funding(&db, &policy).await))

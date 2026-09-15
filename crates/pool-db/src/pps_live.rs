@@ -1074,6 +1074,7 @@ mod tests {
             checked_at_unix: NOW,
             valid_until_unix: NOW + 90,
             spendable_zatoshis: 1_000_000_000,
+            mature_spendable_zatoshis: 1_000_000_000,
             reserve_floor_zatoshis: e.reserve_floor_zatoshis,
             reserved_fee_allowance_zatoshis: e.fee_allowance_zatoshis,
             generation: generation as u64,
@@ -1225,15 +1226,17 @@ mod tests {
             .unwrap();
         let attempt = f.db.create_payout_attempt(1, 5, "fixture-pps").await.unwrap();
         let mut lease = funded(&f).await;
-        // Five zatoshis cannot cover the batch (5) plus its fee bound (1).
-        lease.spendable_zatoshis = 5;
+        // Five MATURE zatoshis cannot cover the batch (5) plus its fee bound (1),
+        // however much shallower money backs new credits (spendable stays 1e9).
+        lease.mature_spendable_zatoshis = 5;
         assert!(matches!(
             f.db.reserve_pps_payout(attempt, &[(f.m, 5)], &lease, &fee(attempt)).await,
             Err(PpsDbError::FundingInsufficient)
         ));
         assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, 0);
-        // Six does, although it is far below the credit rule's 5 + 10 + 100.
+        // Six does, although it is far below the credit rule's 5 + 100.
         lease.spendable_zatoshis = 6;
+        lease.mature_spendable_zatoshis = 6;
         assert!(matches!(
             f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&lease), NOW).await,
             Err(PpsDbError::FundingInsufficient)
@@ -1243,10 +1246,11 @@ mod tests {
         // Reserving moved the funding generation, so the pre-send collector takes a
         // fresh proof. The recheck (the seal's rule) still passes at six...
         let mut fresh = funded(&f).await;
-        fresh.spendable_zatoshis = 6;
+        fresh.mature_spendable_zatoshis = 6;
         f.db.check_pps_funding(&fresh).await.unwrap();
-        // ...and refuses once the wallet no longer covers what is committed.
-        fresh.spendable_zatoshis = 5;
+        // ...and refuses once the MATURE balance no longer covers what is
+        // committed: shallower notes back new credits, never a send.
+        fresh.mature_spendable_zatoshis = 5;
         assert!(matches!(f.db.check_pps_funding(&fresh).await, Err(PpsDbError::FundingInsufficient)));
     }
     #[tokio::test]
@@ -1735,9 +1739,10 @@ mod tests {
                     f.db.reserve_payout(old, &[(f.m, 1)]).await.unwrap();
                 }
                 2 => {
-                    // Exactly what is committed to leave the wallet (the seal's rule);
-                    // a new legacy claim after attestation is one zatoshi more.
-                    lease.spendable_zatoshis = f.db.pps_funding_snapshot().await.unwrap().committed_outflow_zatoshis;
+                    // Exactly what is committed to leave the wallet (the seal's rule,
+                    // measured on the MATURE balance); a new legacy claim after
+                    // attestation is one zatoshi more.
+                    lease.mature_spendable_zatoshis = f.db.pps_funding_snapshot().await.unwrap().committed_outflow_zatoshis;
                     f.db.check_pps_funding(&lease).await.unwrap();
                     f.db.credit_balance(f.m, 1).await.unwrap();
                 }
@@ -2347,6 +2352,7 @@ mod tests {
         let projected = f.db.pps_testnet_budget_extension_snapshot(&f.e).await.unwrap();
         PpsFundingLease { network:"testnet".into(), checked_at_unix:NOW,
             valid_until_unix:NOW+60, spendable_zatoshis:projected.required_spendable_zatoshis,
+            mature_spendable_zatoshis:projected.required_spendable_zatoshis,
             reserve_floor_zatoshis:projected.reserve_floor_zatoshis,
             reserved_fee_allowance_zatoshis:projected.fee_allowance_zatoshis,
             generation:projected.generation }

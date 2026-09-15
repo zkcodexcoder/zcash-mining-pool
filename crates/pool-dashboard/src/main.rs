@@ -76,6 +76,9 @@ fn validate_dashboard_pps(config: &Config) -> Result<()> {
         (true, Some(p)) => {
             p.validate(&config.pool.network).map_err(anyhow::Error::msg)?;
             config.pps_funding.unwrap_or_default().validate(&p.epoch_config())?;
+            // Credit-side note maturity of the wallet funding proof (payouts stay at 10).
+            node_rpc::zecd_funding::set_credit_note_maturity(p.funding_maturity_confirmations)
+                .map_err(anyhow::Error::msg)?;
             anyhow::ensure!(config.payout.enabled && config.payout.reconcile_interval_secs > 0
                 && config.payout.interval_secs > 0 && !config.payout.pay_immature
                 && config.payout.wallet_rpc_url.is_some() && config.payout.pool_address.is_some(),

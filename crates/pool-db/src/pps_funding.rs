@@ -83,7 +83,11 @@ pub struct PpsFundingLease {
     pub network: String,
     pub checked_at_unix: i64,
     pub valid_until_unix: i64,
+    /// Confirmed balance backing NEW CREDITS: notes at the credit maturity.
     pub spendable_zatoshis: i64,
+    /// The part of it a payout can spend now: notes at the payout maturity (the
+    /// send's minconf). Payout checks use this; the credit maturity may be lower.
+    pub mature_spendable_zatoshis: i64,
     pub reserve_floor_zatoshis: i64,
     pub reserved_fee_allowance_zatoshis: i64,
     pub generation: u64,
@@ -810,11 +814,12 @@ pub(crate) fn validate_lease(
     Ok(())
 }
 
-/// Payout rule: a fresh proof must cover everything already committed to leave the
-/// wallet plus `batch_and_fee_zatoshis` (the batch being reserved with its fee
-/// bound; 0 once it is reserved). It may spend into the reserve floor: the floor
-/// backs new credits, not the settlement of existing debts (operator decision
-/// 2026-09-15, after a 1,000 TAZ floor held 1,298 TAZ of payouts on a 1,532 TAZ wallet).
+/// Payout rule: a fresh proof's MATURE balance (notes a send can spend now) must
+/// cover everything already committed to leave the wallet plus
+/// `batch_and_fee_zatoshis` (the batch being reserved with its fee bound; 0 once
+/// it is reserved). It may spend into the reserve floor: the floor is a warning
+/// level, not collateral (operator decision 2026-09-15, after a 1,000 TAZ floor
+/// held 1,298 TAZ of payouts on a 1,532 TAZ wallet).
 pub(crate) fn validate_payout_lease(
     s: &PpsFundingSnapshot,
     l: Option<&PpsFundingLease>,
@@ -822,7 +827,7 @@ pub(crate) fn validate_payout_lease(
     batch_and_fee_zatoshis: i64,
 ) -> Result<(), PpsDbError> {
     let l = fresh_lease(s, l, now)?;
-    if l.spendable_zatoshis < plus(s.committed_outflow_zatoshis, batch_and_fee_zatoshis)? {
+    if l.mature_spendable_zatoshis < plus(s.committed_outflow_zatoshis, batch_and_fee_zatoshis)? {
         return Err(PpsDbError::FundingInsufficient);
     }
     Ok(())
@@ -847,6 +852,8 @@ fn fresh_lease<'a>(
         || now >= l.valid_until_unix
         || l.spendable_zatoshis < 0
         || l.spendable_zatoshis > 21_000_000 * 100_000_000
+        || l.mature_spendable_zatoshis < 0
+        || l.mature_spendable_zatoshis > 21_000_000 * 100_000_000
         || l.reserve_floor_zatoshis != s.reserve_floor_zatoshis
         || l.reserved_fee_allowance_zatoshis != s.fee_allowance_zatoshis
     {

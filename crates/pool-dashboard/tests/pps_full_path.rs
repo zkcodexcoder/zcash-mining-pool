@@ -229,6 +229,7 @@ fn synthetic_policy() -> PpsPolicy {
         fee_allowance_zatoshis: 10_000_000,
         reserve_min_zatoshis: 10_000_000,
         max_payout_zatoshis: 100_000_000,
+        funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY,
         settle_confirmations: 10,
     }
 }
@@ -246,6 +247,7 @@ async fn synthetic_funding(
         // Covers what is owed with 100 ZEC to spare: a proof that cannot cover a
         // credit refuses it (decision #1), so every fixture must be backed.
         spendable_zatoshis: s.required_spendable_zatoshis + 10_000_000_000,
+        mature_spendable_zatoshis: s.required_spendable_zatoshis + 10_000_000_000,
         reserve_floor_zatoshis: epoch.reserve_floor_zatoshis,
         reserved_fee_allowance_zatoshis: epoch.fee_allowance_zatoshis,
         generation: s.generation,
