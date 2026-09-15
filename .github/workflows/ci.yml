@@ -1,0 +1,18 @@
+# Workspace tests on every push and pull request (audit item 11, operator decision #15).
+name: ci
+on:
+  push:
+    branches: [main, pps]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust tests (all crates, no fail-fast)
+        run: cargo test --workspace --no-fail-fast
+      - name: JS credit-health view test
+        run: node crates/pool-api/tests/credit_health_view.cjs

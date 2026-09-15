@@ -140,6 +140,7 @@ impl Reconciler {
         self.check_invariant(&mut summary).await;
         self.check_pps_invariant(&mut summary).await;
         self.check_pps_withholding(&mut summary).await;
+        self.check_pps_fee_allowance(&mut summary).await;
         self.check_coinbase_outputs(&mut summary).await;
 
         let health = serde_json::json!({
@@ -1052,6 +1053,20 @@ impl Reconciler {
         }
     }
 
+    /// Fee allowance watch (operator decision 2026-09-15, #5): the payout fee
+    /// allowance is a fixed lifetime number; alert once paid plus reserved fees
+    /// reach 80% of it, well before sends would stop for want of fee capacity.
+    async fn check_pps_fee_allowance(&self, summary: &mut SweepSummary) {
+        if self.pps_policy.is_none() { return; }
+        let s = match self.db.pps_funding_snapshot().await {
+            Ok(s) => s,
+            Err(e) => { summary.alerts.push(format!("PPS fee allowance check failed: {e}")); return; }
+        };
+        if let Some(alert) = fee_allowance_warning(s.paid_fees_zatoshis, s.reserved_fees_zatoshis, s.fee_allowance_zatoshis) {
+            summary.alerts.push(alert);
+        }
+    }
+
     /// True when the payout wallet reports the transaction conflicted (-1 confirmations).
     async fn pps_wallet_conflicted(&self, txid: &str) -> bool {
         matches!(
@@ -1066,6 +1081,15 @@ impl Reconciler {
 const WITHHOLDING_WINDOW_SECONDS: i64 = 86_400;
 const WITHHOLDING_MIN_EXPECTED: f64 = 5.0;
 const WITHHOLDING_P_THRESHOLD: f64 = 1e-3;
+
+/// The fee-allowance alert text once paid + reserved fees reach 80% of the allowance.
+pub(crate) fn fee_allowance_warning(paid: i64, reserved: i64, allowance: i64) -> Option<String> {
+    let used = paid.checked_add(reserved)?;
+    if allowance <= 0 || used.checked_mul(10)? < allowance.checked_mul(8)? { return None; }
+    Some(format!(
+        "PPS fee allowance {:.1}% used ({used} of {allowance} zatoshis paid or reserved); extend the budget before sends stop",
+        used as f64 * 100.0 / allowance as f64))
+}
 
 /// P(X <= k) for X ~ Poisson(lambda), summed in log space.
 pub(crate) fn poisson_lower_tail(lambda: f64, k: i64) -> f64 {
@@ -1097,6 +1121,16 @@ pub(crate) mod tests {
     use axum::{extract::State, routing::post, Json, Router};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
+    #[test]
+    fn fee_allowance_warns_at_eighty_percent() {
+        assert!(fee_allowance_warning(79, 0, 100).is_none());
+        assert!(fee_allowance_warning(70, 9, 100).is_none());
+        assert!(fee_allowance_warning(70, 10, 100).is_some_and(|a| a.starts_with("PPS fee allowance 80.0% used")));
+        assert!(fee_allowance_warning(100, 0, 100).is_some());
+        assert!(fee_allowance_warning(1, 0, 0).is_none());
+        assert!(fee_allowance_warning(i64::MAX, 1, 100).is_none());
+    }
+
     #[test]
     fn poisson_lower_tail_matches_known_values() {
         assert!((poisson_lower_tail(10.0, 10) - 0.5830).abs() < 1e-3);
