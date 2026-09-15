@@ -898,9 +898,6 @@ pub struct PpsMinerLuck {
     pub expected_blocks: f64,
     pub found_blocks: i64,
 }
-fn target_as_f64(bytes: &[u8]) -> f64 {
-    bytes.iter().fold(0.0_f64, |acc, b| acc * 256.0 + f64::from(*b))
-}
 /// A financial halt: a send that failed byte-for-byte verification (recipient,
 /// fee, version or source mismatch) or an excess fee, not yet released by an
 /// operator (pps_halt_releases, audit B10). Sends are fenced while one is
@@ -1187,34 +1184,37 @@ impl PoolDb {
         .execute(self.inner()).await?;
         Ok(())
     }
-    /// Expected blocks (the sum over credited shares of network target over
-    /// assigned target) and found blocks per miner since `since_unix`
-    /// (withholding defence, #10). Blocks of every status count as found.
+    /// Expected blocks per miner since `since_unix` — the value credited to the
+    /// miner's shares, grossed up by the pool fee, divided by the block subsidy
+    /// each share was priced against (exactly the P&L page's "expected") — and
+    /// the blocks found (any status). Withholding defence, #10.
     pub async fn pps_withholding_report(&self, since_unix: i64) -> Result<Vec<PpsMinerLuck>, PpsDbError> {
         use std::collections::BTreeMap;
+        let mut c = self.inner().acquire().await?;
+        let fee_bps = active_epoch(&mut c).await?.fee_bps;
+        let kept = f64::from(10_000_u16.checked_sub(fee_bps).ok_or(PpsDbError::Invariant)?) / 10_000.0;
+        if kept <= 0.0 { return Err(PpsDbError::Invariant); }
         let mut expected: BTreeMap<i64, f64> = BTreeMap::new();
         let rows = sqlx::query(
-            "SELECT e.miner_id,q.assigned_target,q.network_target,COUNT(*) AS n FROM pps_events e \
-             JOIN pps_quotes q ON q.quote_id=e.quote_id WHERE e.accepted_at>=?1 GROUP BY e.miner_id,e.quote_id",
+            "SELECT e.miner_id,q.miner_subsidy,SUM(e.amount_whole) AS whole,SUM(e.amount_fraction) AS fraction FROM pps_events e \
+             JOIN pps_quotes q ON q.quote_id=e.quote_id WHERE e.accepted_at>=?1 GROUP BY e.miner_id,q.miner_subsidy",
         )
-        .bind(since_unix).fetch_all(self.inner()).await?;
+        .bind(since_unix).fetch_all(&mut *c).await?;
         for r in &rows {
             let miner: i64 = r.try_get("miner_id")?;
-            let assigned: Vec<u8> = r.try_get("assigned_target")?;
-            let network: Vec<u8> = r.try_get("network_target")?;
-            let n: i64 = r.try_get("n")?;
-            // A share that met the assigned target solves the block with probability
-            // network_target / assigned_target (a smaller target is harder).
-            let (assigned, network) = (target_as_f64(&assigned), target_as_f64(&network));
-            if assigned <= 0.0 || network < 0.0 { return Err(PpsDbError::Invariant); }
-            *expected.entry(miner).or_default() += n as f64 * (network / assigned);
+            let subsidy: i64 = r.try_get("miner_subsidy")?;
+            let whole: i64 = r.try_get("whole")?;
+            let fraction: i64 = r.try_get("fraction")?;
+            if subsidy <= 0 || whole < 0 || fraction < 0 { return Err(PpsDbError::Invariant); }
+            let credited = whole as f64 + fraction as f64 / crate::pps_live::PPS_SCALE as f64;
+            *expected.entry(miner).or_default() += credited / kept / subsidy as f64;
         }
         let mut found: BTreeMap<i64, i64> = BTreeMap::new();
         let rows = sqlx::query(
             "SELECT w.miner_id,COUNT(*) AS n FROM blocks b JOIN workers w ON w.id=b.found_by \
              WHERE b.created_at>=datetime(?1,'unixepoch') GROUP BY w.miner_id",
         )
-        .bind(since_unix).fetch_all(self.inner()).await?;
+        .bind(since_unix).fetch_all(&mut *c).await?;
         for r in &rows {
             found.insert(r.try_get("miner_id")?, r.try_get("n")?);
         }
@@ -1223,7 +1223,7 @@ impl PoolDb {
         let mut report = Vec::with_capacity(miners.len());
         for miner in miners {
             let address: String = sqlx::query_scalar("SELECT address FROM miners WHERE id=?1")
-                .bind(miner).fetch_optional(self.inner()).await?.unwrap_or_default();
+                .bind(miner).fetch_optional(&mut *c).await?.unwrap_or_default();
             report.push(PpsMinerLuck {
                 miner_id: miner, address,
                 expected_blocks: expected.get(&miner).copied().unwrap_or(0.0),
