@@ -1045,9 +1045,13 @@ async fn conventional_proven_recipient_or_fee_violation_is_a_durable_global_hold
         // The miner whose payout is held is not offered again, even with a balance
         // still due, so the next round is idle.
         assert_eq!(process(&f, &rpc).await.unwrap(), 0);
-        // Another miner's due balance meets the halt, which refuses the new seal.
-        credit_second_miner(&f, SAPLING_RECIPIENT, 'f').await;
-        assert!(process(&f, &rpc).await.is_err());
+        // New credits are refused under the halt (operator decision 2026-09-15),
+        // so no new due balance can even form; the round stays empty.
+        assert!(matches!(
+            try_credit_second_miner(&f, SAPLING_RECIPIENT, 'f').await,
+            Err(pool_db::pps_live::PpsDbError::FinancialHalt)
+        ));
+        assert_eq!(process(&f, &rpc).await.unwrap(), 0);
         assert!(f.db.refund_pps_payout(attempt.attempt_id).await.is_err());
         assert_eq!(rpc.sends(), 1);
         assert_eq!(f.legacy().await, legacy);
@@ -1209,6 +1213,9 @@ async fn conventional_legacy_inflight_and_wrong_route_prevent_new_sends() {
 
 
 async fn credit_second_miner(f: &Fixture, address: &str, proof: char) -> i64 {
+    try_credit_second_miner(f, address, proof).await.unwrap()
+}
+async fn try_credit_second_miner(f: &Fixture, address: &str, proof: char) -> Result<i64, pool_db::pps_live::PpsDbError> {
     let miner = f.db.get_or_create_miner(address).await.unwrap();
     let worker = f.db.get_or_create_worker(miner.id, "synthetic-worker-2").await.unwrap();
     let now = Utc::now().timestamp();
@@ -1233,9 +1240,8 @@ async fn credit_second_miner(f: &Fixture, address: &str, proof: char) -> i64 {
         Some(&funding(&f.db, &f.policy).await),
         now,
     )
-    .await
-    .unwrap();
-    miner.id
+    .await?;
+    Ok(miner.id)
 }
 
 #[tokio::test]

@@ -37,7 +37,7 @@ pub enum CreditAdmissionState { Ready, Degraded, Paused, Unknown }
 /// hard credit gate and maps to `Paused`.
 fn degrades_only(reason: &str) -> bool {
     matches!(reason,
-        "chain_invalid" | "liability_over_cap" | "reserve_low" | "financial_halt" | "funding_missing" | "funding_expired"
+        "chain_invalid" | "liability_over_cap" | "reserve_low" | "funding_missing" | "funding_expired"
         | "generation_changed" | "invalid_evidence" | "fee_capacity_exhausted")
 }
 
@@ -287,7 +287,7 @@ pub(crate) fn db_category(error:&PpsDbError) -> &'static str {
         PpsDbError::ChainLeaseRequired=>"chain_lease_required",
         PpsDbError::FundingLeaseRequired=>"funding_lease_required", PpsDbError::FundingInsufficient=>"funding_insufficient",
         PpsDbError::FeeBudgetExceeded=>"fee_capacity_exhausted", PpsDbError::Invariant=>"accounting_invalid",
-        PpsDbError::PayoutHalted=>"payout_halted",
+        PpsDbError::PayoutHalted=>"payout_halted", PpsDbError::FinancialHalt=>"financial_halt",
         PpsDbError::Database(_)=>"accounting_unavailable",
     }
 }
@@ -352,11 +352,12 @@ fn assess(h:&mut PpsCreditHealth, epoch:&PpsEpoch, route:&PpsFundingRoute,
         _ => false,
     };
     let reason=if funding.is_none() { Some("accounting_invalid") }
+        // A financial halt refuses new credits (operator decision 2026-09-15).
+        else if snapshot.financial_halt { Some("financial_halt") }
         else if insolvent { Some("funding_insufficient") }
         else if funding.is_some_and(|s| s.unused_credit_subzatoshis==0) { Some("liability_over_cap") }
         else if reserve_low { Some("reserve_low") }
         else if !h.chain_expiry_valid { Some("chain_invalid") }
-        else if snapshot.financial_halt { Some("financial_halt") }
         else if lease.is_none() { Some("funding_missing") }
         else if !h.funding_expiry_valid { Some("funding_expired") }
         else if h.generation_matches != Some(true) { Some("generation_changed") }
@@ -561,13 +562,18 @@ mod tests {
         s.funding.as_mut().unwrap().reserved_fees_zatoshis=4_980_000_000;
         assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"fee_capacity_exhausted");
         s.funding.as_mut().unwrap().reserved_fees_zatoshis=0;
-        // A halt fences sends only: crediting continues, so it degrades.
+        // A halt is a hard stop for new credits (operator decision 2026-09-15): it
+        // pauses, and outranks every warning and proven insolvency alike.
         s.financial_halt=true;
         assess(&mut h,&e,&route,Some(&l),&s,100);
-        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"financial_halt"));
-        // Audit B14: the most serious warning is reported. Liability over the cap
-        // outranks a send-side halt, and neither pauses crediting.
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"financial_halt"));
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=0;
+        s.funding.as_mut().unwrap().required_spendable_zatoshis+=1;
+        assess(&mut h,&e,&route,Some(&l),&s,100);
+        assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Paused,"financial_halt"));
+        s.funding.as_mut().unwrap().required_spendable_zatoshis-=1;
+        s.financial_halt=false;
+        // Audit B14: the most serious warning is reported.
         assess(&mut h,&e,&route,Some(&l),&s,100);
         assert_eq!((h.state,h.category.as_str()),(CreditAdmissionState::Degraded,"liability_over_cap"));
         s.funding.as_mut().unwrap().unused_credit_subzatoshis=1;

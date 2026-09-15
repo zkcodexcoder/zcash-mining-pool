@@ -642,7 +642,7 @@ const REASON = {
   funding_insufficient:'wallet cannot cover what miners are owed plus payout fees — valid shares are being REJECTED until income or a top-up is spendable; found blocks are still submitted',
   invalid_evidence:'funding evidence rejected — shares still credited, payouts held',
   fee_capacity_exhausted:'payout fee budget spent — shares still credited, payouts held',
-  financial_halt:'operator halt — shares still credited, no sends',
+  financial_halt:'accounting halt — a send failed verification; sends stopped and valid shares are being REJECTED until an operator unhalts; found blocks are still submitted',
   chain_invalid:'chain agreement unproven (node vs reference explorers) — warning only; shares still credited, payouts continue',
   liability_over_cap:'miners are owed more than the liability cap — warning only; shares still credited, payouts catching up',
   reserve_low:'the wallet buffer above what miners are owed is below the reserve floor — warning only; shares still credited',

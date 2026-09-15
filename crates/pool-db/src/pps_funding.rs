@@ -861,6 +861,16 @@ fn fresh_lease<'a>(
     }
     Ok(l)
 }
+/// A financial halt: a send that failed byte-for-byte verification (recipient,
+/// fee, version or source mismatch) or an excess fee. Sends are fenced until an
+/// operator unhalts; since 2026-09-15 new credits are refused too.
+pub(crate) async fn financial_halt_active(c: &mut SqliteConnection) -> Result<bool, PpsDbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pps_conventional_halts) OR EXISTS(SELECT 1 FROM pps_conventional_attempts WHERE excess_fee IS NOT NULL)",
+    )
+    .fetch_one(&mut *c)
+    .await?)
+}
 pub(crate) async fn check(
     c: &mut SqliteConnection,
     e: &PpsEpoch,
@@ -1386,11 +1396,11 @@ impl PoolDb {
         if active_epoch(&mut tx).await? != *e { return Err(PpsDbError::EpochMismatch); }
         let generation:i64=sqlx::query_scalar("SELECT generation FROM pps_funding_generation WHERE singleton=1")
             .fetch_one(&mut *tx).await?;
-        let financial_halt:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pps_conventional_halts) OR EXISTS(SELECT 1 FROM pps_conventional_attempts WHERE excess_fee IS NOT NULL)")
-            .fetch_one(&mut *tx).await?;
+        let financial_halt = financial_halt_active(&mut tx).await?;
         // snapshot no longer bricks under a halt, so surface live funding even
-        // while financial_halt is set: ops can see the ledger is solvent and
-        // only SENDING is fenced. financial_halt stays a distinct health flag.
+        // while financial_halt is set: ops can see whether the ledger is solvent.
+        // financial_halt stays a distinct health flag (a hard credit stop since
+        // 2026-09-15, cleared only by an operator).
         let funding=Some(snapshot(&mut tx,e,false).await?);
         tx.rollback().await?;
         Ok(PpsCreditReadinessSnapshot { generation:u64::try_from(generation).map_err(|_|PpsDbError::Invariant)?,

@@ -1444,9 +1444,15 @@ impl ShareValidator {
                     // Proven insolvency (operator decision 2026-09-15): the wallet cannot
                     // cover what miners are already owed, so no new work is bought.
                     // A block-solving share is still submitted below (audit B1).
-                    StratumError::other(if matches!(error, pool_db::pps_live::PpsDbError::FundingInsufficient) {
-                        "PPS admission paused: pool cannot cover payouts"
-                    } else { "PPS admission paused: ledger or authorization gate" }) })?;
+                    StratumError::other(match &error {
+                        pool_db::pps_live::PpsDbError::FundingInsufficient =>
+                            "PPS admission paused: pool cannot cover payouts",
+                        // A financial halt (a send that failed verification) stops new
+                        // credits until an operator unhalts (operator decision 2026-09-15).
+                        pool_db::pps_live::PpsDbError::FinancialHalt =>
+                            "PPS admission paused: pool accounting halted",
+                        _ => "PPS admission paused: ledger or authorization gate",
+                    }) })?;
             drop(latest);
             // Never-reject: the share was credited even though the credit-path funding
             // gate was stale (typically the ~12s window after a payout bumps the funding

@@ -37,6 +37,8 @@ pub enum PpsDbError {
     FeeBudgetExceeded,
     #[error("PPS payout sending halted pending operator review")]
     PayoutHalted,
+    #[error("PPS accounting halted pending operator review; new credits refused")]
+    FinancialHalt,
     #[error("PPS accounting invariant failed")]
     Invariant,
     #[error("PPS database operation failed")]
@@ -421,6 +423,14 @@ impl PoolDb {
             return Ok(receipt);
         }
         epoch_check(&mut tx, e).await?;
+        // Operator decision 2026-09-15: a financial halt (a send that failed
+        // byte-for-byte verification, or an excess fee) is a hard stop for NEW
+        // credits, like proven insolvency: the books cannot be trusted until an
+        // operator unhalts. Duplicates above still replay exactly-once, and a
+        // block-solving share is still submitted by the caller (audit B1).
+        if crate::pps_funding::financial_halt_active(&mut tx).await? {
+            return Err(PpsDbError::FinancialHalt);
+        }
         let now = clock()?;
         // An absent or stale funding lease never rejects a valid share; a fresh proof
         // that the wallet cannot cover what is owed does (see advisory_funding).
@@ -1865,6 +1875,26 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn a_financial_halt_refuses_new_credits_and_still_replays_duplicates() {
+        // Operator decision 2026-09-15: a halt (a proven violation in a send) is a
+        // hard stop for NEW credits, like proven insolvency. Exactly-once replay of
+        // an already-credited proof still answers, and the books still read.
+        let (f, a, intent) = conventional_fixture().await;
+        conventional_sent(&f, a, &intent).await;
+        f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::RecipientMismatch).await.unwrap();
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await,
+            Err(PpsDbError::FinancialHalt)
+        ));
+        let replay = f.db
+            .credit_pps_share(&f.e, &event(&f, 1, 3 * PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        assert!(replay.duplicate);
+        assert!(f.db.pps_credit_readiness_snapshot(&f.e).await.unwrap().financial_halt);
+        assert_eq!(f.db.pps_funding_snapshot().await.unwrap().gross_subzatoshis, 3 * PPS_SCALE);
+    }
+    #[tokio::test]
     async fn conventional_contract_halt_is_permanent_global_and_preserves_claims() {
         let (f, a, intent) = conventional_fixture().await;
         assert!(f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::RecipientMismatch).await.is_err());
@@ -1874,11 +1904,14 @@ mod tests {
         f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::RecipientMismatch).await.unwrap();
         f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::RecipientMismatch).await.unwrap();
         assert!(f.db.halt_pps_conventional_payout(a, PpsConventionalHalt::FeeMismatch).await.is_err());
-        // Halt fences NEW sends only: snapshot + admission keep working, the
-        // seal is refused (PayoutHalted).
+        // Halt fences new sends AND new credits (operator decision 2026-09-15);
+        // the snapshot keeps reading, the seal is refused (PayoutHalted).
         assert!(f.db.pps_funding_snapshot().await.is_ok());
         assert!(f.db.seal_pps_payout(b, &fee(b).proposal_id).await.is_err());
-        assert!(f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&funded(&f).await), NOW).await.is_ok());
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&funded(&f).await), NOW).await,
+            Err(PpsDbError::FinancialHalt)
+        ));
         assert!(f.db.confirm_pps_conventional_payout(a, &"c".repeat(64), 7).await.is_err());
         assert!(f.db.refund_pps_payout(a).await.is_err());
         assert!(sqlx::query("DELETE FROM pps_conventional_halts").execute(f.db.inner()).await.is_err());
@@ -2000,19 +2033,13 @@ mod tests {
             (None, Some(CONVENTIONAL_BOUND + 1))
         );
         assert_eq!(receipt.status, "reserved");
-        // Over-ceiling fee fences sends but no longer bricks accounting/admission.
+        // An over-ceiling fee is a financial halt: accounting still reads; sends
+        // and new credits are refused until an operator unhalts (2026-09-15).
         assert!(f.db.pps_funding_snapshot().await.is_ok());
-        assert!(f
-            .db
-            .credit_pps_share(
-                &f.e,
-                &event(&f, 2, 1),
-                Some(&f.l),
-                Some(&funded(&f).await),
-                NOW
-            )
-            .await
-            .is_ok());
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 2, 1), Some(&f.l), Some(&funded(&f).await), NOW).await,
+            Err(PpsDbError::FinancialHalt)
+        ));
         assert!(f.db.refund_pps_payout(a).await.is_err());
         assert!(f
             .db
