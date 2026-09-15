@@ -105,7 +105,17 @@ pub struct PpsFundingSnapshot {
     pub fee_allowance_zatoshis: i64,
     pub paid_fees_zatoshis: i64,
     pub reserved_fees_zatoshis: i64,
+    /// What NEW credits must be backed by: owed + reserve floor + unspent fee
+    /// allowance (audit B3). Decision #1 refuses credits when a fresh proof falls short.
     pub required_spendable_zatoshis: i64,
+    /// PPS reservations in flight (pps_payout_items), whole zatoshis.
+    pub pps_paying_zatoshis: i64,
+    /// Money already committed to leave the wallet: legacy pending and paying, PPS
+    /// reservations in flight and reserved fee bounds. A payout needs the wallet to
+    /// cover this plus its own batch and fee, never the reserve floor: the floor
+    /// backs new credits, not the settlement of existing ones (operator decision
+    /// 2026-09-15).
+    pub committed_outflow_zatoshis: i64,
 }
 
 /// Read-side telemetry only; not a funding capability or credit authorization.
@@ -568,6 +578,8 @@ pub(crate) async fn snapshot(
         paid_fees_zatoshis: 0,
         reserved_fees_zatoshis: 0,
         required_spendable_zatoshis: 0,
+        pps_paying_zatoshis: 0,
+        committed_outflow_zatoshis: 0,
     };
     // Checked Rust folds, never SQLite SUM (which can overflow or become REAL).
     let mut legacy_reserved = std::collections::BTreeMap::<i64, i64>::new();
@@ -632,6 +644,7 @@ pub(crate) async fn snapshot(
                 return Err(PpsDbError::Invariant);
             }
             cursor = Some(m);
+            s.pps_paying_zatoshis = plus(s.pps_paying_zatoshis, r.try_get("paying")?)?;
             let value = subunits(
                 plus(r.try_get("pending")?, r.try_get("paying")?)?,
                 r.try_get("fraction")?,
@@ -780,13 +793,53 @@ pub(crate) async fn snapshot(
         )?,
         e.fee_allowance_zatoshis - s.paid_fees_zatoshis,
     )?;
+    // What must leave the wallet on commitments already made. Paying may spend
+    // into the reserve floor to honour them; the floor backs new credits.
+    s.committed_outflow_zatoshis = plus(
+        plus(plus(s.legacy_pending_zatoshis, s.legacy_paying_zatoshis)?, s.pps_paying_zatoshis)?,
+        s.reserved_fees_zatoshis,
+    )?;
     Ok(s)
 }
+/// Credit rule: a fresh proof must cover owed + reserve floor + unspent fee
+/// allowance (`required_spendable_zatoshis`). Decision #1 refuses new credits below it.
 pub(crate) fn validate_lease(
     s: &PpsFundingSnapshot,
     l: Option<&PpsFundingLease>,
     now: i64,
 ) -> Result<(), PpsDbError> {
+    let l = fresh_lease(s, l, now)?;
+    if l.spendable_zatoshis < s.required_spendable_zatoshis {
+        return Err(PpsDbError::FundingInsufficient);
+    }
+    Ok(())
+}
+
+/// Payout rule: a fresh proof must cover everything already committed to leave the
+/// wallet plus `batch_and_fee_zatoshis` (the batch being reserved with its fee
+/// bound; 0 once it is reserved). It may spend into the reserve floor: the floor
+/// backs new credits, not the settlement of existing debts (operator decision
+/// 2026-09-15, after a 1,000 TAZ floor held 1,298 TAZ of payouts on a 1,532 TAZ wallet).
+pub(crate) fn validate_payout_lease(
+    s: &PpsFundingSnapshot,
+    l: Option<&PpsFundingLease>,
+    now: i64,
+    batch_and_fee_zatoshis: i64,
+) -> Result<(), PpsDbError> {
+    let l = fresh_lease(s, l, now)?;
+    if l.spendable_zatoshis < plus(s.committed_outflow_zatoshis, batch_and_fee_zatoshis)? {
+        return Err(PpsDbError::FundingInsufficient);
+    }
+    Ok(())
+}
+
+/// Freshness and shape only: present, unexpired, this network and generation, the
+/// policy's floor and allowance. Says nothing about whether the amount suffices.
+fn fresh_lease<'a>(
+    s: &PpsFundingSnapshot,
+    l: Option<&'a PpsFundingLease>,
+    now: i64,
+) -> Result<&'a PpsFundingLease, PpsDbError> {
     let l = l.ok_or(PpsDbError::FundingLeaseRequired)?;
     if l.network != s.network
         || l.generation != s.generation
@@ -804,10 +857,7 @@ pub(crate) fn validate_lease(
     {
         return Err(PpsDbError::FundingLeaseRequired);
     }
-    if l.spendable_zatoshis < s.required_spendable_zatoshis {
-        return Err(PpsDbError::FundingInsufficient);
-    }
-    Ok(())
+    Ok(l)
 }
 pub(crate) async fn check(
     c: &mut SqliteConnection,
@@ -1284,7 +1334,9 @@ impl PoolDb {
             if send_blocked { return Err(PpsDbError::PayoutHalted); }
             let state = snapshot(&mut tx, &epoch, false).await?;
             if funding.is_some() {
-                validate_lease(&state, funding, runtime_now()?)?;
+                // This attempt's items and fee are already reserved, so they are in
+                // the committed outflow: the payout rule with nothing extra.
+                validate_payout_lease(&state, funding, runtime_now()?, 0)?;
                 funded_snapshot = Some(state);
             }
         }
@@ -1318,7 +1370,7 @@ impl PoolDb {
             }
         }
         if let Some(state) = &funded_snapshot {
-            validate_lease(state, funding, runtime_now()?)?;
+            validate_payout_lease(state, funding, runtime_now()?, 0)?;
         }
         tx.commit().await?;
         Ok(())
@@ -1433,7 +1485,8 @@ impl PoolDb {
         let mut tx = self.inner().begin_with("BEGIN IMMEDIATE").await?;
         let e = active_epoch(&mut tx).await?;
         let s = snapshot(&mut tx, &e, false).await?;
-        validate_lease(&s, Some(l), runtime_now()?)?;
+        // Pre-send recheck after reservation: the payout rule, nothing extra.
+        validate_payout_lease(&s, Some(l), runtime_now()?, 0)?;
         tx.commit().await?;
         Ok(())
     }

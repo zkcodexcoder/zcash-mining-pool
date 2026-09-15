@@ -655,14 +655,17 @@ impl PoolDb {
                 { return Err(PpsDbError::Invalid); }
             }
         }
-        crate::pps_funding::check(
-            &mut tx,
-            &e,
+        // A payout needs the wallet to cover what is already committed to leave it
+        // plus this batch and its fee bound; it may spend into the reserve floor
+        // (operator decision 2026-09-15). The floor backs new credits instead.
+        let batch = items.iter().try_fold(0i64, |sum, (_, amount)| add(sum, *amount))?;
+        let state = crate::pps_funding::snapshot(&mut tx, &e, false).await?;
+        crate::pps_funding::validate_payout_lease(
+            &state,
             Some(funding),
             crate::pps_funding::runtime_now()?,
-            false,
-        )
-        .await?;
+            add(batch, fee.fee_zatoshis)?,
+        )?;
         let attempt: Option<(String,)> =
             sqlx::query_as("SELECT status FROM payout_attempts WHERE id=?1")
                 .bind(attempt_id)
@@ -718,14 +721,15 @@ impl PoolDb {
         }
         if !out.is_empty() {
             crate::pps_funding::reserve_fee(&mut tx, attempt_id, fee, conventional).await?;
-            crate::pps_funding::check(
-                &mut tx,
-                &e,
+            // Re-checked with this reservation and its fee now in the committed
+            // outflow: the payout rule, nothing extra.
+            let reserved = crate::pps_funding::snapshot(&mut tx, &e, false).await?;
+            crate::pps_funding::validate_payout_lease(
+                &reserved,
                 Some(funding),
                 crate::pps_funding::runtime_now()?,
-                false,
-            )
-            .await?;
+                0,
+            )?;
             crate::pps_funding::bump_generation(&mut tx).await?;
         }
         tx.commit().await?;
@@ -1207,6 +1211,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, 5);
+    }
+    #[tokio::test]
+    async fn payouts_may_spend_into_the_reserve_floor_to_settle_what_is_owed() {
+        // Operator decision 2026-09-15: the reserve floor backs NEW credits (the
+        // credit rule wants owed + floor + allowance); settling existing debts only
+        // needs the wallet to cover what is committed to leave it plus this batch.
+        // Fixture: floor 10, allowance 100, one miner owed 5.
+        let f = setup(true, 10).await;
+        f.db.credit_pps_share(&f.e, &event(&f, 1, 5 * PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW)
+            .await
+            .unwrap();
+        let attempt = f.db.create_payout_attempt(1, 5, "fixture-pps").await.unwrap();
+        let mut lease = funded(&f).await;
+        // Five zatoshis cannot cover the batch (5) plus its fee bound (1).
+        lease.spendable_zatoshis = 5;
+        assert!(matches!(
+            f.db.reserve_pps_payout(attempt, &[(f.m, 5)], &lease, &fee(attempt)).await,
+            Err(PpsDbError::FundingInsufficient)
+        ));
+        assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, 0);
+        // Six does, although it is far below the credit rule's 5 + 10 + 100.
+        lease.spendable_zatoshis = 6;
+        assert!(matches!(
+            f.db.credit_pps_share(&f.e, &event(&f, 2, PPS_SCALE), Some(&f.l), Some(&lease), NOW).await,
+            Err(PpsDbError::FundingInsufficient)
+        ));
+        f.db.reserve_pps_payout(attempt, &[(f.m, 5)], &lease, &fee(attempt)).await.unwrap();
+        assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, 5);
+        // Reserving moved the funding generation, so the pre-send collector takes a
+        // fresh proof. The recheck (the seal's rule) still passes at six...
+        let mut fresh = funded(&f).await;
+        fresh.spendable_zatoshis = 6;
+        f.db.check_pps_funding(&fresh).await.unwrap();
+        // ...and refuses once the wallet no longer covers what is committed.
+        fresh.spendable_zatoshis = 5;
+        assert!(matches!(f.db.check_pps_funding(&fresh).await, Err(PpsDbError::FundingInsufficient)));
     }
     #[tokio::test]
     async fn proven_insolvency_refuses_the_credit_until_a_fresh_proof_covers_it() {
@@ -1694,7 +1734,9 @@ mod tests {
                     f.db.reserve_payout(old, &[(f.m, 1)]).await.unwrap();
                 }
                 2 => {
-                    lease.spendable_zatoshis = f.db.pps_funding_snapshot().await.unwrap().required_spendable_zatoshis;
+                    // Exactly what is committed to leave the wallet (the seal's rule);
+                    // a new legacy claim after attestation is one zatoshi more.
+                    lease.spendable_zatoshis = f.db.pps_funding_snapshot().await.unwrap().committed_outflow_zatoshis;
                     f.db.check_pps_funding(&lease).await.unwrap();
                     f.db.credit_balance(f.m, 1).await.unwrap();
                 }

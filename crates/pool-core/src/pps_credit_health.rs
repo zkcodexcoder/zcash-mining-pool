@@ -531,7 +531,8 @@ mod tests {
             unused_credit_subzatoshis:95_000_000_000_u128*pool_db::pps_live::PPS_SCALE,
             gross_subzatoshis:0,paid_zatoshis:0,cap_subzatoshis:95_000_000_000_u128*pool_db::pps_live::PPS_SCALE,
             total_exposure_zatoshis:100_000_000_000,reserve_floor_zatoshis:1,fee_allowance_zatoshis:5_000_000_000,
-            paid_fees_zatoshis:0,reserved_fees_zatoshis:0,required_spendable_zatoshis:100_000_000_001};
+            paid_fees_zatoshis:0,reserved_fees_zatoshis:0,required_spendable_zatoshis:100_000_000_001,
+            pps_paying_zatoshis:0,committed_outflow_zatoshis:0};
         (e,l,pool_db::pps_funding::PpsCreditReadinessSnapshot {generation:7,financial_halt:false,funding:Some(s)})
     }
     #[test]

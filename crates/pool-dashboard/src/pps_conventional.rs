@@ -222,8 +222,9 @@ pub(crate) async fn process(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRp
 /// reason payouts almost never completed (they reserved, then the pre-send
 /// funding recheck failed and refunded). Retry the READ-ONLY collection a
 /// bounded number of times on transient categories before giving up the round.
-/// Real rejections (insolvency, wrong network, unproven signer, bad evidence,
-/// route/recipient) fail immediately. This moves no money: the resulting lease
+/// Real rejections (wrong network, unproven signer, bad evidence, route/recipient)
+/// fail immediately; a short wallet is not one — the ledger's payout rule decides
+/// at reservation and at the seal. This moves no money: the resulting lease
 /// is still validated at reserve and at the seal under the writer lock.
 async fn collect_funding_resilient(db: &PoolDb, wallet: &ZcashRpcClient, policy: &PpsPolicy,
     from: &str, node: &ZcashRpcClient, route: &PpsFundingRoute)

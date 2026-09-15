@@ -179,7 +179,10 @@ pub async fn collect_pps_funding_for_route(
     db: &PoolDb, wallet: &ZcashRpcClient, epoch: &PpsEpoch, from: &str,
     node: &ZcashRpcClient, route: &PpsFundingRoute,
 ) -> Result<PpsFundingLease, PpsFundingError> {
-    collect_for_route(db, wallet, epoch, from, node, route, Shortfall::Refuse).await
+    // Payout preflight keeps a short proof: the ledger's payout rule (committed
+    // outflow, which may spend into the reserve floor) decides at reservation
+    // and at the seal. Only the budget extension refuses a short proof outright.
+    collect_for_route(db, wallet, epoch, from, node, route, Shortfall::Keep).await
 }
 
 async fn collect_for_route(
@@ -476,6 +479,7 @@ mod tests {
             total_exposure_zatoshis:1_000_000_000, reserve_floor_zatoshis:1,
             fee_allowance_zatoshis:10_000_000,paid_fees_zatoshis:0,reserved_fees_zatoshis:0,
             required_spendable_zatoshis:1_000_000_006,
+            pps_paying_zatoshis:0, committed_outflow_zatoshis:5,
         };
         assert!(finish_evidence(&s,&s,1_000_000_006,&e,100,100,Shortfall::Refuse).is_ok());
         assert_eq!(finish_evidence(&s,&s,1_000_000_005,&e,100,100,Shortfall::Refuse),Err(PpsFundingError::InsufficientFunding));
@@ -505,6 +509,7 @@ mod tests {
             paid_zatoshis:0,cap_subzatoshis:0,total_exposure_zatoshis:1_000_000_000,
             reserve_floor_zatoshis:1,fee_allowance_zatoshis:50_000_000,paid_fees_zatoshis:0,
             reserved_fees_zatoshis:0,required_spendable_zatoshis:1,
+            pps_paying_zatoshis:0,committed_outflow_zatoshis:0,
         };
         let ceiling=28_905_000;
         assert!(validate_credit_fee_capacity(&route,&s).is_ok());
