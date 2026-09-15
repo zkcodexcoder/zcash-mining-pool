@@ -1965,8 +1965,8 @@ mod tests {
     }
     #[tokio::test]
     async fn withholding_report_counts_expected_and_found_blocks_per_miner() {
-        // The fixture quote has assigned target 0x0202… over network target 0x0101…:
-        // each share is "expected" to solve two blocks.
+        // The fixture quote has network target 0x0101… under assigned target 0x0202…:
+        // each share solves the block with probability one half.
         let f = setup(true, 1_000_000).await;
         for i in 1..=3 {
             f.db.credit_pps_share(&f.e, &event(&f, i, PPS_SCALE), Some(&f.l), Some(&funded(&f).await), NOW).await.unwrap();
@@ -1976,7 +1976,7 @@ mod tests {
         let report = f.db.pps_withholding_report(NOW - 100).await.unwrap();
         assert_eq!(report.len(), 1);
         assert_eq!((report[0].miner_id, report[0].found_blocks), (f.m, 1));
-        assert!((report[0].expected_blocks - 6.0).abs() < 1e-9, "{}", report[0].expected_blocks);
+        assert!((report[0].expected_blocks - 1.5).abs() < 1e-9, "{}", report[0].expected_blocks);
         assert_eq!(report[0].address, "synthetic-miner");
         // Shares before the window do not count; the block (stamped now) still does.
         let later = f.db.pps_withholding_report(NOW + 1).await.unwrap();

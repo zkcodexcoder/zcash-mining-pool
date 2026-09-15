@@ -1187,8 +1187,8 @@ impl PoolDb {
         .execute(self.inner()).await?;
         Ok(())
     }
-    /// Expected blocks (the sum over credited shares of assigned target over
-    /// network target) and found blocks per miner since `since_unix`
+    /// Expected blocks (the sum over credited shares of network target over
+    /// assigned target) and found blocks per miner since `since_unix`
     /// (withholding defence, #10). Blocks of every status count as found.
     pub async fn pps_withholding_report(&self, since_unix: i64) -> Result<Vec<PpsMinerLuck>, PpsDbError> {
         use std::collections::BTreeMap;
@@ -1203,9 +1203,11 @@ impl PoolDb {
             let assigned: Vec<u8> = r.try_get("assigned_target")?;
             let network: Vec<u8> = r.try_get("network_target")?;
             let n: i64 = r.try_get("n")?;
+            // A share that met the assigned target solves the block with probability
+            // network_target / assigned_target (a smaller target is harder).
             let (assigned, network) = (target_as_f64(&assigned), target_as_f64(&network));
-            if network <= 0.0 || assigned < 0.0 { return Err(PpsDbError::Invariant); }
-            *expected.entry(miner).or_default() += n as f64 * (assigned / network);
+            if assigned <= 0.0 || network < 0.0 { return Err(PpsDbError::Invariant); }
+            *expected.entry(miner).or_default() += n as f64 * (network / assigned);
         }
         let mut found: BTreeMap<i64, i64> = BTreeMap::new();
         let rows = sqlx::query(

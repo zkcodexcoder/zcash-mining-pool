@@ -21,13 +21,17 @@ pub const COLLECTION_TIMEOUT_SECONDS: u64 = 45;
 /// dashboard passes to `z_sendmany`. The mature balance backs sends.
 pub const PAYOUT_NOTE_MATURITY: u32 = 10;
 /// Confirmations a note needs before it backs NEW CREDITS. Defaults to the payout
-/// maturity; `[pps] funding_maturity_confirmations` (1..=10) lowers it so change
-/// from the pool's own payouts counts as soon as it confirms instead of hiding
-/// for ten blocks (operator decision 2026-09-15: mine whenever owed < reserve).
+/// maturity; `[pps] funding_maturity_confirmations` (0..=10) lowers it so change
+/// from the pool's own payouts counts at once instead of hiding for ten blocks
+/// (operator decision 2026-09-15: mine whenever owed < reserve). At 0 a note
+/// still needs zecd's `safe` and `spendable` flags, so an unconfirmed note counts
+/// only when it is the wallet's own change: if that send confirms the change
+/// exists, and if it conflicts the spent inputs return — either way the balance
+/// is what the proof said.
 static CREDIT_NOTE_MATURITY: AtomicU32 = AtomicU32::new(PAYOUT_NOTE_MATURITY);
 pub fn set_credit_note_maturity(confirmations: u32) -> Result<(), &'static str> {
-    if !(1..=PAYOUT_NOTE_MATURITY).contains(&confirmations) {
-        return Err("PPS funding_maturity_confirmations must be within 1..=10");
+    if confirmations > PAYOUT_NOTE_MATURITY {
+        return Err("PPS funding_maturity_confirmations must be within 0..=10");
     }
     CREDIT_NOTE_MATURITY.store(confirmations, Ordering::Relaxed);
     Ok(())
@@ -1327,6 +1331,12 @@ mod tests {
         // fresh payout change note cannot pause admission.
         let mut pending=note("orchard",3,"1"); pending["confirmations"]=json!(0);
         assert_eq!(eligible_balance(&json!(1),&json!([pending.clone()]),10),Ok((0,0)));
+        assert_eq!(eligible_balance(&json!(1),&json!([pending.clone()]),1),Ok((0,0)));
+        // At maturity 0 the wallet's own unconfirmed change (safe, spendable) backs
+        // credits, never payouts; an unsafe unconfirmed note still counts for neither.
+        assert_eq!(eligible_balance(&json!(1),&json!([pending.clone()]),0),Ok((100_000_000,0)));
+        let mut unsafe_note=pending.clone(); unsafe_note["safe"]=json!(false);
+        assert_eq!(eligible_balance(&json!(1),&json!([unsafe_note]),0),Ok((0,0)));
         assert_eq!(eligible_balance(&json!(1),&json!([pending]),1),Ok((0,0)));
         // At a lower credit maturity a shallow note backs new credits as soon as it
         // confirms, while a send (minconf 10) still cannot spend it.

@@ -30,10 +30,11 @@ pub struct PpsPolicy {
     pub fee_allowance_zatoshis: i64,
     pub reserve_min_zatoshis: i64,
     pub max_payout_zatoshis: i64,
-    /// Confirmations a wallet note needs before it backs NEW CREDITS (1..=10).
+    /// Confirmations a wallet note needs before it backs NEW CREDITS (0..=10).
     /// Payouts always spend notes at `PAYOUT_NOTE_MATURITY`; a lower credit
-    /// maturity lets a payout's own change count as soon as it confirms, so
-    /// admission does not pause while the wallet holds the money.
+    /// maturity lets a payout's own change count sooner (0: as soon as the wallet
+    /// lists it as safe and spendable), so admission does not pause while the
+    /// wallet holds the money.
     #[serde(default = "default_funding_maturity_confirmations")]
     pub funding_maturity_confirmations: u32,
     /// Withholding defence (#10): an account younger than this may not hold more
@@ -89,8 +90,8 @@ impl PpsPolicy {
         if !SETTLE_CONFIRMATIONS_RANGE.contains(&self.settle_confirmations) {
             return Err("PPS settle confirmations must be within 3..=100");
         }
-        if !(1..=PAYOUT_NOTE_MATURITY).contains(&self.funding_maturity_confirmations) {
-            return Err("PPS funding_maturity_confirmations must be within 1..=10");
+        if self.funding_maturity_confirmations > PAYOUT_NOTE_MATURITY {
+            return Err("PPS funding_maturity_confirmations must be within 0..=10");
         }
         if !(0..=366_i64 * 86_400).contains(&self.young_account_seconds)
             || self.young_account_exposure_zatoshis.is_some_and(|v| v < 0 || v > MAX_MONEY)
@@ -153,14 +154,16 @@ mod tests {
 
     #[test]
     fn funding_maturity_is_bounded_by_the_payout_maturity() {
-        for bad in [0, PAYOUT_NOTE_MATURITY + 1, u32::MAX] {
+        for bad in [PAYOUT_NOTE_MATURITY + 1, u32::MAX] {
             let mut p = policy();
             p.funding_maturity_confirmations = bad;
             assert!(p.validate("testnet").is_err());
         }
-        let mut p = policy();
-        p.funding_maturity_confirmations = 1;
-        assert!(p.validate("testnet").is_ok());
+        for ok in [0, 1, PAYOUT_NOTE_MATURITY] {
+            let mut p = policy();
+            p.funding_maturity_confirmations = ok;
+            assert!(p.validate("testnet").is_ok());
+        }
     }
 
     #[test]
