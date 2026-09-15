@@ -680,7 +680,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #0b0b0b;
-            color: #c8c8c8;
+            color: #ececec;
             min-height: 100vh;
         }
 
@@ -704,7 +704,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             border: 1px solid #333;
             padding: 0.15rem 0.5rem;
             font-size: 0.6rem;
-            color: #666;
+            color: #b0b0b0;
             text-transform: uppercase;
             letter-spacing: 0.08em;
         }
@@ -715,13 +715,13 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             gap: 1rem;
         }
         .header-link {
-            color: #555;
+            color: #a8a8a8;
             font-size: 0.7rem;
             text-decoration: none;
             text-transform: uppercase;
             letter-spacing: 0.06em;
         }
-        .header-link:hover { color: #999; }
+        .header-link:hover { color: #dcdcdc; }
         .header-link.active { color: #f4b728; }
 
         .container { max-width: 1400px; margin: 0 auto; padding: 1rem 1.5rem; }
@@ -739,7 +739,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             padding: 0.5rem 1.25rem;
             background: #111;
             border: none;
-            color: #555;
+            color: #a8a8a8;
             font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
             font-size: 0.7rem;
             font-weight: 600;
@@ -748,13 +748,13 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             cursor: pointer;
             transition: color 0.15s, background 0.15s;
         }
-        .range-btn:hover { color: #999; background: #151515; }
+        .range-btn:hover { color: #dcdcdc; background: #151515; }
         .range-btn.active { color: #f4b728; background: #1a1a1a; }
         .range-status {
             margin-left: auto;
             padding: 0 1rem;
             font-size: 0.6rem;
-            color: #444;
+            color: #9c9c9c;
             background: #111;
             height: 100%;
             display: flex;
@@ -777,7 +777,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.6rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             margin-bottom: 0.25rem;
         }
         .summary-cell .value {
@@ -818,7 +818,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.6rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             padding: 0.5rem 0;
         }
 
@@ -837,7 +837,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #444;
+            color: #9c9c9c;
             padding: 0.5rem 0.75rem;
             text-align: left;
             background: #0e0e0e;
@@ -848,7 +848,7 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.75rem;
             padding: 0.4rem 0.75rem;
             border-bottom: 1px solid #1a1a1a;
-            color: #999;
+            color: #dcdcdc;
         }
         tr:hover td { background: #151515; }
         tr.our-pool td { color: #f4b728; }
@@ -869,10 +869,10 @@ const NETWORK_HTML: &str = r##"<!DOCTYPE html>
         .node-badge.v5 { background: #3a3a1a; color: #ecc94b; border: 1px solid #5a5a2d; }
         .node-badge.v4 { background: #3a1a1a; color: #fc8181; border: 1px solid #5a2d2d; }
 
-        .loading { color: #333; font-style: italic; font-family: inherit; }
+        .loading { color: #8a8a8a; font-style: italic; font-family: inherit; }
         .last-updated {
             font-size: 0.6rem;
-            color: #444;
+            color: #9c9c9c;
             text-align: right;
             padding: 0.25rem 0;
         }
@@ -1130,7 +1130,7 @@ async function fetchData() {
                 const cbShort = b.coinbase_text.length > 40 ? b.coinbase_text.substring(0, 40) + '...' : b.coinbase_text;
                 const badge = nodeBadge(b.coinbase_tx_version, b.is_zebrad, b.is_zakura);
                 return '<tr' + cls + '>' +
-                    '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#e0e0e0;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
+                    '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#f2f2f2;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
                     '<td title="' + b.hash + '">' + hashShort + '</td>' +
                     '<td title="' + b.miner_address + '">' + b.miner_label + badge + '</td>' +
                     '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +

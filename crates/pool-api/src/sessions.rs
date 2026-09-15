@@ -64,7 +64,7 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #0b0b0b;
-            color: #c8c8c8;
+            color: #ececec;
             min-height: 100vh;
         }
         .header {
@@ -87,7 +87,7 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
             border: 1px solid #333;
             padding: 0.15rem 0.5rem;
             font-size: 0.6rem;
-            color: #666;
+            color: #b0b0b0;
             text-transform: uppercase;
             letter-spacing: 0.08em;
         }
@@ -98,13 +98,13 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
             gap: 1rem;
         }
         .header-link {
-            color: #555;
+            color: #a8a8a8;
             font-size: 0.7rem;
             text-decoration: none;
             text-transform: uppercase;
             letter-spacing: 0.06em;
         }
-        .header-link:hover { color: #999; }
+        .header-link:hover { color: #dcdcdc; }
         .container { max-width: 1600px; margin: 0 auto; padding: 1rem 1.5rem; }
         .summary {
             display: flex;
@@ -122,7 +122,7 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
         }
         .summary-card .value {
             font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
@@ -143,7 +143,7 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #444;
+            color: #9c9c9c;
             padding: 0.5rem 0.75rem;
             text-align: left;
             background: #0e0e0e;
@@ -155,13 +155,13 @@ const SESSIONS_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.75rem;
             padding: 0.4rem 0.75rem;
             border-bottom: 1px solid #1a1a1a;
-            color: #999;
+            color: #dcdcdc;
             white-space: nowrap;
         }
         tr:hover td { background: #151515; }
         .updated {
             font-size: 0.6rem;
-            color: #333;
+            color: #8a8a8a;
             text-align: right;
             padding: 0.5rem 0;
         }
@@ -298,7 +298,7 @@ async function fetchSessions() {
 
         const tbody = document.getElementById('session-body');
         if (sessions.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:#333;padding:2rem">No active sessions</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:#8a8a8a;padding:2rem">No active sessions</td></tr>';
         } else {
             // Sort by difficulty descending
             sessions.sort((a, b) => b.difficulty - a.difficulty);
@@ -349,7 +349,7 @@ async function fetchSessions() {
                     '<td>' + acc.toLocaleString() + '</td>' +
                     '<td style="color:' + rejColor + '" title="' + rejTitle + '">' + (totalSub > 0 ? rejPct.toFixed(1) + '%' : '--') + '</td>' +
                     '<td>' + s.retargets + '</td>' +
-                    '<td>' + (s.last_retarget_secs != null ? formatDuration(s.last_retarget_secs) + ' ago' : '<span style="color:#333">--</span>') + '</td>' +
+                    '<td>' + (s.last_retarget_secs != null ? formatDuration(s.last_retarget_secs) + ' ago' : '<span style="color:#8a8a8a">--</span>') + '</td>' +
                     '<td style="color:' + ratioColor + '">' + s.smoothed_ratio.toFixed(2) + '</td>' +
                     '</tr>';
                 if (expanded) {
@@ -358,7 +358,7 @@ async function fetchSessions() {
                             '<div style="flex:1;min-width:0"><canvas id="chart-' + s.session_id + '"></canvas></div>' +
                             '<div style="flex:1;max-height:200px;overflow-y:auto">' +
                             '<table style="width:100%;font-size:0.7rem;border-collapse:collapse">' +
-                            '<thead><tr style="color:#555;border-bottom:1px solid #222">' +
+                            '<thead><tr style="color:#a8a8a8;border-bottom:1px solid #222">' +
                             '<th style="text-align:left;padding:2px 6px">Time</th>' +
                             '<th style="text-align:right;padding:2px 6px">Difficulty</th>' +
                             '<th style="text-align:left;padding:2px 6px">Reason</th></tr></thead><tbody>';
@@ -369,13 +369,13 @@ async function fetchSessions() {
                                 : (h.reason || '').startsWith('reset') ? '#f4b728'
                                 : '#888';
                             html += '<tr style="border-bottom:1px solid #1a1a1a">' +
-                                '<td style="padding:2px 6px;color:#555">' + formatDuration(h.secs_since_connect) + '</td>' +
-                                '<td style="padding:2px 6px;text-align:right;color:#ccc">' + formatDifficulty(h.difficulty) + '</td>' +
+                                '<td style="padding:2px 6px;color:#a8a8a8">' + formatDuration(h.secs_since_connect) + '</td>' +
+                                '<td style="padding:2px 6px;text-align:right;color:#e6e6e6">' + formatDifficulty(h.difficulty) + '</td>' +
                                 '<td style="padding:2px 6px;color:' + reasonColor + '">' + (h.reason || '--') + '</td></tr>';
                         }
                         html += '</tbody></table></div></div></td></tr>';
                     } else {
-                        html += '<tr class="detail-row"><td colspan="13"><div class="detail-cell" style="color:#333;font-size:0.75rem;text-align:center;padding:1rem">' +
+                        html += '<tr class="detail-row"><td colspan="13"><div class="detail-cell" style="color:#8a8a8a;font-size:0.75rem;text-align:center;padding:1rem">' +
                             'No difficulty adjustments — steady state since connect</div></td></tr>';
                     }
                 }
@@ -450,12 +450,12 @@ function renderDiffChart(sid, history) {
                 x: {
                     display: true,
                     grid: { color: '#1a1a1a' },
-                    ticks: { color: '#333', font: { size: 9 }, maxTicksLimit: 10 }
+                    ticks: { color: '#8a8a8a', font: { size: 9 }, maxTicksLimit: 10 }
                 },
                 y: {
                     display: true,
                     grid: { color: '#1a1a1a' },
-                    ticks: { color: '#333', font: { size: 9 },
+                    ticks: { color: '#8a8a8a', font: { size: 9 },
                         callback: (v) => formatDifficulty(v)
                     }
                 }
@@ -471,9 +471,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (filterWorker) {
         const banner = document.createElement('div');
         banner.style.cssText = 'background:#1a1a1a;border:1px solid #333;padding:0.5rem 1rem;margin-bottom:1rem;font-size:0.75rem;display:flex;align-items:center;gap:0.75rem';
-        banner.innerHTML = '<span style="color:#555">Filtered:</span> <span style="color:#f4b728;font-family:monospace">' +
+        banner.innerHTML = '<span style="color:#a8a8a8">Filtered:</span> <span style="color:#f4b728;font-family:monospace">' +
             (filterWorker.length > 30 ? filterWorker.substring(0,12) + '...' + filterWorker.slice(-12) : filterWorker) +
-            '</span> <a href="/sessions" style="color:#555;margin-left:auto;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.06em;text-decoration:none">Show All</a>';
+            '</span> <a href="/sessions" style="color:#a8a8a8;margin-left:auto;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.06em;text-decoration:none">Show All</a>';
         document.querySelector('.container').insertBefore(banner, document.querySelector('.summary'));
     }
     fetchSessions();

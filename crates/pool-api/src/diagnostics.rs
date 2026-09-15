@@ -346,7 +346,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #0b0b0b;
-            color: #c8c8c8;
+            color: #ececec;
             min-height: 100vh;
         }
 
@@ -370,7 +370,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             border: 1px solid #333;
             padding: 0.15rem 0.5rem;
             font-size: 0.6rem;
-            color: #666;
+            color: #b0b0b0;
             text-transform: uppercase;
             letter-spacing: 0.08em;
         }
@@ -381,13 +381,13 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             gap: 1rem;
         }
         .header-link {
-            color: #555;
+            color: #a8a8a8;
             font-size: 0.7rem;
             text-decoration: none;
             text-transform: uppercase;
             letter-spacing: 0.06em;
         }
-        .header-link:hover { color: #999; }
+        .header-link:hover { color: #dcdcdc; }
 
         .container { max-width: 1400px; margin: 0 auto; padding: 1rem 1.5rem; }
 
@@ -403,17 +403,17 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             padding: 0.5rem 0.75rem;
             background: #111;
             border: none;
-            color: #c8c8c8;
+            color: #ececec;
             font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
             font-size: 0.75rem;
             outline: none;
         }
-        .lookup-row input::placeholder { color: #333; }
+        .lookup-row input::placeholder { color: #8a8a8a; }
         .lookup-row button {
             padding: 0.5rem 1rem;
             background: #1a1a1a;
             border: none;
-            color: #666;
+            color: #b0b0b0;
             font-size: 0.65rem;
             text-transform: uppercase;
             letter-spacing: 0.06em;
@@ -437,7 +437,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             margin-bottom: 0.15rem;
         }
         .hero-card .value {
@@ -452,7 +452,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.6rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             padding: 0.5rem 0;
         }
 
@@ -470,7 +470,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #444;
+            color: #9c9c9c;
             padding: 0.5rem 0.75rem;
             text-align: left;
             background: #0e0e0e;
@@ -481,7 +481,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.75rem;
             padding: 0.4rem 0.75rem;
             border-bottom: 1px solid #1a1a1a;
-            color: #999;
+            color: #dcdcdc;
         }
         tr:hover td { background: #151515; }
 
@@ -510,7 +510,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
             font-size: 0.6rem;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #555;
+            color: #a8a8a8;
             margin-bottom: 0.5rem;
         }
         .chart-panel canvas {
@@ -523,14 +523,14 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
         .status-orphaned { color: #fc8181; }
 
         .empty-msg {
-            color: #333;
+            color: #8a8a8a;
             font-style: italic;
             padding: 1rem;
             text-align: center;
         }
 
         #diag-content { display: none; }
-        #loading-msg { color: #555; padding: 2rem; text-align: center; font-size: 0.8rem; }
+        #loading-msg { color: #a8a8a8; padding: 2rem; text-align: center; font-size: 0.8rem; }
         #error-msg { color: #fc8181; padding: 2rem; text-align: center; font-size: 0.8rem; display: none; }
 
         @media (max-width: 900px) {
@@ -617,7 +617,7 @@ const MINER_DIAGNOSTICS_HTML: &str = r##"<!DOCTYPE html>
 
         <div class="section-title" style="display:flex;align-items:center;gap:1rem">
             Difficulty History
-            <select id="worker-filter" onchange="applyWorkerFilter()" style="background:#111;border:1px solid #333;color:#999;padding:0.2rem 0.5rem;font-size:0.7rem;font-family:inherit;cursor:pointer">
+            <select id="worker-filter" onchange="applyWorkerFilter()" style="background:#111;border:1px solid #333;color:#dcdcdc;padding:0.2rem 0.5rem;font-size:0.7rem;font-family:inherit;cursor:pointer">
                 <option value="">All Workers</option>
             </select>
         </div>
@@ -744,7 +744,7 @@ function buildDiffChart(shares) {
             plugins: {
                 legend: {
                     display: workerNames.length > 1,
-                    labels: { color: '#666', font: { size: 10 } }
+                    labels: { color: '#b0b0b0', font: { size: 10 } }
                 },
                 tooltip: {
                     mode: 'nearest',
@@ -772,14 +772,14 @@ function buildDiffChart(shares) {
                     type: 'linear',
                     display: true,
                     grid: { color: '#1a1a1a' },
-                    ticks: { color: '#333', font: { size: 9 }, maxTicksLimit: 10 },
-                    title: { display: true, text: 'Share #', color: '#444', font: { size: 10 } }
+                    ticks: { color: '#8a8a8a', font: { size: 9 }, maxTicksLimit: 10 },
+                    title: { display: true, text: 'Share #', color: '#9c9c9c', font: { size: 10 } }
                 },
                 y: {
                     display: true,
                     grid: { color: '#1a1a1a' },
-                    ticks: { color: '#333', font: { size: 9 } },
-                    title: { display: true, text: 'Difficulty', color: '#444', font: { size: 10 } }
+                    ticks: { color: '#8a8a8a', font: { size: 9 } },
+                    title: { display: true, text: 'Difficulty', color: '#9c9c9c', font: { size: 10 } }
                 }
             },
             animation: { duration: 0 }
@@ -891,7 +891,7 @@ async function fetchDiagnostics() {
                 const totSubs = acc + totRej;
                 let rejCell;
                 if (totSubs === 0) {
-                    rejCell = '<td style="color:#666">--</td>';
+                    rejCell = '<td style="color:#b0b0b0">--</td>';
                 } else {
                     const pct = w.live_rejection_pct;
                     const color = pct > 10 ? '#fc8181' : pct > 2 ? '#f4b728' : '#48bb78';
@@ -907,7 +907,7 @@ async function fetchDiagnostics() {
                 return '<tr>' +
                     '<td><span class="status-dot ' + (w.is_online ? 'dot-online' : 'dot-offline') + '"></span>' +
                     '<span class="' + (w.is_online ? 'status-online' : 'status-offline') + '">' + (w.is_online ? 'Online' : 'Offline') + '</span></td>' +
-                    '<td><a href="/sessions?worker=' + encodeURIComponent(w.name) + '" style="color:#e0e0e0;text-decoration:none" title="View live sessions">' + w.name + '</a></td>' +
+                    '<td><a href="/sessions?worker=' + encodeURIComponent(w.name) + '" style="color:#f2f2f2;text-decoration:none" title="View live sessions">' + w.name + '</a></td>' +
                     '<td>' + hr1m + '</td>' +
                     '<td>' + hr10m + '</td>' +
                     '<td>' + (w.current_difficulty != null ? w.current_difficulty.toFixed(4) : '--') + '</td>' +
@@ -939,7 +939,7 @@ async function fetchDiagnostics() {
         } else {
             bTbody.innerHTML = d.blocks_found.map(b =>
                 '<tr>' +
-                '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#e0e0e0;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
+                '<td><a href="' + EXPLORER + '/block/' + b.height + '" target="_blank" style="color:#f2f2f2;text-decoration:none" onmouseover="this.style.color=\'#f4b728\'" onmouseout="this.style.color=\'#e0e0e0\'">' + b.height + '</a></td>' +
                 '<td title="' + b.hash + '">' + b.hash.substring(0, 16) + '...</td>' +
                 '<td>' + b.reward_zec.toFixed(4) + ' ' + COIN + '</td>' +
                 '<td class="status-' + b.status + '">' + b.status + '</td>' +

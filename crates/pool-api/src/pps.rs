@@ -389,7 +389,7 @@ const PPS_HTML: &str = r####"<!DOCTYPE html>
 <style>
   :root {
     --paper:#f4f6f8; --panel:#fff; --sunk:#eef1f4;
-    --ink:#1a1f2b; --ink-2:#4c5461; --ink-3:#7b8494; --rule:#dfe3e8;
+    --ink:#1a1f2b; --ink-2:#4c5461; --ink-3:#646d7c; --rule:#dfe3e8;
     --bronze:#a06c1a; --teal:#2a8a86;
     --good:#2f7d4f; --good-soft:#e2f0e8; --owed:#b07714; --owed-soft:#f6ecd8;
     --crit:#ad3a30; --crit-soft:#f7e4e1; --flow-track:#e7eaee;
