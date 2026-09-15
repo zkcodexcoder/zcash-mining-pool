@@ -114,8 +114,11 @@ impl ZcashRpcClient {
     pub async fn zecd_conventional_rpc(
         &self, method: &'static str, params: serde_json::Value,
     ) -> Result<serde_json::Value, crate::zecd_funding::ZecdFundingError> {
+        // listunspent and getrawmempool: read-only, for the pre-send note snapshot
+        // and lost-operation recovery (2026-09-15, #8).
         if !matches!(method, "z_sendmany" | "z_getoperationstatus" | "getrawtransaction"
-            | "getblock" | "getblockhash" | "gettransaction" | "getwalletinfo")
+            | "getblock" | "getblockhash" | "gettransaction" | "getwalletinfo"
+            | "listunspent" | "getrawmempool")
         { return Err(crate::zecd_funding::ZecdFundingError::InvalidEvidence); }
         self.zecd_bounded_rpc(method, params, crate::zecd_funding::MAX_RPC_BODY_BYTES, false).await
     }

@@ -318,6 +318,10 @@ struct MockState {
     expected_payments: Option<Vec<(String, i64)>>,
     /// Per-operation status overrides; other operations use `operation`.
     operations: std::collections::HashMap<String, Value>,
+    /// Notes listed in addition to the fixture's one funding note.
+    extra_unspent: Vec<Value>,
+    /// Hide the fixture's funding note, as if a send had spent it.
+    hide_base_note: bool,
 }
 struct MockRpc {
     client: Arc<ZcashRpcClient>,
@@ -392,9 +396,15 @@ impl MockRpc {
                     }
                 }
                 "listunspent" => {
-                    json!([{"pool":"orchard","txid":"d".repeat(64),"vout":0,"address":SOURCE,
-                    "amount":2000,"confirmations":10,"safe":true,"spendable":true,"solvable":true}])
+                    let mut notes = Vec::new();
+                    if !st.hide_base_note {
+                        notes.push(json!({"pool":"orchard","txid":"d".repeat(64),"vout":0,"address":SOURCE,
+                        "amount":2000,"confirmations":10,"safe":true,"spendable":true,"solvable":true}));
+                    }
+                    notes.extend(st.extra_unspent.iter().cloned());
+                    json!(notes)
                 }
+                "getrawmempool" => json!([]),
                 "getblockcount" => json!(if st.calls.iter().any(|m| m == "z_sendmany") {
                     HEIGHT
                 } else {
@@ -502,6 +512,8 @@ impl MockRpc {
             history_readiness: None,
             expected_payments: None,
             operations: std::collections::HashMap::new(),
+            extra_unspent: Vec::new(),
+            hide_base_note: false,
         }));
         let listener =
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -898,6 +910,80 @@ async fn conventional_saved_txid_recovers_after_wallet_forgets_operation() {
     );
     assert_eq!(rpc.sends(), 1);
     assert_eq!(f.db.pps_invariant().await.unwrap().paid_zatoshis, CREDIT);
+}
+
+/// The send went out, but the wallet never reports the operation: a restart
+/// between the send and the status read (zecd keeps operation state per session).
+async fn lost_operation_fixture() -> (Fixture, MockRpc, pool_db::pps_funding::PpsConventionalAttempt) {
+    let f = Fixture::new().await;
+    let rpc = MockRpc::new(&f.db).await;
+    {
+        let mut s = rpc.state.lock().unwrap();
+        s.operation = json!([]);
+        s.confirmations = 0;
+    }
+    // The round sends, cannot confirm the operation, and the immediate reconcile
+    // finds nothing spent and the attempt too young to release: held.
+    assert!(process(&f, &rpc).await.is_err());
+    let attempt = f.attempt().await;
+    assert!(attempt.sealed && attempt.operation_id.is_some() && attempt.expected_txid.is_none());
+    assert_eq!(rpc.sends(), 1);
+    assert!(f.db.get_pps_send_notes(attempt.attempt_id).await.unwrap().is_some_and(|n| n == vec!["d".repeat(64)]));
+    (f, rpc, attempt)
+}
+
+#[tokio::test]
+async fn conventional_lost_operation_is_recovered_from_its_change_note() {
+    let (mut f, rpc, attempt) = lost_operation_fixture().await;
+    // The send's change note appears in the wallet, carrying the send's txid.
+    rpc.state.lock().unwrap().extra_unspent.push(json!({"pool":"orchard","txid":TXID,"vout":1,"address":SOURCE,
+        "amount":100,"confirmations":0,"safe":true,"spendable":true,"solvable":true}));
+    f.reopen().await;
+    assert_eq!(reconcile(&f, &rpc, attempt.attempt_id).await.unwrap(), 0);
+    let recovered = f.attempt().await;
+    assert_eq!(recovered.expected_txid.as_deref(), Some(TXID));
+    assert!(recovered.sealed && recovered.status == "reserved");
+    // With the txid recorded, the normal path settles at the configured depth.
+    rpc.state.lock().unwrap().confirmations = crate::pps_conventional::PPS_SETTLE_MATURITY;
+    assert_eq!(reconcile(&f, &rpc, attempt.attempt_id).await.unwrap(), 1);
+    assert_eq!(rpc.sends(), 1);
+    assert_eq!(f.db.pps_invariant().await.unwrap().paid_zatoshis, CREDIT);
+}
+
+#[tokio::test]
+async fn conventional_lost_operation_with_every_note_unspent_is_released_once_old_enough() {
+    let (mut f, rpc, attempt) = lost_operation_fixture().await;
+    f.reopen().await;
+    // Too young: held, nothing released.
+    assert!(reconcile(&f, &rpc, attempt.attempt_id).await.is_err());
+    assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, CREDIT);
+    sqlx::query("UPDATE payout_attempts SET updated_at=datetime('now','-30 minutes') WHERE id=?1")
+        .bind(attempt.attempt_id).execute(&f.pool).await.unwrap();
+    assert_eq!(reconcile(&f, &rpc, attempt.attempt_id).await.unwrap(), 0);
+    let released = f.attempt().await;
+    assert_eq!((released.status.as_str(), released.sealed, released.operation_id.is_some()), ("released", false, false));
+    let sum = f.db.pps_invariant().await.unwrap();
+    assert_eq!((sum.pending_zatoshis, sum.paying_zatoshis, sum.paid_zatoshis), (CREDIT, 0, 0));
+    let evidence: String = sqlx::query_scalar("SELECT evidence FROM pps_released_sends WHERE attempt_id=?1")
+        .bind(attempt.attempt_id).fetch_one(&f.pool).await.unwrap();
+    assert!(evidence.contains("operation_lost"));
+    assert_eq!(rpc.sends(), 1);
+}
+
+#[tokio::test]
+async fn conventional_lost_operation_with_a_spent_note_and_no_match_stays_held() {
+    let (mut f, rpc, attempt) = lost_operation_fixture().await;
+    rpc.state.lock().unwrap().hide_base_note = true;
+    sqlx::query("UPDATE payout_attempts SET updated_at=datetime('now','-30 minutes') WHERE id=?1")
+        .bind(attempt.attempt_id).execute(&f.pool).await.unwrap();
+    f.reopen().await;
+    assert!(reconcile(&f, &rpc, attempt.attempt_id).await.is_err());
+    let held = f.attempt().await;
+    assert!(held.sealed && held.status == "reserved" && held.expected_txid.is_none());
+    assert_eq!(f.db.pps_invariant().await.unwrap().paying_zatoshis, CREDIT);
+    let journaled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pps_released_sends WHERE attempt_id=?1")
+        .bind(attempt.attempt_id).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(journaled, 0);
 }
 
 #[tokio::test]

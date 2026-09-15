@@ -1156,6 +1156,31 @@ impl PoolDb {
         self.mark_pps_proposal(attempt, proposal_id, Some(expected_txid), false)
             .await
     }
+    /// The wallet's unspent note txids just before this attempt's send
+    /// (lost-operation recovery, #8). Insert-once; the attempt must be reserved
+    /// and unsent.
+    pub async fn record_pps_send_notes(&self, attempt: i64, txids: &[String]) -> Result<(), PpsDbError> {
+        if attempt <= 0 || txids.len() > 100_000 || txids.iter().any(|t| !canonical_hash(t)) {
+            return Err(PpsDbError::Invalid);
+        }
+        let mut c = self.inner().acquire().await?;
+        let mut tx = c.begin_with("BEGIN IMMEDIATE").await?;
+        let a = conventional_attempt(&mut tx, attempt).await?.ok_or(PpsDbError::Invalid)?;
+        if a.status != "reserved" || a.operation_id.is_some() || a.expected_txid.is_some() {
+            return Err(PpsDbError::Invalid);
+        }
+        let encoded = serde_json::to_string(txids).map_err(|_| PpsDbError::Invalid)?;
+        sqlx::query("INSERT INTO pps_send_note_snapshots(attempt_id,txids) VALUES(?1,?2)")
+            .bind(attempt).bind(encoded).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    /// The pre-send note snapshot of an attempt, if one was taken.
+    pub async fn get_pps_send_notes(&self, attempt: i64) -> Result<Option<Vec<String>>, PpsDbError> {
+        let encoded: Option<String> = sqlx::query_scalar("SELECT txids FROM pps_send_note_snapshots WHERE attempt_id=?1")
+            .bind(attempt).fetch_optional(self.inner()).await?;
+        encoded.map(|e| serde_json::from_str::<Vec<String>>(&e).map_err(|_| PpsDbError::Invariant)).transpose()
+    }
     pub async fn record_pps_conventional_operation(
         &self,
         attempt: i64,

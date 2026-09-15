@@ -409,6 +409,12 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
             collect_funding_resilient(db,wallet,policy,from,node,route)).await?;
         pre_send_phase("funding_recheck", db.check_pps_funding(&funding)).await?;
         let recipients=pre_send_phase("recipient_encoding", async { encode_recipients(&intent, policy.max_payout_zatoshis) }).await?;
+        // Lost-operation recovery (#8): remember which notes the wallet holds before
+        // this send. The send spends at least one of them and its change note
+        // carries the send's txid, so a forgotten operation id can be recovered
+        // from the notes or, when every note is still unspent, released.
+        let notes=pre_send_phase("note_snapshot", unspent_note_txids(wallet)).await?;
+        pre_send_phase("note_snapshot_record", db.record_pps_send_notes(attempt,&notes)).await?;
         // Chain agreement is a warning only (chain_before_send logs it); it does
         // not bound the seal. The funding lease alone sets the seal deadline.
         pre_send_phase("seal", db.seal_pps_conventional_payout_funded(attempt,&bound.intent_id,&funding)).await?;
@@ -429,6 +435,81 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
 /// Returns recipient count only after canonical block inclusion and exact raw
 /// payout verification. Unknown, failed, expired or missing operations remain
 /// held; this function has no send or proposal-generation path.
+/// A lost operation with nothing spent is released only once the attempt is this old.
+const LOST_OPERATION_RELEASE_AGE_SECONDS: i64 = 1200;
+/// More mempool transactions than this cannot be proven foreign to the wallet in time.
+const LOST_OPERATION_MEMPOOL_LIMIT: usize = 500;
+
+/// Distinct txids of every note the wallet holds (any confirmation depth).
+async fn unspent_note_txids(wallet:&ZcashRpcClient) -> Result<Vec<String>> {
+    let notes=rpc(wallet,"listunspent",json!([0,u32::MAX,[],false])).await?;
+    let rows=notes.as_array().context("PPS listunspent schema")?;
+    anyhow::ensure!(rows.len()<=100_000,"PPS wallet note listing too large to snapshot");
+    let mut txids:Vec<String>=rows.iter()
+        .filter_map(|n| n.get("txid").and_then(Value::as_str))
+        .filter(|t| t.len()==64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    txids.sort(); txids.dedup();
+    Ok(txids)
+}
+
+/// Lost-operation recovery (operator decision 2026-09-15, #8). zecd keeps
+/// operation state per session, so a wallet restart forgets a send's operation
+/// id before its transaction was recorded. A send spends at least one note the
+/// wallet held before it, and its change note carries the send's txid, so:
+/// - a note that appeared since the pre-send snapshot whose transaction verifies
+///   byte-for-byte against the intent IS this send: record its txid (it then
+///   settles through the normal path);
+/// - if every pre-send note is still unspent, no mempool transaction belongs to
+///   the wallet and the attempt is old enough, nothing was sent: release the
+///   claims (journaled in pps_released_sends with the evidence);
+/// - anything else stays held for the operator tools.
+async fn recover_lost_operation(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,attempt:i64,
+    row:&pool_db::pps_funding::PpsConventionalAttempt,opid:&str,expected:&ConventionalPayoutExpectation) -> Result<usize>
+{
+    use std::collections::BTreeSet;
+    let before:BTreeSet<String>=db.get_pps_send_notes(attempt).await?
+        .context("PPS operation lost and no pre-send note snapshot; held")?.into_iter().collect();
+    let now:BTreeSet<String>=unspent_note_txids(wallet).await?.into_iter().collect();
+    for txid in now.difference(&before) {
+        let Ok(raw)=rpc(node,"getrawtransaction",json!([txid,1])).await else { continue };
+        let Some(hex)=raw.get("hex").and_then(Value::as_str) else { continue };
+        let verified=match node_rpc::zecd_conventional::verify_conventional_payout(hex,txid,expected) {
+            Ok(_)=>true,
+            Err(node_rpc::zecd_conventional::ConventionalError::WalletHistory) if expected.requires_wallet_history() =>
+                match rpc(wallet,"gettransaction",json!([txid])).await {
+                    Ok(history)=>node_rpc::zecd_conventional::verify_conventional_payout_with_wallet(hex,txid,expected,&history).is_ok(),
+                    Err(_)=>false,
+                },
+            Err(_)=>false,
+        };
+        if verified {
+            db.record_pps_conventional_transaction(attempt,&row.intent_id,opid,txid).await?;
+            tracing::warn!(attempt,"PPS lost operation recovered: its transaction was found by the change note and verified against the intent");
+            return Ok(0);
+        }
+    }
+    let spent=before.difference(&now).count();
+    anyhow::ensure!(spent==0,"PPS operation lost: {spent} pre-send note(s) spent but no transaction matched the intent; held for review");
+    let mempool=rpc(node,"getrawmempool",json!([])).await?;
+    let mempool=mempool.as_array().context("PPS mempool schema")?;
+    anyhow::ensure!(mempool.len()<=LOST_OPERATION_MEMPOOL_LIMIT,"PPS operation lost: mempool too large to prove foreign; held");
+    for t in mempool.iter().filter_map(Value::as_str) {
+        anyhow::ensure!(rpc(wallet,"gettransaction",json!([t])).await.is_err(),
+            "PPS operation lost: a mempool transaction belongs to the wallet; held");
+    }
+    let (_,_,updated_at)=db.get_pps_payout_attempt_status(attempt).await?.context("PPS attempt row missing")?;
+    let updated=chrono::NaiveDateTime::parse_from_str(&updated_at,"%Y-%m-%d %H:%M:%S").context("PPS attempt timestamp")?;
+    let age=chrono::Utc::now().timestamp()-updated.and_utc().timestamp();
+    anyhow::ensure!(age>=LOST_OPERATION_RELEASE_AGE_SECONDS,"PPS operation lost; nothing spent yet, waiting before release");
+    let evidence=json!({"kind":"operation_lost","pre_send_notes":before.len(),"unspent_now":now.len(),
+        "mempool_transactions":mempool.len(),"attempt_age_seconds":age,"checked_at_unix":chrono::Utc::now().timestamp()}).to_string();
+    let released=db.release_failed_conventional_send(attempt,opid,&evidence).await?;
+    tracing::warn!(attempt,released,"PPS lost operation released: every pre-send note is still unspent, nothing was sent");
+    Ok(0)
+}
+
 pub(crate) async fn reconcile_one(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
     policy:&PpsPolicy,chain:&PpsGate,attempt:i64) -> Result<usize>
 {
@@ -494,8 +575,13 @@ async fn reconcile_steps(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
             *stage="operation_status";
             let response=rpc(wallet,"z_getoperationstatus",json!([[opid]])).await?;
             let statuses=response.as_array().context("PPS operation schema")?;
-            anyhow::ensure!(statuses.len()==1 && statuses[0].get("id").and_then(Value::as_str)==Some(opid),
-                "PPS operation identity mismatch");
+            if !(statuses.len()==1 && statuses[0].get("id").and_then(Value::as_str)==Some(opid)) {
+                // zecd keeps operation state per session: a wallet restart forgets a
+                // send's operation id before its transaction was recorded. Recover
+                // from the notes (#8) instead of holding the attempt forever.
+                *stage="operation_recovery";
+                return recover_lost_operation(db,wallet,node,attempt,&row,opid,&expected).await;
+            }
             match statuses[0].get("status").and_then(Value::as_str) {
                 Some("success")=>{},
                 Some("queued"|"executing")=>return Ok(0),
