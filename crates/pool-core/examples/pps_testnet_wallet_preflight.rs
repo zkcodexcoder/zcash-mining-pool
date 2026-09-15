@@ -123,7 +123,7 @@ fn error_category(error: ZecdFundingError) -> &'static str {
 async fn probe(input: &Input, report: &mut Report) {
     report.input_valid = true;
     if input.recipients.iter().any(|address|
-        node_rpc::zecd_conventional::validate_testnet_recipient(address).is_err())
+        node_rpc::zecd_conventional::validate_recipient("testnet", address).is_err())
     {
         report.error_category = "recipient_unsupported";
         return;

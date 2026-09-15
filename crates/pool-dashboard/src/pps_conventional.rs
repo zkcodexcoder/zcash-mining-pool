@@ -3,7 +3,7 @@
 //! resend, replace, or refund a possibly submitted transaction.
 use crate::pps_gate::PpsGate;
 use anyhow::{Context, Result};
-use node_rpc::{zecd_conventional::{ConventionalPayoutExpectation, TestnetConventionalProfile,
+use node_rpc::{zecd_conventional::{ConventionalPayoutExpectation, ConventionalProfile,
     verify_conventional_payout, verify_conventional_payout_with_wallet}, ZcashRpcClient};
 use pool_core::pps_funding::{PpsFundingError, PpsFundingRoute, collect_pps_funding_for_route};
 use pool_db::{PoolDb, pps_policy::PpsPolicy, pps_funding::{PpsConventionalIntent,
@@ -140,10 +140,10 @@ pub(super) async fn pre_send_or_release<T>(db: &PoolDb, attempt: i64,
 }
 
 fn expectation(intent: &PpsConventionalIntent) -> Result<ConventionalPayoutExpectation> {
-    let profile = TestnetConventionalProfile::consensus_size_bound(&intent.network,
+    let profile = ConventionalProfile::consensus_size_bound(&intent.network,
         usize::from(intent.max_recipients))?;
     anyhow::ensure!(intent.profile == profile.identifier(), "PPS intent profile mismatch");
-    Ok(ConventionalPayoutExpectation::new(&profile, &intent.source, &amounts(intent)?,
+    Ok(ConventionalPayoutExpectation::new(&profile, &intent.network, &intent.source, &amounts(intent)?,
         u32::try_from(intent.target_height)?)?)
 }
 
@@ -267,7 +267,7 @@ async fn process_inner(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClie
     from: &str, minimum: i64, policy: &PpsPolicy, chain: &PpsGate,
     route: &PpsFundingRoute) -> Result<usize>
 {
-    pre_send_phase("policy", async { policy.validate("testnet").map_err(anyhow::Error::msg) }).await?;
+    pre_send_phase("policy", async { policy.validate(&policy.network).map_err(anyhow::Error::msg) }).await?;
     pre_send_phase("route", async {
         route.validate(&policy.epoch_config())?;
         anyhow::ensure!(route.holds_new_legacy_sends() && minimum > 0, "PPS route mismatch");
@@ -347,7 +347,7 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
         for p in pending {
             // Audit B6: one unpayable row (for example a recipient the active route
             // cannot pay after a route change) must not block every other miner.
-            if route.validate_recipient("testnet", &p.address).is_err() {
+            if route.validate_recipient(&policy.network, &p.address).is_err() {
                 tracing::warn!(miner_id = p.miner_id,
                     "PPS payout recipient unsupported by the active route; skipped, balance retained");
                 continue;
@@ -356,7 +356,7 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
             if amount < minimum { continue; }
             // Audit B6: a recipient sharing a receiver with one already in this batch
             // would make the builder reject the whole round; defer it to a later round.
-            let Ok(keys) = node_rpc::zecd_conventional::recipient_receiver_keys(&p.address) else {
+            let Ok(keys) = node_rpc::zecd_conventional::recipient_receiver_keys(&policy.network, &p.address) else {
                 tracing::warn!(miner_id = p.miner_id, "PPS payout recipient undecodable; skipped, balance retained");
                 continue;
             };
@@ -379,7 +379,7 @@ async fn send_batch(db: &PoolDb, wallet: &ZcashRpcClient, node: &ZcashRpcClient,
         node.get_block_count().await.map_err(|_|anyhow::anyhow!("PPS node tip unavailable"))
     }).await?;
     let intent = pre_send_phase("intent_construction", async {
-        Ok::<_,anyhow::Error>(PpsConventionalIntent { version:1,network:"testnet".into(),epoch:policy.epoch.clone(),
+        Ok::<_,anyhow::Error>(PpsConventionalIntent { version:1,network:policy.network.clone(),epoch:policy.epoch.clone(),
             target_height:tip.checked_add(1).context("PPS target overflow")?,source:from.into(),
             profile:"consensus-size-v1".into(),max_recipients:100,items:selected })
     }).await?;
@@ -472,7 +472,7 @@ async fn reconcile_steps(db:&PoolDb,wallet:&ZcashRpcClient,node:&ZcashRpcClient,
     policy:&PpsPolicy,chain:&PpsGate,attempt:i64,stage:&mut &'static str) -> Result<usize>
 {
     *stage="policy";
-    policy.validate("testnet").map_err(anyhow::Error::msg)?;
+    policy.validate(&policy.network).map_err(anyhow::Error::msg)?;
     chain.fresh_lease().await?;
     *stage="epoch";
     db.verify_pps_epoch(&policy.epoch_config()).await?;

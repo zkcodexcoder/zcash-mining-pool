@@ -1783,7 +1783,7 @@ mod tests {
             let mut value = valid.clone();
             match bad {
                 0 => value.version = 2,
-                1 => value.network = "mainnet".into(),
+                1 => value.network = "regtest".into(), // mainnet intents are valid since 2026-09-15
                 2 => value.target_height = 0,
                 3 => value.profile = "unchecked".into(),
                 4 => value.max_recipients = 101,

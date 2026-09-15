@@ -17,7 +17,7 @@ use zcash_primitives::transaction::{
     fees::{zip317, FeeRule},
     Transaction, TxVersion,
 };
-use zcash_protocol::consensus::{BranchId, NetworkType, TEST_NETWORK};
+use zcash_protocol::consensus::{BranchId, Network, NetworkType, Parameters};
 
 const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
 const MAX_RAW_BYTES: usize = 2_000_000;
@@ -25,6 +25,16 @@ const MAX_RAW_BYTES: usize = 2_000_000;
 // Sapling outputs require 948 bytes; Orchard/Ironwood actions at least 884.
 // Shared headers, anchors, binding signatures, and proofs only increase size.
 const MIN_SHIELDED_ACTION_BYTES: usize = 352;
+
+/// The consensus parameters a conventional send is verified against. The same
+/// route serves mainnet and testnet (operator decision 2026-09-15, #1).
+fn network_params(network: &str) -> Result<Network, ConventionalError> {
+    match network {
+        "mainnet" => Ok(Network::MainNetwork),
+        "testnet" => Ok(Network::TestNetwork),
+        _ => Err(ConventionalError::Profile),
+    }
+}
 
 #[derive(Clone, Copy)]
 enum FeeProfile {
@@ -34,30 +44,30 @@ enum FeeProfile {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConventionalError {
-    #[error("testnet conventional profile unsupported")]
+    #[error("conventional profile unsupported")]
     Profile,
-    #[error("testnet conventional payout unsupported")]
+    #[error("conventional payout unsupported")]
     Payout,
-    #[error("testnet conventional transaction invalid")]
+    #[error("conventional transaction invalid")]
     Transaction,
-    #[error("testnet conventional fee invalid")]
+    #[error("conventional fee invalid")]
     Fee,
-    #[error("testnet conventional recipients mismatch")]
+    #[error("conventional recipients mismatch")]
     Recipient,
     /// Inadequate pinned-wallet evidence, not a proven raw financial violation.
     /// The caller must HOLD the reservation, never release it or infer a fee halt.
-    #[error("testnet conventional wallet history unavailable or inconsistent")]
+    #[error("conventional wallet history unavailable or inconsistent")]
     WalletHistory,
 }
 
 /// Structural validation only; never use configuration-supplied values as a
 /// substitute for independently verified runtime profile evidence.
 #[derive(Clone, Copy)]
-pub struct TestnetConventionalProfile {
+pub struct ConventionalProfile {
     kind: FeeProfile,
     max_recipients: usize,
 }
-impl TestnetConventionalProfile {
+impl ConventionalProfile {
     pub fn validate(
         network: &str,
         action_limit: usize,
@@ -66,7 +76,7 @@ impl TestnetConventionalProfile {
         max_recipients: usize,
     ) -> Result<Self, ConventionalError> {
         // Deliberately bounded subset of zecd's configurable usize range.
-        if network != "testnet"
+        if network_params(network).is_err()
             || !cache_proving_key
             || sapling_enabled
             || !(1..=50).contains(&action_limit)
@@ -98,7 +108,7 @@ impl TestnetConventionalProfile {
         network: &str,
         max_recipients: usize,
     ) -> Result<Self, ConventionalError> {
-        if network != "testnet" || !(1..=100).contains(&max_recipients) {
+        if network_params(network).is_err() || !(1..=100).contains(&max_recipients) {
             return Err(ConventionalError::Profile);
         }
         Ok(Self {
@@ -289,8 +299,8 @@ impl TryFromAddress for RecipientAddress {
 /// the payout selector can skip a recipient that overlaps one already selected
 /// (for example a wallet's bare t-address and its UA) instead of letting the batch
 /// builder reject the whole round.
-pub fn recipient_receiver_keys(address: &str) -> Result<Vec<Vec<u8>>, ConventionalError> {
-    Ok(decode_recipient(address)?
+pub fn recipient_receiver_keys(network: &str, address: &str) -> Result<Vec<Vec<u8>>, ConventionalError> {
+    Ok(decode_recipient(network_params(network)?.network_type(), address)?
         .receivers
         .into_iter()
         .map(|receiver| match receiver {
@@ -301,9 +311,9 @@ pub fn recipient_receiver_keys(address: &str) -> Result<Vec<Vec<u8>>, Convention
         .collect())
 }
 
-fn decode_recipient(address: &str) -> Result<RecipientAddress, ConventionalError> {
+fn decode_recipient(network: NetworkType, address: &str) -> Result<RecipientAddress, ConventionalError> {
     let decoded = canonical(address)?
-        .convert_if_network::<RecipientAddress>(NetworkType::Test)
+        .convert_if_network::<RecipientAddress>(network)
         .map_err(|_| ConventionalError::Payout)?;
     // Address-container checksums and network encodings are not curve-point
     // validity. Reject an unpayable known receiver before any accounting credit.
@@ -322,11 +332,12 @@ fn decode_recipient(address: &str) -> Result<RecipientAddress, ConventionalError
     Ok(decoded)
 }
 
-/// Admit canonical testnet bare transparent/Sapling addresses and UAs with a
-/// known shielded receiver. TEX, unknown-only UAs and cross-network inputs fail.
-/// This is structural address admission, not wallet ownership or spend authority.
-pub fn validate_testnet_recipient(address: &str) -> Result<(), ConventionalError> {
-    decode_recipient(address).map(|_| ())
+/// Admit canonical bare transparent/Sapling addresses and UAs of the given
+/// network with a known shielded receiver. TEX, unknown-only UAs and
+/// cross-network inputs fail. This is structural address admission, not wallet
+/// ownership or spend authority.
+pub fn validate_recipient(network: &str, address: &str) -> Result<(), ConventionalError> {
+    decode_recipient(network_params(network)?.network_type(), address).map(|_| ())
 }
 
 /// Runtime-private: no Debug/Serialize implementation exposes payment details.
@@ -337,6 +348,7 @@ pub struct ConventionalPayoutExpectation {
     wallet_history: bool,
     target_height: u32,
     branch: BranchId,
+    params: Network,
     ceiling: i64,
     allow_sapling: bool,
 }
@@ -345,19 +357,21 @@ impl ConventionalPayoutExpectation {
     /// persisted with this attempt. Never replace it with a later recovery tip.
     /// This pure function checks source KIND only, not wallet ownership.
     pub fn new(
-        profile: &TestnetConventionalProfile,
+        profile: &ConventionalProfile,
+        network: &str,
         source: &str,
         amounts: &[(String, i64)],
         target_height: u32,
     ) -> Result<Self, ConventionalError> {
+        let params = network_params(network)?;
         canonical(source)?
-            .convert_if_network::<ShieldedSource>(NetworkType::Test)
+            .convert_if_network::<ShieldedSource>(params.network_type())
             .map_err(|_| ConventionalError::Payout)?;
         if target_height == 0 || target_height > u32::MAX - 100 {
             return Err(ConventionalError::Payout);
         }
         let ceiling = profile.fee_ceiling_zatoshis(amounts.len())?;
-        let branch = BranchId::for_height(&TEST_NETWORK, target_height.into());
+        let branch = BranchId::for_height(&params, target_height.into());
         if !matches!(
             TxVersion::suggested_for_branch(branch),
             TxVersion::V5 | TxVersion::V6
@@ -373,7 +387,7 @@ impl ConventionalPayoutExpectation {
             if *amount <= 0 || *amount > MAX_MONEY {
                 return Err(ConventionalError::Payout);
             }
-            let decoded = decode_recipient(address)?;
+            let decoded = decode_recipient(params.network_type(), address)?;
             // Reject aliases and overlapping UA components, even components
             // that cannot be selected for payment on this shielded-only UA path.
             for receiver in &decoded.receivers {
@@ -410,6 +424,7 @@ impl ConventionalPayoutExpectation {
             wallet_history,
             target_height,
             branch,
+            params,
             ceiling,
             allow_sapling: matches!(profile.kind, FeeProfile::ConsensusSize),
         })
@@ -518,7 +533,7 @@ fn inspect_conventional_raw(
     }
     let conventional = zip317::FeeRule::standard()
         .fee_required(
-            &TEST_NETWORK,
+            &expected.params,
             expected.target_height.into(),
             std::iter::empty::<zcash_primitives::transaction::fees::transparent::InputSize>(),
             output_sizes,
@@ -564,9 +579,9 @@ fn negative_zatoshis(value: Option<&Value>) -> Result<i64, ConventionalError> {
     Ok(amount)
 }
 
-fn history_receiver(address: &str, pool: &str) -> Result<RecipientReceiver, ConventionalError> {
+fn history_receiver(network: NetworkType, address: &str, pool: &str) -> Result<RecipientReceiver, ConventionalError> {
     let bad = ConventionalError::WalletHistory;
-    let decoded = decode_recipient(address).map_err(|_| bad)?;
+    let decoded = decode_recipient(network, address).map_err(|_| bad)?;
     // Pinned zecd normalizes outgoing history to the SINGLE paid receiver.
     // The original multi-receiver UA is not recoverable from ciphertext.
     if decoded.unknown || decoded.receivers.len() != 1 {
@@ -653,6 +668,7 @@ pub fn verify_conventional_payout_with_wallet(
             return Err(bad);
         }
         let receiver = history_receiver(
+            expected.params.network_type(),
             detail.get("address").and_then(Value::as_str).ok_or(bad)?,
             pool,
         )?;
@@ -684,12 +700,13 @@ pub fn verify_conventional_payout_with_wallet(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use zcash_protocol::consensus::TEST_NETWORK;
     use zcash_address::ToAddress;
-    fn profile() -> TestnetConventionalProfile {
-        TestnetConventionalProfile::validate("testnet", 50, true, false, 100).unwrap()
+    fn profile() -> ConventionalProfile {
+        ConventionalProfile::validate("testnet", 50, true, false, 100).unwrap()
     }
-    fn size_profile() -> TestnetConventionalProfile {
-        TestnetConventionalProfile::consensus_size_bound("testnet", 100).unwrap()
+    fn size_profile() -> ConventionalProfile {
+        ConventionalProfile::consensus_size_bound("testnet", 100).unwrap()
     }
     fn source() -> String {
         ZcashAddress::from_sapling(NetworkType::Test, [1; 43]).encode()
@@ -699,7 +716,7 @@ pub(crate) mod tests {
     }
     fn expected() -> ConventionalPayoutExpectation {
         ConventionalPayoutExpectation::new(
-            &profile(),
+            &profile(), "testnet",
             &source(),
             &[(recipient(), 100_000)],
             2_000_000,
@@ -985,7 +1002,7 @@ pub(crate) mod tests {
         for pool in ["orchard", "ironwood", "sapling"] {
             let (raw, txid, height, source, ua, wallet) = shielded_receipt_fixture(pool);
             let expected = ConventionalPayoutExpectation::new(
-                &size_profile(),
+                &size_profile(), "testnet",
                 &source,
                 &[(ua.clone(), 100_000)],
                 height,
@@ -1007,7 +1024,7 @@ pub(crate) mod tests {
             if pool == "sapling" {
                 let bare = wallet["details"][0]["address"].as_str().unwrap().to_owned();
                 let e = ConventionalPayoutExpectation::new(
-                    &size_profile(),
+                    &size_profile(), "testnet",
                     &source,
                     &[(bare, 100_000)],
                     height,
@@ -1037,7 +1054,7 @@ pub(crate) mod tests {
         );
         let bare = ZcashAddress::from_sapling(NetworkType::Test, fixture_sapling(4)).encode();
         for valid in [&ua, &bare, &recipient()] {
-            assert!(validate_testnet_recipient(valid).is_ok());
+            assert!(validate_recipient("testnet", valid).is_ok());
         }
         let unknown = Address::try_from_items(vec![Receiver::Unknown {
             typecode: 0x10,
@@ -1052,7 +1069,7 @@ pub(crate) mod tests {
             },
         ])
         .unwrap();
-        assert!(validate_testnet_recipient(
+        assert!(validate_recipient("testnet", 
             &ZcashAddress::from_unified(NetworkType::Test, known_and_unknown).encode()
         )
         .is_ok());
@@ -1079,7 +1096,7 @@ pub(crate) mod tests {
             ZcashAddress::from_tex(NetworkType::Test, [4; 20]).encode(),
             ZcashAddress::from_transparent_p2pkh(NetworkType::Main, [2; 20]).encode(),
         ] {
-            assert!(validate_testnet_recipient(&invalid).is_err());
+            assert!(validate_recipient("testnet", &invalid).is_err());
         }
         for alias in [
             ua.clone(),
@@ -1096,7 +1113,7 @@ pub(crate) mod tests {
             ),
         ] {
             assert!(ConventionalPayoutExpectation::new(
-                &size_profile(),
+                &size_profile(), "testnet",
                 &source(),
                 &[(ua.clone(), 1), (alias, 2)],
                 2_000_000
@@ -1112,7 +1129,7 @@ pub(crate) mod tests {
         .unwrap();
         let mixed = ZcashAddress::from_unified(NetworkType::Test, mixed).encode();
         assert!(ConventionalPayoutExpectation::new(
-            &size_profile(),
+            &size_profile(), "testnet",
             &source(),
             &[(mixed, 1), (recipient(), 2)],
             2_000_000
@@ -1124,7 +1141,7 @@ pub(crate) mod tests {
     fn wallet_evidence_malformed_incomplete_or_mismatching_always_holds() {
         let (raw, txid, height, source, ua, wallet) = shielded_receipt_fixture("orchard");
         let expected =
-            ConventionalPayoutExpectation::new(&size_profile(), &source, &[(ua, 100_000)], height)
+            ConventionalPayoutExpectation::new(&size_profile(), "testnet", &source, &[(ua, 100_000)], height)
                 .unwrap();
         let holds = |value: &Value| {
             assert_eq!(
@@ -1251,7 +1268,7 @@ pub(crate) mod tests {
         let (raw, txid, height, source, ua, mut wallet) = shielded_receipt_fixture("orchard");
         let ua2 = unified_address(NetworkType::Test, None, Some(fixture_orchard(6)));
         let expected = ConventionalPayoutExpectation::new(
-            &size_profile(),
+            &size_profile(), "testnet",
             &source,
             &[(ua, 100_000), (ua2.clone(), 100_000)],
             height,
@@ -1287,7 +1304,7 @@ pub(crate) mod tests {
         );
         let receiver = unified_address(NetworkType::Test, None, Some(fixture_orchard(5)));
         let expected = ConventionalPayoutExpectation::new(
-            &size_profile(),
+            &size_profile(), "testnet",
             &source(),
             &[(recipient(), 100_000), (ua, 100_000)],
             height,
@@ -1319,7 +1336,7 @@ pub(crate) mod tests {
         .unwrap();
         let mixed = ZcashAddress::from_unified(NetworkType::Test, mixed).encode();
         let no_fallback = ConventionalPayoutExpectation::new(
-            &size_profile(),
+            &size_profile(), "testnet",
             &source(),
             &[(mixed, 100_000)],
             height,
@@ -1332,7 +1349,7 @@ pub(crate) mod tests {
         // The optional wallet-aware API is compatible with an entirely visible
         // payout too, but its raw-only predecessor needs no wallet assertion.
         let transparent = ConventionalPayoutExpectation::new(
-            &size_profile(),
+            &size_profile(), "testnet",
             &source(),
             &[(recipient(), 100_000)],
             height,
@@ -1350,7 +1367,7 @@ pub(crate) mod tests {
     fn raw_fee_violation_is_distinct_from_wallet_history_hold() {
         let (raw, txid, height, source, ua, wallet) = shielded_receipt_fixture("orchard");
         let expected =
-            ConventionalPayoutExpectation::new(&size_profile(), &source, &[(ua, 100_000)], height)
+            ConventionalPayoutExpectation::new(&size_profile(), "testnet", &source, &[(ua, 100_000)], height)
                 .unwrap();
         assert_eq!(
             verify_conventional_payout_with_wallet(&raw, &txid, &expected, &Value::Null).err(),
@@ -1391,11 +1408,12 @@ pub(crate) mod tests {
     fn consensus_size_profile_is_explicit_and_bounded_for_every_recipient_count() {
         assert_eq!(size_profile().identifier(), "consensus-size-v1");
         assert_eq!(profile().identifier(), "restricted-family-v1");
-        for network in ["mainnet", "regtest", "test", "Testnet", ""] {
-            assert!(TestnetConventionalProfile::consensus_size_bound(network, 100).is_err());
+        assert!(ConventionalProfile::consensus_size_bound("mainnet", 100).is_ok());
+        for network in ["regtest", "test", "Testnet", "Mainnet", ""] {
+            assert!(ConventionalProfile::consensus_size_bound(network, 100).is_err());
         }
         for n in [0, 101, usize::MAX] {
-            assert!(TestnetConventionalProfile::consensus_size_bound("testnet", n).is_err());
+            assert!(ConventionalProfile::consensus_size_bound("testnet", n).is_err());
             assert!(size_profile().fee_ceiling_zatoshis(n).is_err());
         }
         assert_eq!(MAX_RAW_BYTES / MIN_SHIELDED_ACTION_BYTES, 5681);
@@ -1425,7 +1443,7 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(size_profile().fee_ceiling_zatoshis(100), Ok(28_905_000));
-        let one = TestnetConventionalProfile::consensus_size_bound("testnet", 1).unwrap();
+        let one = ConventionalProfile::consensus_size_bound("testnet", 1).unwrap();
         assert!(one.fee_ceiling_zatoshis(2).is_err());
     }
 
@@ -1445,7 +1463,7 @@ pub(crate) mod tests {
             let base_fee = if o + i > 0 { -100_042 } else { 0 };
             let (raw, _, height) = raw_fixture(v6, o, i, base_fee, 100_000);
             let expected = ConventionalPayoutExpectation::new(
-                &size_profile(),
+                &size_profile(), "testnet",
                 &source(),
                 &[(recipient(), 100_000)],
                 height,
@@ -1456,7 +1474,7 @@ pub(crate) mod tests {
             let checked = verify_conventional_payout(&raw, &txid, &expected).unwrap();
             assert_eq!(checked.actual_fee_zatoshis(), fee);
             let restricted = ConventionalPayoutExpectation::new(
-                &profile(),
+                &profile(), "testnet",
                 &source(),
                 &[(recipient(), 100_000)],
                 height,
@@ -1485,7 +1503,7 @@ pub(crate) mod tests {
             let (raw, _, height) = raw_fixture(false, 0, 0, 0, 100_000);
             let (raw, txid) = add_sapling(&raw, height, spends, 0, 100_000 + fee);
             let expected = ConventionalPayoutExpectation::new(
-                &size_profile(),
+                &size_profile(), "testnet",
                 &source(),
                 &[(recipient(), 100_000)],
                 height,
@@ -1516,7 +1534,7 @@ pub(crate) mod tests {
             let (base, _, height) = raw_fixture(v6, 0, 0, 0, 100_000);
             let (raw, txid) = add_sapling(&base, height, 1, 0, 110_000);
             let expected = ConventionalPayoutExpectation::new(
-                &size_profile(),
+                &size_profile(), "testnet",
                 &source(),
                 &[(recipient(), 100_000)],
                 height,
@@ -1584,7 +1602,7 @@ pub(crate) mod tests {
             ZcashAddress::from_transparent_p2pkh(NetworkType::Main, [2; 20]).encode(),
         ] {
             assert!(ConventionalPayoutExpectation::new(
-                &size_profile(),
+                &size_profile(), "testnet",
                 &source(),
                 &[(bad, 1)],
                 2_000_000
@@ -1592,7 +1610,7 @@ pub(crate) mod tests {
             .is_err());
         }
         assert!(ConventionalPayoutExpectation::new(
-            &size_profile(),
+            &size_profile(), "testnet",
             &recipient(),
             &[(recipient(), 1)],
             2_000_000
@@ -1608,7 +1626,7 @@ pub(crate) mod tests {
         ] {
             let (raw, txid, height) = raw_fixture(v6, o, i, fee, 100_000);
             let e = ConventionalPayoutExpectation::new(
-                &profile(),
+                &profile(), "testnet",
                 &source(),
                 &[(recipient(), 100_000)],
                 height,
@@ -1627,7 +1645,7 @@ pub(crate) mod tests {
                 Err(ConventionalError::Transaction)
             ));
             let wrong = ConventionalPayoutExpectation::new(
-                &profile(),
+                &profile(), "testnet",
                 &source(),
                 &[(recipient(), 99_999)],
                 height,
@@ -1652,7 +1670,7 @@ pub(crate) mod tests {
         ));
         let (raw, txid, _) = raw_fixture(false, 2, 0, 15_000, 100_000);
         let wrong_branch = ConventionalPayoutExpectation::new(
-            &profile(),
+            &profile(), "testnet",
             &source(),
             &[(recipient(), 100_000)],
             4_100_000,
@@ -1702,7 +1720,7 @@ pub(crate) mod tests {
             tx.write(&mut bytes).unwrap();
             for profile in [profile(), size_profile()] {
                 let e = ConventionalPayoutExpectation::new(
-                    &profile,
+                    &profile, "testnet",
                     &source(),
                     &[(recipient(), 100_000)],
                     2_000_000,
@@ -1722,17 +1740,18 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn profiles_are_testnet_only_fixed_bounded_cached_family_path() {
-        assert!(TestnetConventionalProfile::validate("mainnet", 50, true, false, 100).is_err());
-        assert!(TestnetConventionalProfile::validate("testnet", 50, false, false, 100).is_err());
-        assert!(TestnetConventionalProfile::validate("testnet", 50, true, true, 100).is_err());
+    fn profiles_are_fixed_bounded_cached_family_paths_on_either_network() {
+        assert!(ConventionalProfile::validate("mainnet", 50, true, false, 100).is_ok());
+        assert!(ConventionalProfile::validate("regtest", 50, true, false, 100).is_err());
+        assert!(ConventionalProfile::validate("testnet", 50, false, false, 100).is_err());
+        assert!(ConventionalProfile::validate("testnet", 50, true, true, 100).is_err());
         for limit in [0, 51, usize::MAX] {
             assert!(
-                TestnetConventionalProfile::validate("testnet", limit, true, false, 100).is_err()
+                ConventionalProfile::validate("testnet", limit, true, false, 100).is_err()
             );
         }
         for n in [0, 101, usize::MAX] {
-            assert!(TestnetConventionalProfile::validate("testnet", 50, true, false, n).is_err());
+            assert!(ConventionalProfile::validate("testnet", 50, true, false, n).is_err());
         }
         assert_eq!(profile().fee_ceiling_zatoshis(100), Ok(1_020_000));
         assert!(profile().fee_ceiling_zatoshis(0).is_err());
@@ -1742,7 +1761,7 @@ pub(crate) mod tests {
     fn payout_rejects_unsupported_network_source_recipient_and_amounts() {
         for bad in [recipient(), "ANY_TADDR".into(), format!(" {}", source())] {
             assert!(ConventionalPayoutExpectation::new(
-                &profile(),
+                &profile(), "testnet",
                 &bad,
                 &[(recipient(), 1)],
                 2_000_000
@@ -1753,7 +1772,7 @@ pub(crate) mod tests {
         let tex = ZcashAddress::from_tex(NetworkType::Test, [2; 20]).encode();
         for bad in [main, tex, source()] {
             assert!(ConventionalPayoutExpectation::new(
-                &profile(),
+                &profile(), "testnet",
                 &source(),
                 &[(bad, 1)],
                 2_000_000
@@ -1762,7 +1781,7 @@ pub(crate) mod tests {
         }
         for bad in [-1, 0, MAX_MONEY, i64::MAX] {
             assert!(ConventionalPayoutExpectation::new(
-                &profile(),
+                &profile(), "testnet",
                 &source(),
                 &[(recipient(), bad)],
                 2_000_000
@@ -1770,18 +1789,18 @@ pub(crate) mod tests {
             .is_err());
         }
         assert!(ConventionalPayoutExpectation::new(
-            &profile(),
+            &profile(), "testnet",
             &source(),
             &[(recipient(), 1), (recipient(), 2)],
             2_000_000
         )
         .is_err());
         assert!(
-            ConventionalPayoutExpectation::new(&profile(), &source(), &[(recipient(), 1)], 1)
+            ConventionalPayoutExpectation::new(&profile(), "testnet", &source(), &[(recipient(), 1)], 1)
                 .is_err()
         );
         assert!(ConventionalPayoutExpectation::new(
-            &profile(),
+            &profile(), "testnet",
             &source(),
             &[(recipient(), 1)],
             u32::MAX
@@ -1819,7 +1838,7 @@ pub(crate) mod tests {
                                 let fee=zip317::FeeRule::standard().fee_required(&TEST_NETWORK,2_000_000.into(),
                     std::iter::empty::<zcash_primitives::transaction::fees::transparent::InputSize>(),
                     vec![34;n],0,0,o,i).unwrap();
-                                let p = TestnetConventionalProfile::validate(
+                                let p = ConventionalProfile::validate(
                                     "testnet", a, true, false, 100,
                                 )
                                 .unwrap();
@@ -1843,7 +1862,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             ConventionalError::Transaction.to_string(),
-            "testnet conventional transaction invalid"
+            "conventional transaction invalid"
         );
     }
 }

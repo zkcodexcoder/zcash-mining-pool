@@ -104,7 +104,7 @@ fn client(url: &str, user: &Option<String>, password: &Option<String>)
 async fn probe(input: &Input, report: &mut Report) {
     report.stage = "recipient_check";
     if input.recipients.iter().any(|address|
-        node_rpc::zecd_conventional::validate_testnet_recipient(address).is_err())
+        node_rpc::zecd_conventional::validate_recipient("testnet", address).is_err())
     {
         report.category = "recipient_unsupported";
         return;

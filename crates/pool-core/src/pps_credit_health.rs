@@ -547,7 +547,7 @@ mod tests {
     }
     #[test]
     fn credit_health_accounts_for_generation_backing_cap_halt_and_next_batch() {
-        let route=PpsFundingRoute::ZecdConventionalTestnet{hold_new_legacy_sends:true};
+        let route=PpsFundingRoute::ZecdConventional{hold_new_legacy_sends:true};
         let (e,l,mut s)=state_fixture(); let mut h=ready();
         assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.state,CreditAdmissionState::Ready);
         s.generation+=1; assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.category,"generation_changed");
@@ -609,7 +609,7 @@ mod tests {
         // The reserve floor is a warning level (operator, 2026-09-15): the buffer the
         // wallet holds above what is owed is the reserve, and health says when it
         // has thinned below the floor. Only a wallet short of what is owed pauses.
-        let route=PpsFundingRoute::ZecdConventionalTestnet{hold_new_legacy_sends:true};
+        let route=PpsFundingRoute::ZecdConventional{hold_new_legacy_sends:true};
         let (e,l,mut s)=state_fixture(); let mut h=ready();
         s.funding.as_mut().unwrap().reserve_floor_zatoshis=5;
         // Covered exactly: nothing above what is owed.
@@ -751,15 +751,12 @@ mod tests {
         }
     }
     #[test]
-    fn low_budget_is_exact_under_twenty_percent_and_mainnet_is_unchanged() {
-        let (e,l,mut s)=state_fixture(); let route=PpsFundingRoute::ZecdConventionalTestnet{hold_new_legacy_sends:true};
+    fn low_budget_is_exact_under_twenty_percent() {
+        let (e,l,mut s)=state_fixture(); let route=PpsFundingRoute::ZecdConventional{hold_new_legacy_sends:true};
         let cap=s.funding.as_ref().unwrap().cap_subzatoshis;
         for (unused,low) in [(cap/5,false),(cap/5-1,true),(cap,false)] {
             s.funding.as_mut().unwrap().unused_credit_subzatoshis=unused; let mut h=ready();
             assess(&mut h,&e,&route,Some(&l),&s,100); assert_eq!(h.budget_low,low);
         }
-        let mut h=ready(); assess(&mut h,&e,&PpsFundingRoute::ZalletPczt,Some(&l),&s,100);
-        assess_quote(&mut h,None,None,false,0,100,Instant::now());
-        assert!(!h.quote_required); assert!(!h.budget_low); assert_eq!(h.state,CreditAdmissionState::Ready);
     }
 }

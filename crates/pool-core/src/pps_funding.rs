@@ -16,26 +16,31 @@ const _: () = assert!(FUNDING_LEASE_SECONDS == node_rpc::zecd_funding::EVIDENCE_
 /// configuration retains the existing PCZT route; a failed route never probes
 /// or falls back to another wallet protocol. Deployment must independently pin
 /// the conventional wallet binary and its standard-fee contract.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PpsFundingRoute {
-    #[default]
-    ZalletPczt,
-    ZecdConventionalTestnet { hold_new_legacy_sends: bool },
+    /// zecd's conventional `z_sendmany` send, verified byte-for-byte against the
+    /// recorded intent. The only route since 2026-09-15 (operator decision #1):
+    /// the PCZT/zallet path never ran and was retired. Configured as
+    /// `route = "zecd_conventional"` (the testnet trial's name
+    /// `zecd_conventional_testnet` still parses).
+    ZecdConventional { hold_new_legacy_sends: bool },
 }
 
 impl<'de> Deserialize<'de> for PpsFundingRoute {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self,D::Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "snake_case")]
-        enum Protocol { ZalletPczt, ZecdConventionalTestnet }
+        enum Protocol {
+            #[serde(alias = "zecd_conventional_testnet")]
+            ZecdConventional,
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Raw { route: Protocol, hold_new_legacy_sends: Option<bool> }
         let raw=Raw::deserialize(deserializer)?;
         match (raw.route,raw.hold_new_legacy_sends) {
-            (Protocol::ZalletPczt,None) => Ok(Self::ZalletPczt),
-            (Protocol::ZecdConventionalTestnet,Some(hold_new_legacy_sends)) =>
-                Ok(Self::ZecdConventionalTestnet { hold_new_legacy_sends }),
+            (Protocol::ZecdConventional,Some(hold_new_legacy_sends)) =>
+                Ok(Self::ZecdConventional { hold_new_legacy_sends }),
             _ => Err(serde::de::Error::custom("PPS funding route fields do not match its explicit protocol")),
         }
     }
@@ -44,15 +49,16 @@ impl<'de> Deserialize<'de> for PpsFundingRoute {
 impl PpsFundingRoute {
     pub fn validate(&self, epoch: &PpsEpoch) -> Result<(), PpsFundingError> {
         match self {
-            Self::ZalletPczt => Ok(()),
-            Self::ZecdConventionalTestnet { hold_new_legacy_sends } => {
-                // Exact, limited testnet authorization. Neither config drift
-                // nor a future mainnet policy may silently expand this route.
-                if epoch.network != "testnet" || epoch.fee_bps >= 10_000
-                    || epoch.max_liability_zatoshis != 95_000_000_000
-                    || epoch.fee_allowance_zatoshis != 5_000_000_000
-                    || epoch.total_exposure_zatoshis != 100_000_000_000
-                    || epoch.reserve_floor_zatoshis <= 0 || !hold_new_legacy_sends
+            Self::ZecdConventional { hold_new_legacy_sends } => {
+                // Structural bounds only; the policy's own validation holds the
+                // amounts. A known network, a fee below 100%, positive liability
+                // and fee allowance within the exposure, a non-negative floor,
+                // and legacy sends held while PPS runs.
+                if !matches!(epoch.network.as_str(), "mainnet" | "testnet") || epoch.fee_bps >= 10_000
+                    || epoch.max_liability_zatoshis <= 0 || epoch.fee_allowance_zatoshis <= 0
+                    || epoch.max_liability_zatoshis.checked_add(epoch.fee_allowance_zatoshis)
+                        .is_none_or(|v| v > epoch.total_exposure_zatoshis)
+                    || epoch.reserve_floor_zatoshis < 0 || !hold_new_legacy_sends
                 { return Err(PpsFundingError::RoutePolicy); }
                 Ok(())
             }
@@ -60,24 +66,17 @@ impl PpsFundingRoute {
     }
 
     pub fn holds_new_legacy_sends(&self) -> bool {
-        matches!(self, Self::ZecdConventionalTestnet { hold_new_legacy_sends: true })
+        matches!(self, Self::ZecdConventional { hold_new_legacy_sends: true })
     }
 
-    /// Recipient admission follows the explicitly selected payout protocol.
-    /// Shielded recipients require the testnet conventional wallet-history
-    /// contract; they must never silently broaden the existing PCZT route.
+    /// Recipient admission for the explicitly selected route and the pool's network.
     pub fn validate_recipient(&self, network: &str, address: &str)
         -> Result<(), PpsFundingError>
     {
         match self {
-            Self::ZalletPczt => node_rpc::pczt::validate_pps_recipient(network, address)
-                .map_err(|_| PpsFundingError::UnsupportedRecipient),
-            Self::ZecdConventionalTestnet { hold_new_legacy_sends: true }
-                if network == "testnet" =>
-            {
-                node_rpc::zecd_conventional::validate_testnet_recipient(address)
-                    .map_err(|_| PpsFundingError::UnsupportedRecipient)
-            }
+            Self::ZecdConventional { hold_new_legacy_sends: true } =>
+                node_rpc::zecd_conventional::validate_recipient(network, address)
+                    .map_err(|_| PpsFundingError::UnsupportedRecipient),
             _ => Err(PpsFundingError::RoutePolicy),
         }
     }
@@ -112,8 +111,8 @@ pub enum PpsFundingError {
 }
 
 /// This is validation, not a capability factory. A lease is issued only by a
-/// fresh wallet read bracketed by matching DB snapshots and a verified fixed
-/// PCZT RPC contract. Config cannot supply a manual wallet attestation.
+/// fresh wallet read bracketed by matching DB snapshots and the wallet's verified
+/// RPC contract. Config cannot supply a manual wallet attestation.
 const _: () = assert!(node_rpc::zecd_funding::PAYOUT_NOTE_MATURITY == pool_db::pps_policy::PAYOUT_NOTE_MATURITY);
 
 pub fn validate_funding_lease(lease: &PpsFundingLease, epoch: &PpsEpoch, now: i64)
@@ -196,8 +195,7 @@ async fn collect_for_route(
     crate::pps_credit_health::stage("route_policy");
     route.validate(epoch)?;
     match route {
-        PpsFundingRoute::ZalletPczt => collect_pczt(db, wallet, epoch, from, node, shortfall).await,
-        PpsFundingRoute::ZecdConventionalTestnet { .. } =>
+        PpsFundingRoute::ZecdConventional { .. } =>
             collect_testnet_for_snapshot(db, wallet, epoch, from, node, None, shortfall).await,
     }
 }
@@ -211,7 +209,7 @@ pub async fn collect_pps_testnet_budget_extension_funding(
 ) -> Result<PpsFundingLease, PpsFundingError> {
     let next = pool_db::pps_funding::testnet_budget_extension_epoch(previous)
         .map_err(|_| PpsFundingError::RoutePolicy)?;
-    PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true }.validate(&next)?;
+    PpsFundingRoute::ZecdConventional { hold_new_legacy_sends:true }.validate(&next)?;
     collect_testnet_for_snapshot(db, wallet, &next, from, node, Some(previous), Shortfall::Refuse).await
 }
 
@@ -272,7 +270,7 @@ pub async fn collect_pps_credit_funding_for_route(
     // new credits against it (proven insolvency), while a missing or stale proof
     // stays advisory. Found blocks are still submitted (audit B1).
     let lease=collect_for_route(db,wallet,epoch,from,node,route,Shortfall::Keep).await?;
-    if matches!(route,PpsFundingRoute::ZecdConventionalTestnet { .. }) {
+    if matches!(route,PpsFundingRoute::ZecdConventional { .. }) {
         crate::pps_credit_health::stage("credit_capacity");
         let snapshot=db.pps_funding_snapshot_for_epoch(epoch).await
             .map_err(|_|PpsFundingError::AccountingUnavailable)?;
@@ -290,17 +288,16 @@ pub async fn collect_pps_credit_funding_for_route(
 
 /// Read-only capacity predicate, also used by sampled status. This never issues
 /// a funding lease or authorizes a credit; the DB still checks admission itself.
-pub fn validate_credit_fee_capacity(route:&PpsFundingRoute,snapshot:&PpsFundingSnapshot)
+pub fn validate_credit_fee_capacity(_route:&PpsFundingRoute,snapshot:&PpsFundingSnapshot)
     -> Result<(),PpsFundingError>
 {
-    if matches!(route,PpsFundingRoute::ZalletPczt) { return Ok(()); }
     if snapshot.paid_fees_zatoshis < 0 || snapshot.reserved_fees_zatoshis < 0 {
         return Err(PpsFundingError::InvalidEvidence);
     }
     let available=snapshot.fee_allowance_zatoshis.checked_sub(snapshot.paid_fees_zatoshis)
         .and_then(|v|v.checked_sub(snapshot.reserved_fees_zatoshis))
         .ok_or(PpsFundingError::InvalidEvidence)?;
-    let ceiling=node_rpc::zecd_conventional::TestnetConventionalProfile::consensus_size_bound("testnet",100)
+    let ceiling=node_rpc::zecd_conventional::ConventionalProfile::consensus_size_bound(&snapshot.network,100)
         .and_then(|p|p.fee_ceiling_zatoshis(100)).map_err(|_|PpsFundingError::InvalidEvidence)?;
     if available < ceiling { return Err(PpsFundingError::FeeCapacityExhausted); }
     Ok(())
@@ -324,51 +321,7 @@ fn finish_testnet_evidence(before: &PpsFundingSnapshot, after: &PpsFundingSnapsh
     Ok(lease)
 }
 
-/// Collects before initial epoch activation too. The ledger must recheck the
-/// generation and required amount atomically at activation/admission/reserve,
-/// and immediately before signing/broadcast. No wallet mutation occurs here.
-pub async fn collect_pps_funding(db: &PoolDb, wallet: &ZcashRpcClient, epoch: &PpsEpoch, from: &str, node: &ZcashRpcClient)
-    -> Result<PpsFundingLease, PpsFundingError>
-{
-    collect_pczt(db, wallet, epoch, from, node, Shortfall::Refuse).await
-}
 
-async fn collect_pczt(db: &PoolDb, wallet: &ZcashRpcClient, epoch: &PpsEpoch, from: &str,
-    node: &ZcashRpcClient, shortfall: Shortfall)
-    -> Result<PpsFundingLease, PpsFundingError>
-{
-    tokio::time::timeout(Duration::from_secs(25), async {
-        let checked_at = chrono::Utc::now().timestamp();
-        crate::pps_credit_health::stage("funding_before");
-        let before = db.pps_funding_snapshot_for_epoch(epoch).await
-            .map_err(|_| PpsFundingError::AccountingUnavailable)?;
-        // This opaque result can only be created by strict read-only discovery
-        // of the fixed PCZT contract. Unsupported wallets never fall back to
-        // an unbounded z_sendmany call or a configuration-supplied assertion.
-        crate::pps_credit_health::stage("pczt_contract");
-        let _contract = node_rpc::pczt::verify_pps_wallet_capability(wallet).await
-            .map_err(|_| PpsFundingError::FeeContractUnavailable)?;
-        // Pinned Zallet has no getblockchaininfo/getinfo wallet methods.
-        // The verifier uses fixed synthetic network-specific addresses with
-        // validateaddress (positive own-network AND negative other-network),
-        // never a wallet-owned address, key or a config-supplied attestation.
-        crate::pps_credit_health::stage("pczt_network");
-        node_rpc::pczt::verify_pps_wallet_network(wallet, &epoch.network).await
-            .map_err(|_| PpsFundingError::NetworkMismatch)?;
-        crate::pps_credit_health::stage("pczt_signer");
-        wallet.pps_wallet_signer_ready(checked_at.checked_add(FUNDING_LEASE_SECONDS)
-            .ok_or(PpsFundingError::InvalidEvidence)?).await
-            .map_err(|_| PpsFundingError::WalletUnavailable)?;
-        crate::pps_credit_health::stage("wallet_collect");
-        let spendable = wallet.confirmed_spendable_zatoshis_on_chain(from, node).await
-            .map_err(|_| PpsFundingError::WalletUnavailable)?;
-        crate::pps_credit_health::stage("funding_after");
-        let after = db.pps_funding_snapshot_for_epoch(epoch).await
-            .map_err(|_| PpsFundingError::AccountingUnavailable)?;
-        crate::pps_credit_health::stage("funding_finish");
-        finish_evidence(&before, &after, spendable, spendable, epoch, checked_at, chrono::Utc::now().timestamp(), shortfall)
-    }).await.map_err(|_| PpsFundingError::Timeout)?
-}
 
 #[cfg(test)]
 mod tests {
@@ -387,16 +340,17 @@ mod tests {
         e
     }
     #[test]
-    fn explicit_testnet_route_requires_exact_all_in_bounds_and_legacy_hold() {
-        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends: true };
+    fn conventional_route_requires_a_known_network_sane_bounds_and_legacy_hold() {
+        let route = PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: true };
         let e = conventional_epoch();
         assert!(route.validate(&e).is_ok());
-        let mut predecessor=e.clone();
-        predecessor.max_liability_zatoshis=950_000_000;
-        predecessor.fee_allowance_zatoshis=50_000_000;
-        predecessor.total_exposure_zatoshis=1_000_000_000;
-        assert_eq!(route.validate(&predecessor),Err(PpsFundingError::RoutePolicy));
-        assert!(PpsFundingRoute::ZalletPczt.validate(&predecessor).is_ok());
+        // Any consistent policy on either network is accepted (operator decision
+        // 2026-09-15 #1: the same route serves mainnet).
+        let mut mainnet = e.clone();
+        mainnet.network = "mainnet".into(); mainnet.fee_bps = 10;
+        mainnet.max_liability_zatoshis = 5_000_000_000; mainnet.fee_allowance_zatoshis = 100_000_000;
+        mainnet.total_exposure_zatoshis = 5_100_000_000; mainnet.reserve_floor_zatoshis = 10_000_000_000;
+        assert!(route.validate(&mainnet).is_ok());
         for fee in [0, 100, 9_999] {
             let mut same_policy = e.clone(); same_policy.fee_bps = fee;
             assert!(route.validate(&same_policy).is_ok());
@@ -404,55 +358,51 @@ mod tests {
         for altered in 0..6 {
             let mut bad = e.clone();
             match altered {
-                0 => bad.network = "mainnet".into(),
-                1 => bad.max_liability_zatoshis += 1,
-                2 => bad.fee_allowance_zatoshis += 1,
-                3 => bad.total_exposure_zatoshis += 1,
-                4 => bad.reserve_floor_zatoshis = 0,
+                0 => bad.network = "regtest".into(),
+                1 => bad.max_liability_zatoshis = 0,
+                2 => bad.fee_allowance_zatoshis = 0,
+                3 => bad.total_exposure_zatoshis = bad.max_liability_zatoshis + bad.fee_allowance_zatoshis - 1,
+                4 => bad.reserve_floor_zatoshis = -1,
                 _ => bad.fee_bps = 10_000,
             }
-            assert_eq!(route.validate(&bad), Err(PpsFundingError::RoutePolicy));
+            assert_eq!(route.validate(&bad), Err(PpsFundingError::RoutePolicy), "{altered}");
         }
-        assert!(PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends: false }.validate(&e).is_err());
+        assert!(PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: false }.validate(&e).is_err());
         assert!(route.holds_new_legacy_sends());
-        assert!(!PpsFundingRoute::ZalletPczt.holds_new_legacy_sends());
+        assert!(!PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: false }.holds_new_legacy_sends());
     }
     #[test]
     fn route_configuration_is_explicit_and_rejects_manual_signer_proofs() {
-        let route: PpsFundingRoute = toml::from_str("route='zecd_conventional_testnet'\nhold_new_legacy_sends=true").unwrap();
-        assert_eq!(route, PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends: true });
-        for config in ["", "route='zecd_conventional_testnet'", "route='unknown'",
-            "route='zallet_pczt'\nhold_new_legacy_sends=true",
-            "route='zecd_conventional_testnet'\nhold_new_legacy_sends=true\nsigner_ready=true"]
+        let route: PpsFundingRoute = toml::from_str("route='zecd_conventional'\nhold_new_legacy_sends=true").unwrap();
+        assert_eq!(route, PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: true });
+        // The testnet trial's name still parses; the retired PCZT route does not.
+        let trial: PpsFundingRoute = toml::from_str("route='zecd_conventional_testnet'\nhold_new_legacy_sends=true").unwrap();
+        assert_eq!(trial, route);
+        for config in ["", "route='zecd_conventional'", "route='unknown'",
+            "route='zallet_pczt'", "route='zallet_pczt'\nhold_new_legacy_sends=true",
+            "route='zecd_conventional'\nhold_new_legacy_sends=true\nsigner_ready=true"]
         { assert!(toml::from_str::<PpsFundingRoute>(config).is_err(), "{config}"); }
-        assert_eq!(PpsFundingRoute::default(), PpsFundingRoute::ZalletPczt);
     }
     #[test]
-    fn existing_pczt_route_does_not_change_its_network_or_economic_policy() {
-        let mut e = epoch();
-        for network in ["mainnet", "testnet"] {
-            e.network = network.into();
-            assert!(PpsFundingRoute::ZalletPczt.validate(&e).is_ok());
-        }
-    }
-    #[test]
-    fn recipient_admission_is_specific_to_the_explicit_testnet_route() {
-        let conventional = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
-        let transparent = "tm9ty64b2UE2PWqVH1NN7hBmZr27U771NKY";
+    fn recipient_admission_follows_the_network_of_the_pool() {
+        let conventional = PpsFundingRoute::ZecdConventional { hold_new_legacy_sends:true };
+        let transparent = "tm9iNYCVAhLLa4rJtfqqHauR5xL1REdpiDs";
         let sapling = "ztestsapling1ywvgdtat0cemx5y6ejpu5wapc5x2j0c08f9lee3fd9s6wvv6n079w5nplr48qne73w6swec4vzv";
         let unified = "utest1rak2faln6pat6jx7rmfulvm80c0mjcnj5z2zvsynqn0zhu9gtk97ll5cyvu7maglwgazje4t00958n2yyadc8ee2vskkmg0e7wscqxaaahke023r8pejc097tf0e5zu6ltq9g6f99xxtpfprujl4uhaph3yj7mu52w3da6x0lgj3j0qy";
         for recipient in [transparent,sapling,unified] {
             assert!(conventional.validate_recipient("testnet",recipient).is_ok());
-            assert_eq!(conventional.validate_recipient("mainnet",recipient),Err(PpsFundingError::RoutePolicy));
-            assert_eq!(PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:false }
+            // A testnet address is not payable on mainnet.
+            assert_eq!(conventional.validate_recipient("mainnet",recipient),Err(PpsFundingError::UnsupportedRecipient));
+            assert_eq!(PpsFundingRoute::ZecdConventional { hold_new_legacy_sends:false }
                 .validate_recipient("testnet",recipient),Err(PpsFundingError::RoutePolicy));
         }
-        assert!(PpsFundingRoute::ZalletPczt.validate_recipient("testnet",transparent).is_ok());
-        assert!(PpsFundingRoute::ZalletPczt.validate_recipient("testnet",sapling).is_err());
-        assert!(PpsFundingRoute::ZalletPczt.validate_recipient("testnet",unified).is_err());
+        let mainnet_transparent = "t1HsdDMzmJfq4vc7T17XYjEkLMLvbgM1fCi";
+        assert!(conventional.validate_recipient("mainnet",mainnet_transparent).is_ok());
+        assert_eq!(conventional.validate_recipient("testnet",mainnet_transparent),Err(PpsFundingError::UnsupportedRecipient));
+        assert_eq!(conventional.validate_recipient("regtest",mainnet_transparent),Err(PpsFundingError::UnsupportedRecipient));
         for bad in ["", "unsupported", "MAINNET", " unified "] {
             assert!(conventional.validate_recipient("testnet",bad).is_err());
-            assert!(PpsFundingRoute::ZalletPczt.validate_recipient("testnet",bad).is_err());
+            assert!(conventional.validate_recipient("mainnet",bad).is_err());
         }
     }
     #[test]
@@ -511,8 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn conventional_credit_capacity_reserves_next_max_batch_but_not_pczt_or_payout_funding() {
-        let route=PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
+    fn conventional_credit_capacity_reserves_next_max_batch_but_not_payout_funding() {
+        let route=PpsFundingRoute::ZecdConventional { hold_new_legacy_sends:true };
         let s=PpsFundingSnapshot {
             network:"testnet".into(),generation:0,legacy_pending_zatoshis:0,legacy_paying_zatoshis:0,
             pps_outstanding_subzatoshis:0,unused_credit_subzatoshis:0,gross_subzatoshis:0,
@@ -529,7 +479,6 @@ mod tests {
         assert_eq!(validate_credit_fee_capacity(&route,&at_limit),Err(PpsFundingError::FeeCapacityExhausted));
         let mut reserved=s.clone(); reserved.reserved_fees_zatoshis=ceiling;
         assert_eq!(validate_credit_fee_capacity(&route,&reserved),Err(PpsFundingError::FeeCapacityExhausted));
-        assert!(validate_credit_fee_capacity(&PpsFundingRoute::ZalletPczt,&reserved).is_ok());
         // The ordinary/payout funding finish remains available after reserving
         // a batch; only the explicitly named credit wrapper applies this gate.
         let e=conventional_epoch();

@@ -45,7 +45,7 @@ impl PpsConventionalIntent {
     fn fee_bound(&self) -> Result<i64, PpsDbError> {
         let text = |s: &str, limit: usize| !s.is_empty() && s.len() <= limit
             && s.bytes().all(|b| b.is_ascii_graphic());
-        if self.version != 1 || self.network != "testnet"
+        if self.version != 1 || !matches!(self.network.as_str(), "mainnet" | "testnet")
             || !text(&self.epoch, 128) || self.target_height == 0
             || self.target_height > u32::MAX as u64 || !text(&self.source, 512)
             || self.profile != "consensus-size-v1" || self.max_recipients != 100
@@ -443,7 +443,7 @@ pub(crate) async fn validate_confirmation(
     match (record, actual) {
         (None, None) => Ok(false),
         (Some(a), Some(actual)) => {
-            if active_epoch(c).await?.network != "testnet"
+            if !matches!(active_epoch(c).await?.network.as_str(), "mainnet" | "testnet")
                 || a.intent()?.is_none()
                 || a.halt_category.is_some()
                 || !a.sealed
@@ -728,7 +728,7 @@ pub(crate) async fn snapshot(
             let sealed: i64 = r.try_get("sealed")?;
             let expected: Option<String> = r.try_get("expected_txid")?;
             let conventional = if r.try_get::<Option<i64>, _>("conventional_id")?.is_some() {
-                if e.network != "testnet" {
+                if !matches!(e.network.as_str(), "mainnet" | "testnet") {
                     return Err(PpsDbError::Invariant);
                 }
                 Some(conventional_from_row(&r)?)
@@ -1003,7 +1003,7 @@ pub(crate) async fn reserve_fee(
     let e = active_epoch(c).await?;
     if let Some(intent) = conventional {
         let parsed = intent.intent()?;
-        if e.network != "testnet"
+        if !matches!(e.network.as_str(), "mainnet" | "testnet")
             || parsed.epoch != e.id
             || intent.intent_id != fee.proposal_id
             || intent.fee_upper_bound_zatoshis != fee.fee_zatoshis
@@ -1100,7 +1100,7 @@ impl PoolDb {
         sqlx::query("PRAGMA synchronous=FULL").execute(&mut *c).await?;
         let mut tx = c.begin_with("BEGIN IMMEDIATE").await?;
         let a = conventional_attempt(&mut tx, attempt).await?.ok_or(PpsDbError::Invalid)?;
-        if active_epoch(&mut tx).await?.network != "testnet" || a.intent()?.is_none()
+        if !matches!(active_epoch(&mut tx).await?.network.as_str(), "mainnet" | "testnet") || a.intent()?.is_none()
             || !a.sealed || a.expected_txid.is_none() || a.operation_id.is_none()
             || a.status != "reserved"
         { return Err(PpsDbError::Invalid); }
@@ -1173,7 +1173,7 @@ impl PoolDb {
         let a = conventional_attempt(&mut tx, attempt)
             .await?
             .ok_or(PpsDbError::Invalid)?;
-        if active_epoch(&mut tx).await?.network != "testnet"
+        if !matches!(active_epoch(&mut tx).await?.network.as_str(), "mainnet" | "testnet")
             || a.intent()?.is_none()
             || a.halt_category.is_some()
             || !a.sealed
@@ -1319,7 +1319,7 @@ impl PoolDb {
             .bind(attempt)
             .fetch_one(&mut *tx)
             .await?;
-        if active_epoch(&mut tx).await?.network != "testnet"
+        if !matches!(active_epoch(&mut tx).await?.network.as_str(), "mainnet" | "testnet")
             || !a.sealed
             || a.status != "reserved"
             || a.operation_id.as_deref() != Some(operation)
@@ -1544,7 +1544,7 @@ impl PoolDb {
         }
         let mut tx = self.inner().begin_with("BEGIN IMMEDIATE").await?;
         let a = conventional_attempt(&mut tx, attempt).await?;
-        if a.is_some() && active_epoch(&mut tx).await?.network != "testnet" {
+        if a.is_some() && !matches!(active_epoch(&mut tx).await?.network.as_str(), "mainnet" | "testnet") {
             return Err(PpsDbError::Invalid);
         }
         tx.commit().await?;
@@ -1558,7 +1558,7 @@ impl PoolDb {
     ) -> Result<Vec<PpsConventionalAttempt>, PpsDbError> {
         if limit == 0 || limit > 100 { return Err(PpsDbError::Invalid); }
         let mut tx = self.inner().begin_with("BEGIN IMMEDIATE").await?;
-        if active_epoch(&mut tx).await?.network != "testnet" { return Err(PpsDbError::Invalid); }
+        if !matches!(active_epoch(&mut tx).await?.network.as_str(), "mainnet" | "testnet") { return Err(PpsDbError::Invalid); }
         let ids: Vec<i64> = sqlx::query_scalar("SELECT p.attempt_id FROM pps_conventional_attempts p JOIN pps_fee_reservations f ON f.attempt_id=p.attempt_id WHERE f.status='reserved' ORDER BY p.attempt_id LIMIT ?1")
             .bind(i64::from(limit)).fetch_all(&mut *tx).await?;
         let mut out = Vec::with_capacity(ids.len());
@@ -1598,7 +1598,7 @@ impl PoolDb {
             return Err(PpsDbError::Invalid);
         }
         if let Some(a) = &record {
-            if active_epoch(&mut tx).await?.network != "testnet"
+            if !matches!(active_epoch(&mut tx).await?.network.as_str(), "mainnet" | "testnet")
                 || a.intent()?.is_none()
                 || a.halt_category.is_some()
                 || a.intent_id != proposal_id

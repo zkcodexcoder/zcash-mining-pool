@@ -214,9 +214,16 @@ fn validate_pps_funding_route(policy: Option<&PpsPolicy>, configured: Option<Pps
 {
     anyhow::ensure!(policy.is_some() || configured.is_none(),
         "PPS funding route requires an explicit PPS policy");
-    let route = configured.unwrap_or_default();
-    if let Some(policy) = policy { route.validate(&policy.epoch_config())?; }
-    Ok(route)
+    match policy {
+        // PPS: the route is explicit configuration, never a default.
+        Some(policy) => {
+            let route = configured.context("PPS requires an explicit [pps_funding] route")?;
+            route.validate(&policy.epoch_config())?;
+            Ok(route)
+        }
+        // No PPS: the route is unused; a placeholder keeps the plumbing typed.
+        None => Ok(PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: true }),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -768,20 +775,21 @@ mod tests {
         validate_pps_legacy_reserve, validate_pps_funding_route};
 
     #[test]
-    fn testnet_funding_route_is_opt_in_and_cannot_cross_into_mainnet_or_legacy() {
-        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends: true };
+    fn pps_funding_route_is_explicit_and_validated_against_the_policy() {
+        let route = PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: true };
         assert!(validate_pps_funding_route(None, Some(route)).is_err());
-        assert_eq!(validate_pps_funding_route(None,None).unwrap(), PpsFundingRoute::ZalletPczt);
+        assert!(validate_pps_funding_route(None, None).is_ok());
         let mut policy = PpsPolicy { network:"testnet".into(), epoch:"testnet-canary".into(),
             fee_bps:100, max_liability_zatoshis:95_000_000_000, total_exposure_zatoshis:100_000_000_000,
             fee_allowance_zatoshis:5_000_000_000, reserve_min_zatoshis:1, max_payout_zatoshis:1_000_000, funding_maturity_confirmations: pool_db::pps_policy::PAYOUT_NOTE_MATURITY, settle_confirmations:10 };
         assert_eq!(validate_pps_funding_route(Some(&policy), Some(route)).unwrap(), route);
         assert_eq!(policy.fee_bps,100); // The route never rewrites the existing pool fee.
+        // A PPS pool has no default route, and the same route serves mainnet.
+        assert!(validate_pps_funding_route(Some(&policy), None).is_err());
         policy.network="mainnet".into();
-        assert!(validate_pps_funding_route(Some(&policy),Some(route)).is_err());
-        assert_eq!(validate_pps_funding_route(Some(&policy),None).unwrap(),PpsFundingRoute::ZalletPczt);
-        policy.network="testnet".into(); policy.max_liability_zatoshis+=1;
-        assert!(validate_pps_funding_route(Some(&policy),Some(route)).is_err());
+        assert_eq!(validate_pps_funding_route(Some(&policy),Some(route)).unwrap(), route);
+        assert!(validate_pps_funding_route(Some(&policy),
+            Some(PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: false })).is_err());
     }
 
     fn parse_mode(mode: &str) -> Result<PplnsConfig, toml::de::Error> {

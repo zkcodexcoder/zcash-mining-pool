@@ -37,7 +37,7 @@ mod actual_validator {
             block: Vec<u8>,
         ) -> Self {
             Self::new_for_route(db,rpc,wallet_rpc,epoch,lease,block,
-                pool_core::pps_funding::PpsFundingRoute::ZalletPczt).await
+                pool_core::pps_funding::PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: true }).await
         }
         pub(super) async fn new_for_route(
             db:PoolDb,rpc:Arc<ZcashRpcClient>,wallet_rpc:Arc<ZcashRpcClient>,epoch:PpsEpoch,
@@ -802,7 +802,7 @@ async fn quote_health_actual_validator_case(node:&FakeRpc,wallet:&FakeRpc,block:
         }
         let harness=actual_validator::Harness::new_for_route(db.clone(),Arc::new(ZcashRpcClient::new(&node.url)),
             Arc::new(ZcashRpcClient::new(&wallet.url)),epoch,synthetic_lease(),block.to_vec(),
-            pool_core::pps_funding::PpsFundingRoute::ZecdConventionalTestnet{hold_new_legacy_sends:true}).await;
+            pool_core::pps_funding::PpsFundingRoute::ZecdConventional{hold_new_legacy_sends:true}).await;
         let before=harness.credit_health().await;
         // No share priced yet is not "unknown": the gates themselves are healthy.
         assert_eq!(before.state,CreditAdmissionState::Ready); assert_eq!(before.category,"ok");

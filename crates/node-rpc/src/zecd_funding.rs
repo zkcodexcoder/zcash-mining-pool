@@ -636,7 +636,7 @@ fn operation_amounts(value: &Value, source: &str, at: i64)
     for row in outputs {
         let address=row.get("address").and_then(Value::as_str)
             .filter(|s| !s.is_empty() && s.len() <= 512).ok_or(ZecdFundingError::InvalidEvidence)?;
-        crate::zecd_conventional::validate_testnet_recipient(address)
+        crate::zecd_conventional::validate_recipient("testnet", address)
             .map_err(|_| ZecdFundingError::InvalidEvidence)?;
         if row.get("memo").is_some_and(|m| m.as_str() != Some("")) {
             return Err(ZecdFundingError::InvalidEvidence);
@@ -716,9 +716,10 @@ async fn verify_identity_operation(wallet: &ZcashRpcClient, source: &str,
     let canonical=node.zecd_signer_read("getblockhash",json!([height])).await?;
     probe_stage("signer_canonical_check");
     if hash(&canonical)? != blockhash { return Err(ZecdFundingError::ChainMismatch); }
-    let profile=crate::zecd_conventional::TestnetConventionalProfile::consensus_size_bound("testnet",100)
+    let profile=crate::zecd_conventional::ConventionalProfile::consensus_size_bound("testnet",100)
         .map_err(|_|ZecdFundingError::InvalidEvidence)?;
-    let expected=crate::zecd_conventional::ConventionalPayoutExpectation::new(&profile,source,&amounts,height as u32)
+    // Legacy identity-receipt proof from the testnet trial (retained, unused).
+    let expected=crate::zecd_conventional::ConventionalPayoutExpectation::new(&profile,"testnet",source,&amounts,height as u32)
         .map_err(|_|ZecdFundingError::InvalidEvidence)?;
     let raw_hex=raw.get("hex").and_then(Value::as_str).ok_or(ZecdFundingError::InvalidEvidence)?;
     if expected.requires_wallet_history() {

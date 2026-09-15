@@ -19,7 +19,6 @@ mod wallet_operation;
 mod payout_ledger;
 mod payout_health;
 mod pps_gate;
-mod pps_payout;
 mod pps_conventional;
 #[cfg(test)]
 mod pps_conventional_tests;
@@ -75,7 +74,7 @@ fn validate_dashboard_pps(config: &Config) -> Result<()> {
     match (mode == "pps", config.pps.as_ref()) {
         (true, Some(p)) => {
             p.validate(&config.pool.network).map_err(anyhow::Error::msg)?;
-            config.pps_funding.unwrap_or_default().validate(&p.epoch_config())?;
+            config.pps_funding.context("PPS requires an explicit [pps_funding] route")?.validate(&p.epoch_config())?;
             // Credit-side note maturity of the wallet funding proof (payouts stay at 10).
             node_rpc::zecd_funding::set_credit_note_maturity(p.funding_maturity_confirmations)
                 .map_err(anyhow::Error::msg)?;
@@ -857,7 +856,8 @@ async fn main() -> Result<()> {
         );
         let payout_config_path = config_path.clone();
         let pps_policy = config.pps.clone();
-        let funding_route = config.pps_funding.unwrap_or_default();
+        // Validated above for PPS; unused (placeholder) for a legacy pool.
+        let funding_route = config.pps_funding.unwrap_or(pool_core::pps_funding::PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: true });
         let loop_settle = Arc::clone(&pps_settle);
         let payout_task = tokio::spawn(async move {
             run_payout_loop(
@@ -1483,10 +1483,9 @@ async fn process_payouts_for_ledger(
     pps_policy: Option<&PpsPolicy>,
     pps_gate: Option<&PpsGate>,
 ) -> anyhow::Result<usize> {
-    if let Some(policy) = pps_policy {
-        return pps_payout::process(db, rpc, node_rpc, pool_address,
-            min_payout_zatoshis, network, policy,
-            pps_gate.context("missing PPS verification gate")?).await;
+    if pps_policy.is_some() {
+        // The PCZT/zallet flow was retired (operator decision 2026-09-15, #1).
+        anyhow::bail!("PPS payouts run through the conventional route only");
     }
     let ledger = if let Some(p) = pps_policy {
         p.validate(network).map_err(anyhow::Error::msg)?;

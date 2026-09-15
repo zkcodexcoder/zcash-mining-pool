@@ -39,7 +39,7 @@ const CREDIT: i64 = 1_000_000;
 const HEIGHT: u32 = 2_000_000;
 
 fn route() -> PpsFundingRoute {
-    PpsFundingRoute::ZecdConventionalTestnet {
+    PpsFundingRoute::ZecdConventional {
         hold_new_legacy_sends: true,
     }
 }
@@ -1189,7 +1189,7 @@ async fn conventional_legacy_inflight_and_wrong_route_prevent_new_sends() {
         1,
         &f.policy,
         &gate(&rpc.client),
-        &PpsFundingRoute::ZalletPczt
+        &PpsFundingRoute::ZecdConventional { hold_new_legacy_sends: false }
     )
     .await
     .is_err());

@@ -2045,7 +2045,7 @@ mod tests {
     #[test]
     fn pps_testnet_refresh_retains_original_proof_without_renewing_expiry() {
         use crate::pps_funding::{PpsFundingRoute, validate_funding_lease};
-        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
+        let route = PpsFundingRoute::ZecdConventional { hold_new_legacy_sends:true };
         let original = refresh_test_proof();
         let mut cached = Some(original.clone());
         begin_pps_funding_refresh(&route,&mut cached);
@@ -2066,7 +2066,7 @@ mod tests {
     #[test]
     fn pps_testnet_refresh_uses_single_flight_start_to_start_success_cadence() {
         use crate::pps_funding::PpsFundingRoute;
-        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
+        let route = PpsFundingRoute::ZecdConventional { hold_new_legacy_sends:true };
         for (collection_seconds,delay_seconds) in [(0,120),(10,110),(30,90),(34,86),(150,0)] {
             let mut cached = Some(refresh_test_proof());
             let mut replacement = refresh_test_proof();
@@ -2083,7 +2083,7 @@ mod tests {
     #[test]
     fn pps_testnet_refresh_failure_retains_only_on_transient_categories() {
         use crate::pps_funding::{PpsFundingError, PpsFundingRoute};
-        let route = PpsFundingRoute::ZecdConventionalTestnet { hold_new_legacy_sends:true };
+        let route = PpsFundingRoute::ZecdConventional { hold_new_legacy_sends:true };
         let original = refresh_test_proof();
         // A transient read failure keeps the previous proof (its own expiry
         // and generation still gate every credit); any substantive rejection
@@ -2111,31 +2111,9 @@ mod tests {
     }
 
     #[test]
-    fn pps_pczt_refresh_preserves_clear_during_read_and_completion_delay() {
-        use crate::pps_funding::{PpsFundingError, PpsFundingRoute};
-        for network in ["mainnet","testnet"] {
-            let route = PpsFundingRoute::ZalletPczt;
-            let mut proof = refresh_test_proof();
-            proof.network = network.into();
-            let mut cached = Some(proof.clone());
-            begin_pps_funding_refresh(&route,&mut cached);
-            assert!(cached.is_none());
-            assert_eq!(finish_pps_funding_refresh(&route,&mut cached,Ok(proof.clone()),
-                Duration::from_secs(34),"ok"),Duration::from_secs(120));
-            assert_eq!(cached,Some(proof));
-            begin_pps_funding_refresh(&route,&mut cached);
-            // PCZT already cleared during the read, so a transient category
-            // has nothing to retain: failures always leave it revoked.
-            assert_eq!(finish_pps_funding_refresh(&route,&mut cached,
-                Err(PpsFundingError::Timeout),Duration::ZERO,"deadline_exceeded"),Duration::from_secs(30));
-            assert!(cached.is_none());
-        }
-    }
-
-    #[test]
     fn pps_credit_refresh_fast_retries_are_bounded_and_retain_transient_proofs() {
         use crate::pps_funding::{PpsFundingError,PpsFundingRoute};
-        let route=PpsFundingRoute::ZecdConventionalTestnet {hold_new_legacy_sends:true};
+        let route=PpsFundingRoute::ZecdConventional {hold_new_legacy_sends:true};
         for category in ["rpc_unavailable","wallet_not_ready","concurrent_change","deadline_exceeded"] {
             let mut failures=0;
             for expected in [5,5,30,30] {
@@ -2151,7 +2129,6 @@ mod tests {
         for category in ["invalid_evidence","identity_mismatch","chain_mismatch","accounting_unavailable","fee_capacity_exhausted","identity_signer_not_proven"] {
             assert_eq!(pps_refresh_retry_delay(&route,category,&mut 0,Duration::from_secs(30)),Duration::from_secs(30));
         }
-        assert_eq!(pps_refresh_retry_delay(&PpsFundingRoute::ZalletPczt,"deadline_exceeded",&mut 0,Duration::from_secs(30)),Duration::from_secs(30));
     }
 
     #[test]
